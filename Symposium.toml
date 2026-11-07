@@ -1,10 +1,10 @@
-name = "muconde-controller"
-# Crate-embedded Symposium manifest for muconde-controller.
+name = "mu-cd-controller"
+# Crate-embedded Symposium manifest for mu-cd-controller.
 
 [[plugins]]
-depends-on = ["muconde-ipc"]
-source.cargo = "muconde-ipc"
+depends-on = ["mu-cd-ipc"]
+source.cargo = "mu-cd-ipc"
 
 [[plugins]]
-depends-on = ["muobserve-ipc"]
-source.cargo = "muobserve-ipc"
+depends-on = ["mu-observable-ipc"]
+source.cargo = "mu-observable-ipc"

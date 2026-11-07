@@ -7,16 +7,16 @@ use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use muconde_controller::api::{spawn_cd_api, CdApiConfig};
-use muconde_controller::cd_state::CdStateStore;
-use muconde_controller::contract::MuConDeConfig;
-use muconde_controller::lease::{ClusterIdlePoller, LeaseCoordinator, DEFAULT_CONTROLLER_URL};
-use muconde_controller::orchestrator::{
+use mu_cd_controller::api::{spawn_cd_api, CdApiConfig};
+use mu_cd_controller::cd_state::CdStateStore;
+use mu_cd_controller::contract::MuConDeConfig;
+use mu_cd_controller::lease::{ClusterIdlePoller, LeaseCoordinator, DEFAULT_CONTROLLER_URL};
+use mu_cd_controller::orchestrator::{
     DeploymentOrchestrator, DeploymentOutcome, HttpMuRegistClient, IpcAgentClient,
     DEFAULT_REGISTRY_URL,
 };
-use muconde_controller::slo::MuObserveSloClient;
-use muconde_controller::tls::TlsConfig;
+use mu_cd_controller::slo::MuObserveSloClient;
+use mu_cd_controller::tls::TlsConfig;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,8 +27,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     info!(
-        version = muconde_controller::CONTROLLER_VERSION,
-        "Starting MuConDe-controller CD control plane"
+        version = mu_cd_controller::CONTROLLER_VERSION,
+        "Starting mu-cd-controller CD control plane"
     );
 
     let controller_url = std::env::var("MUCONDE_CONTROLLER_URL")

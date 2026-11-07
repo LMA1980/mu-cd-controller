@@ -12,14 +12,14 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use muconde_ipc::{
+use mu_cd_ipc::{
     create_fory_runtime, read_frame, write_frame, ArtifactTaintNotification, DeploymentLeaseGrant,
     DeploymentLeaseRequest, IntegrationTestProgress, IntegrationTestReport, IpcHeader,
     RollbackCommand, SlotSwapCommand, StageDeploymentRequest, StageDeploymentResponse,
     MSG_TYPE_IT_PROGRESS, MSG_TYPE_IT_REPORT, MSG_TYPE_ROLLBACK, MSG_TYPE_SLOT_SWAP,
     MSG_TYPE_STAGE_DEPLOY_REQ, MSG_TYPE_STAGE_DEPLOY_RESP,
 };
-use muobserve_ipc::CanarySloAssertionRequest;
+use mu_observable_ipc::CanarySloAssertionRequest;
 
 use crate::cd_state::{
     classify_rollback_reason, CdStateStore, DeploymentStart, ItProgressSink, Slot,
@@ -969,7 +969,7 @@ impl DeploymentOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muconde_ipc::DeploymentSlot;
+    use mu_cd_ipc::DeploymentSlot;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use tokio::sync::Mutex;
 
@@ -1136,9 +1136,9 @@ mod tests {
         async fn verify_canary_slo(
             &self,
             req: &CanarySloAssertionRequest,
-        ) -> Result<muobserve_ipc::CanarySloAssertionResponse, OrchestratorError> {
+        ) -> Result<mu_observable_ipc::CanarySloAssertionResponse, OrchestratorError> {
             self.slo_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(muobserve_ipc::CanarySloAssertionResponse {
+            Ok(mu_observable_ipc::CanarySloAssertionResponse {
                 request_id: req.request_id.clone(),
                 healthy: self.healthy.load(Ordering::SeqCst),
                 error_log_count: self.error_log_count.load(Ordering::SeqCst),

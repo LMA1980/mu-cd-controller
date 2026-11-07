@@ -21,9 +21,12 @@ pub enum ControllerError {
     Io(#[from] std::io::Error),
 }
 
-/// Errors occurring while parsing and validating `.muconde/MuConDe.yml`.
+/// Errors occurring while parsing and validating `.mucd/mu-cd.yml` or legacy `.muconde/MuConDe.yml`.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ContractError {
+    #[error("Configuration manifest not found in '{0}': expected .mucd/mu-cd.ya?ml or .muconde/MuConDe.ya?ml")]
+    NotFound(std::path::PathBuf),
+
     #[error("Unsupported contract version '{0}', expected '1'")]
     UnsupportedVersion(String),
 

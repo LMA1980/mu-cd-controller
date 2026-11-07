@@ -12,19 +12,19 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
-use muconde_controller::api::{
+use mu_cd_controller::api::{
     load_token_file, router, serve, CdApiState, DeploymentGate, DeploymentSummary,
 };
-use muconde_controller::cd_state::{
+use mu_cd_controller::cd_state::{
     CdStateStore, DeploymentStart, GateOutcome, GateVerdict, LeaseView, RollbackReason, Slot,
 };
-use muconde_controller::contract::{IntegrationTestSelector, MuConDeConfig};
-use muconde_controller::error::OrchestratorError;
-use muconde_controller::lease::LeaseCoordinator;
-use muconde_controller::orchestrator::{
+use mu_cd_controller::contract::{IntegrationTestSelector, MuConDeConfig};
+use mu_cd_controller::error::OrchestratorError;
+use mu_cd_controller::lease::LeaseCoordinator;
+use mu_cd_controller::orchestrator::{
     dispatch_agent_frame, AgentFrame, DeploymentOrchestrator, IpcAgentClient, MuRegistClient,
 };
-use muconde_ipc::{
+use mu_cd_ipc::{
     create_fory_runtime, read_frame, write_frame, ArtifactTaintNotification,
     IntegrationTestProgress, IntegrationTestReport, IpcHeader, StageDeploymentRequest,
     StageDeploymentResponse, TestState, MSG_TYPE_HEARTBEAT, MSG_TYPE_IT_PROGRESS,
@@ -426,7 +426,7 @@ async fn test_leases_endpoint() {
 
 #[tokio::test]
 async fn test_lease_coordinator_feeds_lease_view() {
-    use muconde_ipc::DeploymentLeaseRequest;
+    use mu_cd_ipc::DeploymentLeaseRequest;
     let coordinator = LeaseCoordinator::new();
     let grant = coordinator
         .acquire_lease(&DeploymentLeaseRequest {
@@ -555,7 +555,7 @@ async fn test_sse_drops_slow_consumer() {
     for i in 0..10 {
         store.lease_expired(&format!("d{i}"), "l");
     }
-    let mut stream = Box::pin(muconde_controller::api::cd_event_stream(rx));
+    let mut stream = Box::pin(mu_cd_controller::api::cd_event_stream(rx));
     // Lagged receiver: the stream terminates instead of silently skipping events.
     assert!(stream.next().await.is_none());
 }

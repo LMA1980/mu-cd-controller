@@ -18,8 +18,9 @@ pub mod tls;
 pub use api::{CdApiConfig, CdApiState, DeploymentGate, DeploymentSummary};
 pub use cd_state::{CdEvent, CdSnapshot, CdStateStore, GateVerdict, ItProgressSink};
 pub use contract::{
-    IntegrationTestSelector, MuConDeConfig, DEFAULT_BAKE_WINDOW_SECONDS, DEFAULT_LEASE_TTL_SECONDS,
-    DEFAULT_MAX_ERROR_LOGS, DEFAULT_MAX_P99_LATENCY_MS, DEFAULT_WARMUP_TIMEOUT_SECONDS,
+    resolve_manifest_path, IntegrationTestSelector, MuCdConfig, MuConDeConfig,
+    DEFAULT_BAKE_WINDOW_SECONDS, DEFAULT_LEASE_TTL_SECONDS, DEFAULT_MAX_ERROR_LOGS,
+    DEFAULT_MAX_P99_LATENCY_MS, DEFAULT_WARMUP_TIMEOUT_SECONDS,
 };
 pub use error::{ContractError, ControllerError, LeaseError, OrchestratorError, TlsError};
 pub use lease::{ClusterIdlePoller, ClusterNodeStatus, LeaseCoordinator, DEFAULT_CONTROLLER_URL};
