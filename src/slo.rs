@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use muobserve_ipc::{
+use mu_observable_ipc::{
     decode_control_envelope, encode_control_envelope, read_frame, write_frame,
     CanarySloAssertionRequest, CanarySloAssertionResponse, ControlRpcEnvelope, IpcHeader,
     MSG_TYPE_FORY_CONTROL,

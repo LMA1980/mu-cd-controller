@@ -246,7 +246,7 @@ fn verdict_of(d: &DeploymentRecord, now: u64) -> GateVerdict {
 
 impl DeploymentSummary {
     pub fn from_record(d: &DeploymentRecord, now: u64) -> Self {
-        use muconde_ipc::TestState;
+        use mu_cd_ipc::TestState;
         Self {
             deployment_id: d.deployment_id.clone(),
             owner: d.owner.clone(),

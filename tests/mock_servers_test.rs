@@ -15,13 +15,13 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
-use muconde_controller::contract::{IntegrationTestSelector, MuConDeConfig};
-use muconde_controller::error::OrchestratorError;
-use muconde_controller::lease::{ClusterIdlePoller, ClusterNodeStatus, LeaseCoordinator};
-use muconde_controller::orchestrator::{
+use mu_cd_controller::contract::{IntegrationTestSelector, MuConDeConfig};
+use mu_cd_controller::error::OrchestratorError;
+use mu_cd_controller::lease::{ClusterIdlePoller, ClusterNodeStatus, LeaseCoordinator};
+use mu_cd_controller::orchestrator::{
     AgentIpcClient, DeploymentOrchestrator, DeploymentOutcome, HttpMuRegistClient,
 };
-use muconde_ipc::{
+use mu_cd_ipc::{
     DeploymentSlot, IntegrationTestReport, RollbackCommand, SlotSwapCommand,
     StageDeploymentRequest, StageDeploymentResponse,
 };
@@ -441,8 +441,8 @@ async fn test_end_to_end_it_failure_triggers_rollback_and_taints_mock_muregist()
 
 #[tokio::test]
 async fn test_end_to_end_muobserve_slo_gate_promote_and_breach_rollback_taint() {
-    use muconde_controller::slo::MuObserveSloClient;
-    use muobserve_ipc::{
+    use mu_cd_controller::slo::MuObserveSloClient;
+    use mu_observable_ipc::{
         decode_control_envelope, encode_control_envelope, read_frame, write_frame,
         CanarySloAssertionResponse, ControlRpcEnvelope, IpcHeader, MSG_TYPE_FORY_CONTROL,
     };

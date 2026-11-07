@@ -1,5 +1,5 @@
 version: "3"
-name: "MuConDe-controller 3-Tier Declarative Pipeline: Hygiene, Build, Test, Coverage & Miri"
+name: "mu-cd-controller 3-Tier Declarative Pipeline: Hygiene, Build, Test, Coverage & Miri"
 
 env:
   CARGO_TERM_COLOR: "always"
@@ -44,6 +44,7 @@ tasks:
   miri-task:
     tool: "cargo-miri"
     args: ["test", "--workspace", "--lib"]
+    sccache: try
     env:
       CARGO_TARGET_DIR: "target"
       MIRIFLAGS: "-Zmiri-disable-isolation"

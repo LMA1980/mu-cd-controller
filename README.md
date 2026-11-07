@@ -1,23 +1,23 @@
-# MuConDe-controller
+# mu-cd-controller
 
 <p align="center">
   <a href="https://hook.lma1980.duckdns.org/jobs">
-    <img src="https://hook.lma1980.duckdns.org/cards/LMA1980/MuConDe-controller/card.svg" alt="MuConDe-controller Factory Scorecard" width="520"/>
+    <img src="https://hook.lma1980.duckdns.org/cards/LMA1980/mu-cd-controller/card.svg" alt="mu-cd-controller Factory Scorecard" width="520"/>
   </a>
 </p>
 
 <p align="center">
-  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/MuConDe-controller/status.svg" alt="CI Status"/></a>
-  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/MuConDe-controller/score.svg" alt="Quality Score"/></a>
-  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/MuConDe-controller/coverage.svg" alt="Coverage"/></a>
-  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/MuConDe-controller/benchmark.svg" alt="Benchmark"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-cd-controller/status.svg" alt="CI Status"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-cd-controller/score.svg" alt="Quality Score"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-cd-controller/coverage.svg" alt="Coverage"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-cd-controller/benchmark.svg" alt="Benchmark"/></a>
 </p>
 
 ---
 
-Continuous Delivery (CD) control plane orchestrator managing zero-downtime, safe, autonomous deployment across cluster worker nodes over `MuConDe-ipc` and `rustls` mTLS (`step-ca` PKI).
+Continuous Delivery (CD) control plane orchestrator managing zero-downtime, safe, autonomous deployment across cluster worker nodes over `mu-cd-ipc` and `rustls` mTLS (`step-ca` PKI).
 
-`MuConDe-controller` coordinates with `ActionRunner-controller` (`GET https://controller.ci.internal:8443/api/cluster/nodes`), pulls verified artifacts from `MuRegist` (`https://registry.ci.internal:8444`), and drives node-level `MuConDe-agent` daemons over `MuConDe-ipc`.
+`mu-cd-controller` coordinates with `ActionRunner-controller` (`GET https://controller.ci.internal:8443/api/cluster/nodes`), pulls verified artifacts from `MuRegist` (`https://registry.ci.internal:8444`), and drives node-level `mu-cd-agent` daemons over `mu-cd-ipc`.
 
 ---
 
@@ -25,7 +25,7 @@ Continuous Delivery (CD) control plane orchestrator managing zero-downtime, safe
 
 - **Idle Runner Discovery**: Inspects target host worker utilization and pending queue depths (`active_slots == 0 && !exclusive_locked`) to schedule deployments during verified idle windows without interrupting active factory pipelines.
 - **TTL-Bounded Deployment Leases**: Negotiates time-to-live leases (e.g. 300s) on target nodes. If lease renewal fails or verification stalls, the target node autonomously rolls back.
-- **Declarative IT Failure Contracts (`.muconde/MuConDe.yml`)**:
+- **Declarative IT Failure Contracts (`.mucd/mu-cd.yml` with `.muconde/MuConDe.yml` fallback)**:
   - Parses deployment requirements: target node, target slot, probe endpoints, and required critical Integration Test suites (`integration_tests: [...]` or `"all"`).
 - **Atomic Promotion / Rollback State Machine**:
   - Stages candidate release in inactive slot (Slot B).
@@ -61,7 +61,9 @@ Continuous Delivery (CD) control plane orchestrator managing zero-downtime, safe
 
 ---
 
-## Declarative Contract (`.muconde/MuConDe.yml`)
+## Declarative Contract (`.mucd/mu-cd.yml`)
+
+Phase 1 supports both `.mucd/mu-cd.yml` (and `.yaml`) and legacy `.muconde/MuConDe.yml` (with fallback warning).
 
 ```yaml
 version: "1"

@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
 
-use muconde_ipc::{
+use mu_cd_ipc::{
     DeploymentLeaseGrant, DeploymentSlot, IntegrationTestProgress, IntegrationTestReport, TestState,
 };
 use serde::{Deserialize, Serialize};

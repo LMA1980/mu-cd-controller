@@ -8,7 +8,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, RwLock};
 
-use muconde_ipc::{
+use mu_cd_ipc::{
     DeploymentLeaseGrant, DeploymentLeaseRequest, DeploymentLeaseRevoke, DeploymentSlot,
     RollbackCommand,
 };
