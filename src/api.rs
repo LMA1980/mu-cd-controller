@@ -34,7 +34,7 @@ use crate::cd_state::{
     GateTestView, GateVerdict, LeaseView, RollbackReason, Slot,
 };
 use crate::contract::MuConDeConfig;
-use crate::orchestrator::{resolve_target_nodes, DeploymentOrchestrator};
+use crate::orchestrator::DeploymentOrchestrator;
 
 /// Default `limit` for `GET /api/cd/deployments`.
 pub const DEFAULT_DEPLOYMENTS_LIMIT: usize = 20;
@@ -496,7 +496,7 @@ async fn post_deploy(
             .into_response();
     };
 
-    let resolved_nodes = resolve_target_nodes(&config.target_nodes);
+    let resolved_nodes = config.target_nodes.clone();
     let service = config.service.clone();
     let digest = req.artifact_sha256.trim().to_string();
     if digest.is_empty() {

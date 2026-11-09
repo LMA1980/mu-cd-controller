@@ -682,33 +682,29 @@ impl DeploymentOrchestrator {
         &self,
         target_nodes: &[String],
     ) -> Result<String, OrchestratorError> {
-        let resolved_targets = resolve_target_nodes(target_nodes);
         if let Some(ref poller) = self.poller {
             let nodes = poller
                 .fetch_nodes()
                 .await
                 .map_err(OrchestratorError::Lease)?;
 
-            for (idx, target) in target_nodes.iter().enumerate() {
-                let resolved = resolved_targets
-                    .get(idx)
-                    .cloned()
-                    .unwrap_or_else(|| resolve_target_node(target));
+            for target in target_nodes {
+                let resolved = resolve_target_node(target);
                 if let Some(node) = nodes
                     .iter()
                     .find(|n| n.node_id == resolved || &n.node_id == target)
                 {
                     if node.is_idle_for_deployment() {
-                        return Ok(resolved);
+                        return Ok(target.clone());
                     }
                 }
             }
 
             Err(OrchestratorError::Lease(LeaseError::NodeNotIdle(format!(
                 "None of the target nodes {:?} are currently idle and eligible",
-                resolved_targets
+                target_nodes
             ))))
-        } else if let Some(first) = resolved_targets.first() {
+        } else if let Some(first) = target_nodes.first() {
             // When poller is not provided (standalone/test), use first target node
             Ok(first.clone())
         } else {
@@ -719,7 +715,7 @@ impl DeploymentOrchestrator {
     }
 
     /// Orchestrates sequential A/B rollout across every target node in `config.target_nodes`
-    /// (resolved through `MUCONDE_NODE_MAP` when configured).
+    /// (resolved through `MUCONDE_NODE_MAP` when connecting to node agents).
     ///
     /// Stops immediately and returns the outcomes collected so far if any node rolls back.
     pub async fn orchestrate_rollout_for_repo(
@@ -729,7 +725,13 @@ impl DeploymentOrchestrator {
         repo: Option<&str>,
     ) -> Result<Vec<DeploymentOutcome>, OrchestratorError> {
         config.validate()?;
-        let targets = resolve_target_nodes(&config.target_nodes);
+        let mut targets = Vec::with_capacity(config.target_nodes.len());
+        for n in &config.target_nodes {
+            let trimmed = n.trim().to_string();
+            if !trimmed.is_empty() && !targets.contains(&trimmed) {
+                targets.push(trimmed);
+            }
+        }
         let mut outcomes = Vec::with_capacity(targets.len());
         for node in targets {
             let mut single_cfg = config.clone();
