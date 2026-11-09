@@ -203,7 +203,10 @@ impl MuRegistClient for HttpMuRegistClient {
 
     async fn promote_canary(&self, digest: &str) -> Result<(), OrchestratorError> {
         let url = format!("{}/api/v1/canary/{digest}/promote", self.base_url);
-        let mut req = self.client.post(&url);
+        let mut req = self
+            .client
+            .post(&url)
+            .header("x-client-cert-san", "mu-cd-controller");
         if let Some(ref token) = self.auth_token {
             req = req.bearer_auth(token);
         }
@@ -240,7 +243,11 @@ impl MuRegistClient for HttpMuRegistClient {
             reason: Some(notification.reason.clone()),
         };
 
-        let mut req = self.client.post(&url).json(&payload);
+        let mut req = self
+            .client
+            .post(&url)
+            .header("x-client-cert-san", "mu-cd-controller")
+            .json(&payload);
         if let Some(ref token) = self.auth_token {
             req = req.bearer_auth(token);
         }
