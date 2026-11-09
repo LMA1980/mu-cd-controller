@@ -305,11 +305,48 @@ pub fn dispatch_agent_frame(
     }
 }
 
+/// Resolves a logical target node identifier (e.g. `node-a`, `node-b`, `worker-riscv64`)
+/// using `MUCONDE_NODE_MAP` (`"node-a=host1,node-b=host2"`).
+pub fn resolve_target_node(logical: &str) -> String {
+    if let Ok(map_str) = std::env::var("MUCONDE_NODE_MAP") {
+        resolve_target_node_from_map(logical, &map_str)
+    } else {
+        logical.trim().to_string()
+    }
+}
+
+/// Pure helper resolving `logical` against a comma-separated `key=value` map string.
+pub fn resolve_target_node_from_map(logical: &str, map_str: &str) -> String {
+    let trimmed = logical.trim();
+    for pair in map_str.split(',') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k.trim().eq_ignore_ascii_case(trimmed) && !v.trim().is_empty() {
+                return v.trim().to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Resolves and deduplicates a list of logical target node names while preserving order.
+pub fn resolve_target_nodes(nodes: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        let resolved = resolve_target_node(n);
+        if !resolved.is_empty() && !out.contains(&resolved) {
+            out.push(resolved);
+        }
+    }
+    out
+}
+
 /// Network implementation of `AgentIpcClient` communicating over TCP/TLS framing.
 #[derive(Clone)]
 pub struct IpcAgentClient {
     port: u16,
     progress_sink: Option<Arc<dyn ItProgressSink>>,
+    active_streams:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::net::TcpStream>>>,
 }
 
 impl std::fmt::Debug for IpcAgentClient {
@@ -327,6 +364,7 @@ impl IpcAgentClient {
         Self {
             port,
             progress_sink: None,
+            active_streams: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -352,7 +390,8 @@ impl AgentIpcClient for IpcAgentClient {
         req: &StageDeploymentRequest,
     ) -> Result<StageDeploymentResponse, OrchestratorError> {
         let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
-        let addr = format!("{}:{}", node_id, self.port);
+        let host = resolve_target_node(node_id);
+        let addr = format!("{}:{}", host, self.port);
         let mut stream = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
             OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
         })?;
@@ -390,7 +429,8 @@ impl AgentIpcClient for IpcAgentClient {
         cmd: &SlotSwapCommand,
     ) -> Result<(), OrchestratorError> {
         let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
-        let addr = format!("{}:{}", node_id, self.port);
+        let host = resolve_target_node(node_id);
+        let addr = format!("{}:{}", host, self.port);
         let mut stream = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
             OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
         })?;
@@ -403,6 +443,11 @@ impl AgentIpcClient for IpcAgentClient {
         write_frame(&mut stream, &header, &payload)
             .await
             .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+
+        self.active_streams
+            .lock()
+            .await
+            .insert(cmd.deployment_id.clone(), stream);
 
         Ok(())
     }
@@ -417,29 +462,103 @@ impl AgentIpcClient for IpcAgentClient {
         timeout: Duration,
     ) -> Result<IntegrationTestReport, OrchestratorError> {
         let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
-        let addr = format!("{}:{}", node_id, self.port);
-        let mut stream = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
-            OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
-        })?;
+        let host = resolve_target_node(node_id);
+        let addr = format!("{}:{}", host, self.port);
+        let mut stream = if let Some(s) = self.active_streams.lock().await.remove(deployment_id) {
+            s
+        } else {
+            tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
+                OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
+            })?
+        };
 
         let executed = match selected_tests {
             Some(tests) => tests.to_vec(),
             None => vec!["all".to_string()],
         };
 
-        // Await IntegrationTestReport frame within timeout
+        // Await IntegrationTestReport frame or terminal IntegrationTestProgress frames within timeout
         let read_future = async {
+            let mut seen_states: std::collections::HashMap<String, mu_cd_ipc::TestState> =
+                std::collections::HashMap::new();
+            let mut seen_order: Vec<String> = Vec::new();
+            let mut max_duration_ms: u64 = 0;
+            let mut reconnected_after_swap_eof = false;
+
             loop {
-                let (header, payload) = read_frame(&mut stream)
-                    .await
-                    .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
-                if let AgentFrame::Report(report) = dispatch_agent_frame(
+                let frame_res = read_frame(&mut stream).await;
+                let (header, payload) = match frame_res {
+                    Ok(f) => f,
+                    Err(mu_cd_ipc::IpcError::Io(ref e))
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof
+                            && seen_states.is_empty()
+                            && !reconnected_after_swap_eof =>
+                    {
+                        reconnected_after_swap_eof = true;
+                        stream = tokio::net::TcpStream::connect(&addr).await.map_err(|ce| {
+                            OrchestratorError::Agent(format!(
+                                "Connect to agent {addr} failed: {ce}"
+                            ))
+                        })?;
+                        continue;
+                    }
+                    Err(e) => return Err(OrchestratorError::Agent(e.to_string())),
+                };
+
+                match dispatch_agent_frame(
                     &fory,
                     header.msg_type,
                     &payload,
                     self.progress_sink.as_deref(),
                 )? {
-                    return Ok(report);
+                    AgentFrame::Report(report) => return Ok(report),
+                    AgentFrame::Progress(p) => {
+                        if !seen_order.contains(&p.test_name) {
+                            seen_order.push(p.test_name.clone());
+                        }
+                        max_duration_ms = max_duration_ms.max(p.duration_ms);
+                        seen_states.insert(p.test_name, p.state);
+
+                        let all_terminal = !seen_states.is_empty()
+                            && seen_states.values().all(|st| {
+                                matches!(
+                                    st,
+                                    mu_cd_ipc::TestState::Passed | mu_cd_ipc::TestState::Failed
+                                )
+                            });
+                        let any_failed = seen_states
+                            .values()
+                            .any(|st| matches!(st, mu_cd_ipc::TestState::Failed));
+                        if all_terminal && !any_failed {
+                            // Peek briefly in case a fake/legacy agent also emits MSG_TYPE_IT_REPORT on success.
+                            if let Ok(Ok((next_hdr, next_payload))) = tokio::time::timeout(
+                                Duration::from_millis(50),
+                                read_frame(&mut stream),
+                            )
+                            .await
+                            {
+                                if let AgentFrame::Report(report) = dispatch_agent_frame(
+                                    &fory,
+                                    next_hdr.msg_type,
+                                    &next_payload,
+                                    self.progress_sink.as_deref(),
+                                )? {
+                                    return Ok(report);
+                                }
+                            }
+                            return Ok(IntegrationTestReport {
+                                deployment_id: deployment_id.to_string(),
+                                service_name: service.to_string(),
+                                artifact_sha256: artifact_sha256.to_string(),
+                                executed_tests: seen_order,
+                                passed: true,
+                                failed_tests: Vec::new(),
+                                duration_ms: max_duration_ms,
+                                log_excerpt: None,
+                            });
+                        }
+                    }
+                    AgentFrame::Ignored(_) => {}
                 }
             }
         };
@@ -465,7 +584,8 @@ impl AgentIpcClient for IpcAgentClient {
         cmd: &RollbackCommand,
     ) -> Result<(), OrchestratorError> {
         let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
-        let addr = format!("{}:{}", node_id, self.port);
+        let host = resolve_target_node(node_id);
+        let addr = format!("{}:{}", host, self.port);
         let mut stream = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
             OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
         })?;
@@ -555,25 +675,33 @@ impl DeploymentOrchestrator {
         &self,
         target_nodes: &[String],
     ) -> Result<String, OrchestratorError> {
+        let resolved_targets = resolve_target_nodes(target_nodes);
         if let Some(ref poller) = self.poller {
             let nodes = poller
                 .fetch_nodes()
                 .await
                 .map_err(OrchestratorError::Lease)?;
 
-            for target in target_nodes {
-                if let Some(node) = nodes.iter().find(|n| &n.node_id == target) {
+            for (idx, target) in target_nodes.iter().enumerate() {
+                let resolved = resolved_targets
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| resolve_target_node(target));
+                if let Some(node) = nodes
+                    .iter()
+                    .find(|n| n.node_id == resolved || &n.node_id == target)
+                {
                     if node.is_idle_for_deployment() {
-                        return Ok(target.clone());
+                        return Ok(resolved);
                     }
                 }
             }
 
             Err(OrchestratorError::Lease(LeaseError::NodeNotIdle(format!(
                 "None of the target nodes {:?} are currently idle and eligible",
-                target_nodes
+                resolved_targets
             ))))
-        } else if let Some(first) = target_nodes.first() {
+        } else if let Some(first) = resolved_targets.first() {
             // When poller is not provided (standalone/test), use first target node
             Ok(first.clone())
         } else {
@@ -581,6 +709,34 @@ impl DeploymentOrchestrator {
                 "No target nodes specified".into(),
             )))
         }
+    }
+
+    /// Orchestrates sequential A/B rollout across every target node in `config.target_nodes`
+    /// (resolved through `MUCONDE_NODE_MAP` when configured).
+    ///
+    /// Stops immediately and returns the outcomes collected so far if any node rolls back.
+    pub async fn orchestrate_rollout_for_repo(
+        &self,
+        config: &MuConDeConfig,
+        artifact_sha256: &str,
+        repo: Option<&str>,
+    ) -> Result<Vec<DeploymentOutcome>, OrchestratorError> {
+        config.validate()?;
+        let targets = resolve_target_nodes(&config.target_nodes);
+        let mut outcomes = Vec::with_capacity(targets.len());
+        for node in targets {
+            let mut single_cfg = config.clone();
+            single_cfg.target_nodes = vec![node];
+            let outcome = self
+                .orchestrate_deployment_for_repo(&single_cfg, artifact_sha256, None, repo)
+                .await?;
+            let rolled_back = outcome.is_rolled_back();
+            outcomes.push(outcome);
+            if rolled_back {
+                break;
+            }
+        }
+        Ok(outcomes)
     }
 
     /// Orchestrate complete deployment workflow for a candidate artifact.
@@ -1310,5 +1466,50 @@ mod tests {
         assert_eq!(rb.restore_slot, DeploymentSlot::SlotA);
         assert_eq!(rb.failed_artifact_sha256, digest);
         assert!(rb.reason.contains("MuObserve canary SLO breach"));
+    }
+
+    #[test]
+    fn test_resolve_target_node_from_map() {
+        let map = "node-a=host-primary,node-b=host-secondary,worker-riscv64=host-riscv";
+        assert_eq!(resolve_target_node_from_map("node-a", map), "host-primary");
+        assert_eq!(
+            resolve_target_node_from_map("node-b", map),
+            "host-secondary"
+        );
+        assert_eq!(
+            resolve_target_node_from_map("worker-riscv64", map),
+            "host-riscv"
+        );
+        assert_eq!(
+            resolve_target_node_from_map("custom-node", map),
+            "custom-node"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_orchestrate_rollout_for_repo_multi_node() {
+        let coordinator = Arc::new(LeaseCoordinator::new());
+        let agent = Arc::new(MockAgentClient {
+            stage_ok: AtomicBool::new(true),
+            swap_ok: AtomicBool::new(true),
+            it_passed: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let regist = Arc::new(MockMuRegistClient::default());
+        let orchestrator =
+            DeploymentOrchestrator::new(coordinator, None, agent.clone(), regist.clone());
+
+        let mut config = sample_config();
+        config.target_nodes = vec!["node-a".into(), "node-b".into()];
+        let outcomes = orchestrator
+            .orchestrate_rollout_for_repo(&config, "sha256-multi-1", Some("LMA1980/mu-console"))
+            .await
+            .expect("multi-node rollout should succeed");
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(DeploymentOutcome::is_promoted));
+        assert_eq!(agent.stage_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(agent.swap_calls.load(Ordering::SeqCst), 2);
     }
 }
