@@ -7,7 +7,7 @@ use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use mu_cd_controller::api::{spawn_cd_api, CdApiConfig};
+use mu_cd_controller::api::{spawn_cd_api_with_orchestrator, CdApiConfig};
 use mu_cd_controller::cd_state::CdStateStore;
 use mu_cd_controller::contract::MuConDeConfig;
 use mu_cd_controller::lease::{ClusterIdlePoller, LeaseCoordinator, DEFAULT_CONTROLLER_URL};
@@ -117,10 +117,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Optional read-only CD status API on a separate listener (disabled unless
+    // Optional CD status & deploy API on a separate listener (disabled unless
     // MUCONDE_CD_API_ADDR is set; bearer token from MUCONDE_CD_API_TOKEN_FILE).
     let cd_api_config = CdApiConfig::from_env();
-    let _cd_api = spawn_cd_api(&cd_api_config, cd_state.clone()).await?;
+    let _cd_api = spawn_cd_api_with_orchestrator(
+        &cd_api_config,
+        cd_state.clone(),
+        Some(orchestrator.clone()),
+    )
+    .await?;
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "deploy" {

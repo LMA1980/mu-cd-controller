@@ -21,7 +21,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,8 @@ use crate::cd_state::{
     evaluate_gate, now_epoch_ms, CdEvent, CdStateStore, DeploymentRecord, GateOutcome,
     GateTestView, GateVerdict, LeaseView, RollbackReason, Slot,
 };
+use crate::contract::MuConDeConfig;
+use crate::orchestrator::DeploymentOrchestrator;
 
 /// Default `limit` for `GET /api/cd/deployments`.
 pub const DEFAULT_DEPLOYMENTS_LIMIT: usize = 20;
@@ -91,6 +93,7 @@ pub fn load_token_file(path: &Path) -> Option<String> {
 #[derive(Clone)]
 pub struct CdApiState {
     pub store: Arc<CdStateStore>,
+    pub orchestrator: Option<Arc<DeploymentOrchestrator>>,
     token: Option<Arc<str>>,
     keep_alive: Duration,
 }
@@ -100,9 +103,17 @@ impl CdApiState {
     pub fn new(store: Arc<CdStateStore>, token: Option<String>) -> Self {
         Self {
             store,
+            orchestrator: None,
             token: token.map(Arc::from),
             keep_alive: DEFAULT_SSE_KEEP_ALIVE,
         }
+    }
+
+    /// Attaches a [`DeploymentOrchestrator`] so `POST /api/cd/deploy` can dispatch rollouts.
+    #[must_use]
+    pub fn with_orchestrator(mut self, orchestrator: Arc<DeploymentOrchestrator>) -> Self {
+        self.orchestrator = Some(orchestrator);
+        self
     }
 
     /// Overrides the SSE heartbeat interval.
@@ -411,6 +422,169 @@ async fn get_events(State(state): State<CdApiState>) -> impl IntoResponse {
     )
 }
 
+/// Request payload for `POST /api/cd/deploy`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployTriggerRequest {
+    pub repo: Option<String>,
+    pub artifact_sha256: String,
+    pub config: Option<MuConDeConfig>,
+    pub manifest_yaml: Option<String>,
+    pub repo_path: Option<String>,
+    #[serde(default)]
+    pub wait: bool,
+}
+
+/// Response payload for `POST /api/cd/deploy`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployTriggerResponse {
+    pub accepted: bool,
+    pub service: String,
+    pub target_nodes: Vec<String>,
+    pub artifact_sha256: String,
+    pub promoted_nodes: Vec<String>,
+    pub rolled_back_nodes: Vec<String>,
+}
+
+async fn post_deploy(
+    State(state): State<CdApiState>,
+    Json(req): Json<DeployTriggerRequest>,
+) -> Response {
+    let Some(orchestrator) = state.orchestrator.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "orchestrator_unavailable" })),
+        )
+            .into_response();
+    };
+
+    let config = if let Some(cfg) = req.config {
+        if let Err(e) = cfg.validate() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid_contract: {e}") })),
+            )
+                .into_response();
+        }
+        cfg
+    } else if let Some(ref yaml) = req.manifest_yaml {
+        match MuConDeConfig::from_yaml_str(yaml) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("invalid_manifest_yaml: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    } else if let Some(ref path) = req.repo_path {
+        match MuConDeConfig::from_file(path) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("invalid_repo_path: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing_contract" })),
+        )
+            .into_response();
+    };
+
+    let resolved_nodes = config.target_nodes.clone();
+    let service = config.service.clone();
+    let digest = req.artifact_sha256.trim().to_string();
+    if digest.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "empty_artifact_sha256" })),
+        )
+            .into_response();
+    }
+
+    if req.wait {
+        match orchestrator
+            .orchestrate_rollout_for_repo(&config, &digest, req.repo.as_deref())
+            .await
+        {
+            Ok(outcomes) => {
+                let mut promoted_nodes = Vec::new();
+                let mut rolled_back_nodes = Vec::new();
+                for o in &outcomes {
+                    match o {
+                        crate::orchestrator::DeploymentOutcome::Promoted {
+                            target_node, ..
+                        } => {
+                            promoted_nodes.push(target_node.clone());
+                        }
+                        crate::orchestrator::DeploymentOutcome::RolledBack {
+                            target_node, ..
+                        } => {
+                            rolled_back_nodes.push(target_node.clone());
+                        }
+                    }
+                }
+                let status = if rolled_back_nodes.is_empty() {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                };
+                (
+                    status,
+                    Json(DeployTriggerResponse {
+                        accepted: rolled_back_nodes.is_empty(),
+                        service,
+                        target_nodes: resolved_nodes,
+                        artifact_sha256: digest,
+                        promoted_nodes,
+                        rolled_back_nodes,
+                    }),
+                )
+                    .into_response()
+            }
+            Err(e) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response(),
+        }
+    } else {
+        let digest_bg = digest.clone();
+        let repo_bg = req.repo.clone();
+        let cfg_bg = config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = orchestrator
+                .orchestrate_rollout_for_repo(&cfg_bg, &digest_bg, repo_bg.as_deref())
+                .await
+            {
+                tracing::error!(
+                    service = %cfg_bg.service,
+                    digest = %digest_bg,
+                    error = %e,
+                    "Asynchronous CD rollout failed"
+                );
+            }
+        });
+        (
+            StatusCode::ACCEPTED,
+            Json(DeployTriggerResponse {
+                accepted: true,
+                service,
+                target_nodes: resolved_nodes,
+                artifact_sha256: digest,
+                promoted_nodes: Vec::new(),
+                rolled_back_nodes: Vec::new(),
+            }),
+        )
+            .into_response()
+    }
+}
+
 /// Builds the `/api/cd/*` router; every route sits behind the bearer-token gate.
 pub fn router(state: CdApiState) -> Router {
     Router::new()
@@ -418,6 +592,7 @@ pub fn router(state: CdApiState) -> Router {
         .route("/api/cd/deployments/{id}/gate", get(get_gate))
         .route("/api/cd/leases", get(get_leases))
         .route("/api/cd/events", get(get_events))
+        .route("/api/cd/deploy", post(post_deploy))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
@@ -435,6 +610,15 @@ pub async fn spawn_cd_api(
     config: &CdApiConfig,
     store: Arc<CdStateStore>,
 ) -> std::io::Result<Option<(SocketAddr, tokio::task::JoinHandle<()>)>> {
+    spawn_cd_api_with_orchestrator(config, store, None).await
+}
+
+/// Binds and spawns the CD API with an attached [`DeploymentOrchestrator`] for `POST /api/cd/deploy`.
+pub async fn spawn_cd_api_with_orchestrator(
+    config: &CdApiConfig,
+    store: Arc<CdStateStore>,
+    orchestrator: Option<Arc<DeploymentOrchestrator>>,
+) -> std::io::Result<Option<(SocketAddr, tokio::task::JoinHandle<()>)>> {
     let Some(addr) = config.bind_addr.as_deref() else {
         return Ok(None);
     };
@@ -449,13 +633,16 @@ pub async fn spawn_cd_api(
     };
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
-    let state = CdApiState::new(store, token);
+    let mut state = CdApiState::new(store, token);
+    if let Some(orch) = orchestrator {
+        state = state.with_orchestrator(orch);
+    }
     let handle = tokio::spawn(async move {
         if let Err(e) = serve(listener, state).await {
             tracing::error!(error = %e, "CD API listener stopped");
         }
     });
-    tracing::info!(addr = %local, "MuConDe CD status API listening (read-only, bearer auth)");
+    tracing::info!(addr = %local, "MuConDe CD status API listening (bearer auth)");
     Ok(Some((local, handle)))
 }
 
