@@ -337,8 +337,8 @@ pub fn resolve_target_node_from_map(logical: &str, map_str: &str) -> String {
 
 /// Resolves and deduplicates a list of logical target node names while preserving order.
 pub fn resolve_target_nodes(nodes: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(nodes.len());
-    for n in nodes {
+    let mut out = Vec::new();
+    for n in nodes.iter().take(64) {
         let resolved = resolve_target_node(n);
         if !resolved.is_empty() && !out.contains(&resolved) {
             out.push(resolved);
@@ -725,14 +725,14 @@ impl DeploymentOrchestrator {
         repo: Option<&str>,
     ) -> Result<Vec<DeploymentOutcome>, OrchestratorError> {
         config.validate()?;
-        let mut targets = Vec::with_capacity(config.target_nodes.len());
-        for n in &config.target_nodes {
+        let mut targets = Vec::new();
+        for n in config.target_nodes.iter().take(64) {
             let trimmed = n.trim().to_string();
             if !trimmed.is_empty() && !targets.contains(&trimmed) {
                 targets.push(trimmed);
             }
         }
-        let mut outcomes = Vec::with_capacity(targets.len());
+        let mut outcomes = Vec::new();
         for node in targets {
             let mut single_cfg = config.clone();
             single_cfg.target_nodes = vec![node];
