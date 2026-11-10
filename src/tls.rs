@@ -20,7 +20,6 @@ pub struct TlsConfig {
     pub ca_cert_pem: Option<String>,
     pub client_cert_pem: Option<String>,
     pub client_key_pem: Option<String>,
-    pub danger_accept_invalid_certs: bool,
 }
 
 impl TlsConfig {
@@ -37,7 +36,6 @@ impl TlsConfig {
             ca_cert_pem: None,
             client_cert_pem: None,
             client_key_pem: None,
-            danger_accept_invalid_certs: false,
         }
     }
 
@@ -54,14 +52,7 @@ impl TlsConfig {
             ca_cert_pem: Some(ca_cert_pem.into()),
             client_cert_pem: Some(client_cert_pem.into()),
             client_key_pem: Some(client_key_pem.into()),
-            danger_accept_invalid_certs: false,
         }
-    }
-
-    /// Allow insecure / self-signed certificate validation for isolated test environments.
-    pub fn with_danger_accept_invalid_certs(mut self, accept: bool) -> Self {
-        self.danger_accept_invalid_certs = accept;
-        self
     }
 
     /// Ensures the default crypto provider is installed.
@@ -196,18 +187,6 @@ impl TlsConfig {
     pub fn build_reqwest_client(&self) -> Result<reqwest::Client, TlsError> {
         let mut builder = reqwest::Client::builder();
 
-        #[cfg(test)]
-        if self.danger_accept_invalid_certs {
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-
-        #[cfg(not(test))]
-        if self.danger_accept_invalid_certs {
-            return Err(TlsError::InvalidCertificate(
-                "danger_accept_invalid_certs is strictly disabled in production builds".into(),
-            ));
-        }
-
         // Add root CA certificates if provided
         if let Some(ref pem) = self.ca_cert_pem {
             let cert = reqwest::Certificate::from_pem(pem.as_bytes())
@@ -265,10 +244,68 @@ mod tests {
     }
 
     #[test]
-    fn test_danger_accept_invalid_certs_in_test() {
-        let cfg = TlsConfig::default().with_danger_accept_invalid_certs(true);
-        assert!(cfg.danger_accept_invalid_certs);
+    #[cfg_attr(miri, ignore)]
+    fn test_custom_ca_cert_pem_builds_client_with_root_certificate() {
+        let mut ca_params = rcgen::CertificateParams::new(vec!["Test Custom CA".into()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let cfg = TlsConfig {
+            ca_cert_pem: Some(ca_cert.pem()),
+            ..Default::default()
+        };
         let client = cfg.build_reqwest_client();
-        assert!(client.is_ok());
+        assert!(
+            client.is_ok(),
+            "Client should successfully build with custom root CA certificate PEM"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_custom_ca_cert_path_builds_client_with_root_certificate() {
+        let mut ca_params = rcgen::CertificateParams::new(vec!["Test File CA".into()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ca_path = temp_dir.path().join("ca.pem");
+        std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+
+        let cfg = TlsConfig {
+            ca_cert_path: Some(ca_path),
+            ..Default::default()
+        };
+        let client = cfg.build_reqwest_client();
+        assert!(
+            client.is_ok(),
+            "Client should successfully build with custom root CA certificate file path"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_client_mtls_identity_builds_client() {
+        let mut ca_params = rcgen::CertificateParams::new(vec!["Test CA".into()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+        let client_params = rcgen::CertificateParams::new(vec!["client-identity".into()]).unwrap();
+        let client_key = rcgen::KeyPair::generate().unwrap();
+        let client_cert = client_params.signed_by(&client_key, &ca_issuer).unwrap();
+
+        let cfg = TlsConfig {
+            client_cert_pem: Some(client_cert.pem()),
+            client_key_pem: Some(client_key.serialize_pem()),
+            ..Default::default()
+        };
+        let client = cfg.build_reqwest_client();
+        assert!(
+            client.is_ok(),
+            "Client should successfully build with client mTLS certificate and key PEM"
+        );
     }
 }
