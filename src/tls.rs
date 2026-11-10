@@ -196,8 +196,16 @@ impl TlsConfig {
     pub fn build_reqwest_client(&self) -> Result<reqwest::Client, TlsError> {
         let mut builder = reqwest::Client::builder();
 
+        #[cfg(test)]
         if self.danger_accept_invalid_certs {
             builder = builder.danger_accept_invalid_certs(true);
+        }
+
+        #[cfg(not(test))]
+        if self.danger_accept_invalid_certs {
+            return Err(TlsError::InvalidCertificate(
+                "danger_accept_invalid_certs is strictly disabled in production builds".into(),
+            ));
         }
 
         // Add root CA certificates if provided
@@ -254,5 +262,13 @@ mod tests {
         let cfg =
             TlsConfig::from_pem_strings("not-a-valid-cert", "not-a-valid-cert", "not-a-valid-key");
         assert!(cfg.load_ca_certificates().is_err());
+    }
+
+    #[test]
+    fn test_danger_accept_invalid_certs_in_test() {
+        let cfg = TlsConfig::default().with_danger_accept_invalid_certs(true);
+        assert!(cfg.danger_accept_invalid_certs);
+        let client = cfg.build_reqwest_client();
+        assert!(client.is_ok());
     }
 }
