@@ -1,14 +1,14 @@
 [package]
 name = "mu-cd-controller"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Continuous Delivery control plane orchestrating zero-downtime A/B deployments, lease coordination, and taint enforcement"
 license = "AGPL-3.0-only"
 repository = "https://github.com/LMA1980/mu-cd-controller"
 
 [dependencies]
-mu-cd-ipc = { git = "https://github.com/LMA1980/mu-cd-ipc.git", branch = "feat/m8-naming-alignment" }
-mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git", branch = "feat/m8-naming-alignment" }
+mu-cd-ipc = { git = "https://github.com/LMA1980/mu-cd-ipc.git", branch = "main" }
+mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git", branch = "main" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process", "net", "signal"] }
 tokio-rustls = "0.26"
 rustls = "0.23"

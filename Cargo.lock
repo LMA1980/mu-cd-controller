@@ -1145,7 +1145,7 @@ dependencies = [
 
 [[package]]
 name = "mu-cd-controller"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1176,7 +1176,7 @@ dependencies = [
 [[package]]
 name = "mu-cd-ipc"
 version = "0.2.0"
-source = "git+https://github.com/LMA1980/mu-cd-ipc.git?branch=feat%2Fm8-naming-alignment#ec3e0aee1c7635801dc004dac5fdfcc890e85ea9"
+source = "git+https://github.com/LMA1980/mu-cd-ipc.git?branch=main#3335a306e6e9deae404aab0edb07900d0979cbdf"
 dependencies = [
  "bytes",
  "fory",
@@ -1190,7 +1190,7 @@ dependencies = [
 [[package]]
 name = "mu-observable-ipc"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-observable-ipc.git?branch=feat%2Fm8-naming-alignment#28793ce66732461cb68c3aef3006154939265abb"
+source = "git+https://github.com/LMA1980/mu-observable-ipc.git?branch=main#8ae17bcca3ddbd3566e40f1b364afd487306f80c"
 dependencies = [
  "arrow",
  "bytes",

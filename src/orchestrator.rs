@@ -28,7 +28,9 @@ use crate::contract::MuConDeConfig;
 use crate::error::{LeaseError, OrchestratorError};
 use crate::lease::{ClusterIdlePoller, LeaseCoordinator};
 use crate::slo::CanarySloClient;
+use crate::telemetry::{build_cd_span, now_unix_nano, CdTelemetrySink};
 use crate::tls::TlsConfig;
+use mu_observable_ipc::TraceContext;
 
 /// Default MuRegist server URL used across continuous delivery fabric.
 pub const DEFAULT_REGISTRY_URL: &str = "https://registry.ci.ci.internal:8444";
@@ -619,6 +621,7 @@ pub struct DeploymentOrchestrator {
     slo_client: Option<Arc<dyn CanarySloClient>>,
     tainted_digests: Arc<RwLock<HashSet<String>>>,
     cd_state: Option<Arc<CdStateStore>>,
+    telemetry_sink: Option<Arc<dyn CdTelemetrySink>>,
 }
 
 impl DeploymentOrchestrator {
@@ -637,7 +640,14 @@ impl DeploymentOrchestrator {
             slo_client: None,
             tainted_digests: Arc::new(RwLock::new(HashSet::new())),
             cd_state: None,
+            telemetry_sink: None,
         }
+    }
+
+    /// Attach a [`CdTelemetrySink`] (`MuObserveCdSink`) to stream W3C trace spans to `muObserve`.
+    pub fn with_telemetry_sink(mut self, sink: Arc<dyn CdTelemetrySink>) -> Self {
+        self.telemetry_sink = Some(sink);
+        self
     }
 
     /// Publish deployment, gate, lease and outcome changes to the read-only CD API state.
@@ -724,6 +734,18 @@ impl DeploymentOrchestrator {
         artifact_sha256: &str,
         repo: Option<&str>,
     ) -> Result<Vec<DeploymentOutcome>, OrchestratorError> {
+        self.orchestrate_rollout_for_repo_with_trace(config, artifact_sha256, repo, None)
+            .await
+    }
+
+    /// Same as [`Self::orchestrate_rollout_for_repo`], propagating parent W3C [`TraceContext`].
+    pub async fn orchestrate_rollout_for_repo_with_trace(
+        &self,
+        config: &MuConDeConfig,
+        artifact_sha256: &str,
+        repo: Option<&str>,
+        parent_trace: Option<TraceContext>,
+    ) -> Result<Vec<DeploymentOutcome>, OrchestratorError> {
         config.validate()?;
         let mut targets = Vec::new();
         for n in config.target_nodes.iter().take(64) {
@@ -737,7 +759,13 @@ impl DeploymentOrchestrator {
             let mut single_cfg = config.clone();
             single_cfg.target_nodes = vec![node];
             let outcome = self
-                .orchestrate_deployment_for_repo(&single_cfg, artifact_sha256, None, repo)
+                .orchestrate_deployment_for_repo_with_trace(
+                    &single_cfg,
+                    artifact_sha256,
+                    None,
+                    repo,
+                    parent_trace,
+                )
                 .await?;
             let rolled_back = outcome.is_rolled_back();
             outcomes.push(outcome);
@@ -780,6 +808,37 @@ impl DeploymentOrchestrator {
         custom_deployment_id: Option<String>,
         repo: Option<&str>,
     ) -> Result<DeploymentOutcome, OrchestratorError> {
+        self.orchestrate_deployment_for_repo_with_trace(
+            config,
+            artifact_sha256,
+            custom_deployment_id,
+            repo,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`Self::orchestrate_deployment_for_repo`], propagating parent W3C [`TraceContext`]
+    /// and emitting OpenTelemetry spans for `cd.deployment.start`, `cd.slot.stage_b`, and `cd.gate.evaluate`.
+    pub async fn orchestrate_deployment_for_repo_with_trace(
+        &self,
+        config: &MuConDeConfig,
+        artifact_sha256: &str,
+        custom_deployment_id: Option<String>,
+        repo: Option<&str>,
+        parent_trace: Option<TraceContext>,
+    ) -> Result<DeploymentOutcome, OrchestratorError> {
+        let dep_start_ns = now_unix_nano();
+        let root_trace = parent_trace.unwrap_or_else(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            TraceContext::from_seed(now, 0x4d55_4344_0000_0001, 0x5350_414e_0000_0001, true)
+        });
+        let dep_span_ctx = root_trace.next_deterministic_child(1);
+        let mut spans_to_emit = Vec::new();
+
         // Step 1: Enforce Digest Tainting Pre-check (#10)
         if self.is_digest_tainted(artifact_sha256).await? {
             return Err(OrchestratorError::ArtifactTainted(
@@ -814,8 +873,6 @@ impl DeploymentOrchestrator {
         }
 
         if let Some(ref store) = self.cd_state {
-            // Contract test list in order; "all" is expanded by the agent's Pending frames.
-            // The contract has no per-test criticality, so every contract test is critical.
             let tests = config
                 .selected_tests()
                 .map(|t| t.iter().map(|n| (n.clone(), true)).collect())
@@ -840,10 +897,13 @@ impl DeploymentOrchestrator {
             target_slot: grant.candidate_slot,
         };
 
+        let stage_start_ns = now_unix_nano();
         let stage_result = self
             .agent_client
             .stage_deployment(&target_node, &stage_req)
             .await;
+        let stage_end_ns = now_unix_nano();
+        let stage_span_ctx = root_trace.next_deterministic_child(2);
 
         let stage_ok = match stage_result {
             Ok(ref resp) if resp.staged_ok => true,
@@ -852,6 +912,47 @@ impl DeploymentOrchestrator {
                     .error_message
                     .clone()
                     .unwrap_or_else(|| "Staging refused by agent".to_string());
+                spans_to_emit.push(build_cd_span(
+                    stage_span_ctx.trace_id,
+                    stage_span_ctx.span_id,
+                    Some(dep_span_ctx.span_id),
+                    &target_node,
+                    "cd.slot.stage_b",
+                    "INTERNAL",
+                    stage_start_ns,
+                    stage_end_ns,
+                    "ERROR",
+                    Some(err_msg.clone()),
+                    serde_json::json!({
+                        "deployment_id": &deployment_id,
+                        "service": &config.service,
+                        "slot": "b",
+                        "target_node": &target_node,
+                    }),
+                ));
+                spans_to_emit.push(build_cd_span(
+                    dep_span_ctx.trace_id,
+                    dep_span_ctx.span_id,
+                    if root_trace.span_id == dep_span_ctx.span_id {
+                        None
+                    } else {
+                        Some(root_trace.span_id)
+                    },
+                    &target_node,
+                    &format!("cd.deployment.start:{}", config.service),
+                    "SERVER",
+                    dep_start_ns,
+                    now_unix_nano(),
+                    "ERROR",
+                    Some(format!("Staging failed: {err_msg}")),
+                    serde_json::json!({
+                        "deployment_id": &deployment_id,
+                        "service": &config.service,
+                        "target_node": &target_node,
+                        "artifact_sha256": artifact_sha256,
+                    }),
+                ));
+                self.emit_telemetry_spans(spans_to_emit).await;
                 return self
                     .handle_failure_and_rollback(
                         &grant,
@@ -863,13 +964,55 @@ impl DeploymentOrchestrator {
                     .await;
             }
             Err(e) => {
+                let err_msg = format!("Agent stage IPC error: {e}");
+                spans_to_emit.push(build_cd_span(
+                    stage_span_ctx.trace_id,
+                    stage_span_ctx.span_id,
+                    Some(dep_span_ctx.span_id),
+                    &target_node,
+                    "cd.slot.stage_b",
+                    "INTERNAL",
+                    stage_start_ns,
+                    stage_end_ns,
+                    "ERROR",
+                    Some(err_msg.clone()),
+                    serde_json::json!({
+                        "deployment_id": &deployment_id,
+                        "service": &config.service,
+                        "slot": "b",
+                        "target_node": &target_node,
+                    }),
+                ));
+                spans_to_emit.push(build_cd_span(
+                    dep_span_ctx.trace_id,
+                    dep_span_ctx.span_id,
+                    if root_trace.span_id == dep_span_ctx.span_id {
+                        None
+                    } else {
+                        Some(root_trace.span_id)
+                    },
+                    &target_node,
+                    &format!("cd.deployment.start:{}", config.service),
+                    "SERVER",
+                    dep_start_ns,
+                    now_unix_nano(),
+                    "ERROR",
+                    Some(err_msg.clone()),
+                    serde_json::json!({
+                        "deployment_id": &deployment_id,
+                        "service": &config.service,
+                        "target_node": &target_node,
+                        "artifact_sha256": artifact_sha256,
+                    }),
+                ));
+                self.emit_telemetry_spans(spans_to_emit).await;
                 return self
                     .handle_failure_and_rollback(
                         &grant,
                         config,
                         &target_node,
                         artifact_sha256,
-                        &format!("Agent stage IPC error: {e}"),
+                        &err_msg,
                     )
                     .await;
             }
@@ -887,6 +1030,25 @@ impl DeploymentOrchestrator {
                 .await;
         }
 
+        spans_to_emit.push(build_cd_span(
+            stage_span_ctx.trace_id,
+            stage_span_ctx.span_id,
+            Some(dep_span_ctx.span_id),
+            &target_node,
+            "cd.slot.stage_b",
+            "INTERNAL",
+            stage_start_ns,
+            stage_end_ns,
+            "OK",
+            None,
+            serde_json::json!({
+                "deployment_id": &deployment_id,
+                "service": &config.service,
+                "slot": "b",
+                "target_node": &target_node,
+            }),
+        ));
+
         // Step 5: Instruct agent to perform atomic slot swap to Slot B
         let swap_cmd = SlotSwapCommand {
             deployment_id: deployment_id.clone(),
@@ -899,18 +1061,43 @@ impl DeploymentOrchestrator {
         };
 
         if let Err(e) = self.agent_client.slot_swap(&target_node, &swap_cmd).await {
+            let err_msg = format!("Atomic slot swap failed: {e}");
+            spans_to_emit.push(build_cd_span(
+                dep_span_ctx.trace_id,
+                dep_span_ctx.span_id,
+                if root_trace.span_id == dep_span_ctx.span_id {
+                    None
+                } else {
+                    Some(root_trace.span_id)
+                },
+                &target_node,
+                &format!("cd.deployment.start:{}", config.service),
+                "SERVER",
+                dep_start_ns,
+                now_unix_nano(),
+                "ERROR",
+                Some(err_msg.clone()),
+                serde_json::json!({
+                    "deployment_id": &deployment_id,
+                    "service": &config.service,
+                    "target_node": &target_node,
+                    "artifact_sha256": artifact_sha256,
+                }),
+            ));
+            self.emit_telemetry_spans(spans_to_emit).await;
             return self
                 .handle_failure_and_rollback(
                     &grant,
                     config,
                     &target_node,
                     artifact_sha256,
-                    &format!("Atomic slot swap failed: {e}"),
+                    &err_msg,
                 )
                 .await;
         }
 
         // Step 6: Await integration test execution and health watchdog
+        let it_start_ns = now_unix_nano();
         let it_timeout = Duration::from_secs(config.warmup_timeout_seconds);
         let it_result = self
             .agent_client
@@ -932,13 +1119,55 @@ impl DeploymentOrchestrator {
                 r
             }
             Err(e) => {
+                let err_msg = format!("Integration test communication failure: {e}");
+                let gate_span_ctx = root_trace.next_deterministic_child(3);
+                spans_to_emit.push(build_cd_span(
+                    gate_span_ctx.trace_id,
+                    gate_span_ctx.span_id,
+                    Some(dep_span_ctx.span_id),
+                    &target_node,
+                    "cd.gate.evaluate",
+                    "INTERNAL",
+                    it_start_ns,
+                    now_unix_nano(),
+                    "ERROR",
+                    Some(err_msg.clone()),
+                    serde_json::json!({
+                        "deployment_id": &deployment_id,
+                        "service": &config.service,
+                        "target_node": &target_node,
+                    }),
+                ));
+                spans_to_emit.push(build_cd_span(
+                    dep_span_ctx.trace_id,
+                    dep_span_ctx.span_id,
+                    if root_trace.span_id == dep_span_ctx.span_id {
+                        None
+                    } else {
+                        Some(root_trace.span_id)
+                    },
+                    &target_node,
+                    &format!("cd.deployment.start:{}", config.service),
+                    "SERVER",
+                    dep_start_ns,
+                    now_unix_nano(),
+                    "ERROR",
+                    Some(err_msg.clone()),
+                    serde_json::json!({
+                        "deployment_id": &deployment_id,
+                        "service": &config.service,
+                        "target_node": &target_node,
+                        "artifact_sha256": artifact_sha256,
+                    }),
+                ));
+                self.emit_telemetry_spans(spans_to_emit).await;
                 return self
                     .handle_failure_and_rollback(
                         &grant,
                         config,
                         &target_node,
                         artifact_sha256,
-                        &format!("Integration test communication failure: {e}"),
+                        &err_msg,
                     )
                     .await;
             }
@@ -949,19 +1178,96 @@ impl DeploymentOrchestrator {
         let lease_expired = now_ms >= grant.expires_at_epoch_ms;
 
         if lease_expired {
+            let reason = "Lease TTL expired before integration tests completed".to_string();
+            let gate_span_ctx = root_trace.next_deterministic_child(3);
+            spans_to_emit.push(build_cd_span(
+                gate_span_ctx.trace_id,
+                gate_span_ctx.span_id,
+                Some(dep_span_ctx.span_id),
+                &target_node,
+                "cd.gate.evaluate",
+                "INTERNAL",
+                it_start_ns,
+                now_unix_nano(),
+                "ERROR",
+                Some(reason.clone()),
+                serde_json::json!({
+                    "deployment_id": &deployment_id,
+                    "service": &config.service,
+                    "target_node": &target_node,
+                }),
+            ));
+            spans_to_emit.push(build_cd_span(
+                dep_span_ctx.trace_id,
+                dep_span_ctx.span_id,
+                if root_trace.span_id == dep_span_ctx.span_id {
+                    None
+                } else {
+                    Some(root_trace.span_id)
+                },
+                &target_node,
+                &format!("cd.deployment.start:{}", config.service),
+                "SERVER",
+                dep_start_ns,
+                now_unix_nano(),
+                "ERROR",
+                Some(reason.clone()),
+                serde_json::json!({
+                    "deployment_id": &deployment_id,
+                    "service": &config.service,
+                    "target_node": &target_node,
+                    "artifact_sha256": artifact_sha256,
+                }),
+            ));
+            self.emit_telemetry_spans(spans_to_emit).await;
             return self
-                .handle_failure_and_rollback(
-                    &grant,
-                    config,
-                    &target_node,
-                    artifact_sha256,
-                    "Lease TTL expired before integration tests completed",
-                )
+                .handle_failure_and_rollback(&grant, config, &target_node, artifact_sha256, &reason)
                 .await;
         }
 
         if !report.passed || !report.failed_tests.is_empty() {
             let reason = format!("Integration tests failed: {:?}", report.failed_tests);
+            let gate_span_ctx = root_trace.next_deterministic_child(3);
+            spans_to_emit.push(build_cd_span(
+                gate_span_ctx.trace_id,
+                gate_span_ctx.span_id,
+                Some(dep_span_ctx.span_id),
+                &target_node,
+                "cd.gate.evaluate",
+                "INTERNAL",
+                it_start_ns,
+                now_unix_nano(),
+                "ERROR",
+                Some(reason.clone()),
+                serde_json::json!({
+                    "deployment_id": &deployment_id,
+                    "service": &config.service,
+                    "target_node": &target_node,
+                }),
+            ));
+            spans_to_emit.push(build_cd_span(
+                dep_span_ctx.trace_id,
+                dep_span_ctx.span_id,
+                if root_trace.span_id == dep_span_ctx.span_id {
+                    None
+                } else {
+                    Some(root_trace.span_id)
+                },
+                &target_node,
+                &format!("cd.deployment.start:{}", config.service),
+                "SERVER",
+                dep_start_ns,
+                now_unix_nano(),
+                "ERROR",
+                Some(reason.clone()),
+                serde_json::json!({
+                    "deployment_id": &deployment_id,
+                    "service": &config.service,
+                    "target_node": &target_node,
+                    "artifact_sha256": artifact_sha256,
+                }),
+            ));
+            self.emit_telemetry_spans(spans_to_emit).await;
             return self
                 .handle_failure_and_rollback(&grant, config, &target_node, artifact_sha256, &reason)
                 .await;
@@ -990,6 +1296,47 @@ impl DeploymentOrchestrator {
                             slo_resp.p99_latency_ms,
                             slo_resp.reason
                         );
+                        let gate_span_ctx = root_trace.next_deterministic_child(3);
+                        spans_to_emit.push(build_cd_span(
+                            gate_span_ctx.trace_id,
+                            gate_span_ctx.span_id,
+                            Some(dep_span_ctx.span_id),
+                            &target_node,
+                            "cd.gate.evaluate",
+                            "INTERNAL",
+                            it_start_ns,
+                            now_unix_nano(),
+                            "ERROR",
+                            Some(reason.clone()),
+                            serde_json::json!({
+                                "deployment_id": &deployment_id,
+                                "service": &config.service,
+                                "target_node": &target_node,
+                            }),
+                        ));
+                        spans_to_emit.push(build_cd_span(
+                            dep_span_ctx.trace_id,
+                            dep_span_ctx.span_id,
+                            if root_trace.span_id == dep_span_ctx.span_id {
+                                None
+                            } else {
+                                Some(root_trace.span_id)
+                            },
+                            &target_node,
+                            &format!("cd.deployment.start:{}", config.service),
+                            "SERVER",
+                            dep_start_ns,
+                            now_unix_nano(),
+                            "ERROR",
+                            Some(reason.clone()),
+                            serde_json::json!({
+                                "deployment_id": &deployment_id,
+                                "service": &config.service,
+                                "target_node": &target_node,
+                                "artifact_sha256": artifact_sha256,
+                            }),
+                        ));
+                        self.emit_telemetry_spans(spans_to_emit).await;
                         return self
                             .handle_failure_and_rollback(
                                 &grant,
@@ -1003,6 +1350,47 @@ impl DeploymentOrchestrator {
                 }
                 Err(e) => {
                     let reason = format!("MuObserve canary SLO verification error: {e}");
+                    let gate_span_ctx = root_trace.next_deterministic_child(3);
+                    spans_to_emit.push(build_cd_span(
+                        gate_span_ctx.trace_id,
+                        gate_span_ctx.span_id,
+                        Some(dep_span_ctx.span_id),
+                        &target_node,
+                        "cd.gate.evaluate",
+                        "INTERNAL",
+                        it_start_ns,
+                        now_unix_nano(),
+                        "ERROR",
+                        Some(reason.clone()),
+                        serde_json::json!({
+                            "deployment_id": &deployment_id,
+                            "service": &config.service,
+                            "target_node": &target_node,
+                        }),
+                    ));
+                    spans_to_emit.push(build_cd_span(
+                        dep_span_ctx.trace_id,
+                        dep_span_ctx.span_id,
+                        if root_trace.span_id == dep_span_ctx.span_id {
+                            None
+                        } else {
+                            Some(root_trace.span_id)
+                        },
+                        &target_node,
+                        &format!("cd.deployment.start:{}", config.service),
+                        "SERVER",
+                        dep_start_ns,
+                        now_unix_nano(),
+                        "ERROR",
+                        Some(reason.clone()),
+                        serde_json::json!({
+                            "deployment_id": &deployment_id,
+                            "service": &config.service,
+                            "target_node": &target_node,
+                            "artifact_sha256": artifact_sha256,
+                        }),
+                    ));
+                    self.emit_telemetry_spans(spans_to_emit).await;
                     return self
                         .handle_failure_and_rollback(
                             &grant,
@@ -1015,6 +1403,26 @@ impl DeploymentOrchestrator {
                 }
             }
         }
+
+        // Gate evaluated successfully
+        let gate_span_ctx = root_trace.next_deterministic_child(3);
+        spans_to_emit.push(build_cd_span(
+            gate_span_ctx.trace_id,
+            gate_span_ctx.span_id,
+            Some(dep_span_ctx.span_id),
+            &target_node,
+            "cd.gate.evaluate",
+            "INTERNAL",
+            it_start_ns,
+            now_unix_nano(),
+            "OK",
+            None,
+            serde_json::json!({
+                "deployment_id": &deployment_id,
+                "service": &config.service,
+                "target_node": &target_node,
+            }),
+        ));
 
         // Step 7: Success Path - Promotion to Slot A (#9)
         // Mark lease as promoted so background expiration sweeps do not trigger rollback
@@ -1037,12 +1445,43 @@ impl DeploymentOrchestrator {
         }
         self.sync_leases().await;
 
+        // Emit successful root CD deployment span
+        spans_to_emit.push(build_cd_span(
+            dep_span_ctx.trace_id,
+            dep_span_ctx.span_id,
+            if root_trace.span_id == dep_span_ctx.span_id {
+                None
+            } else {
+                Some(root_trace.span_id)
+            },
+            &target_node,
+            &format!("cd.deployment.start:{}", config.service),
+            "SERVER",
+            dep_start_ns,
+            now_unix_nano(),
+            "OK",
+            None,
+            serde_json::json!({
+                "deployment_id": &deployment_id,
+                "service": &config.service,
+                "target_node": &target_node,
+                "artifact_sha256": artifact_sha256,
+            }),
+        ));
+        self.emit_telemetry_spans(spans_to_emit).await;
+
         Ok(DeploymentOutcome::Promoted {
             deployment_id,
             service: config.service.clone(),
             target_node,
             artifact_sha256: artifact_sha256.to_string(),
         })
+    }
+
+    async fn emit_telemetry_spans(&self, spans: Vec<mu_observable_ipc::OtelSpanEntry>) {
+        if let Some(ref sink) = self.telemetry_sink {
+            sink.emit_spans(spans).await;
+        }
     }
 
     /// Handles failure, lease expiration, or IT regression by triggering atomic rollback
@@ -1520,5 +1959,89 @@ mod tests {
         assert!(outcomes.iter().all(DeploymentOutcome::is_promoted));
         assert_eq!(agent.stage_calls.load(Ordering::SeqCst), 2);
         assert_eq!(agent.swap_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_orchestrate_deployment_emits_w3c_trace_spans() {
+        use crate::telemetry::RecordingCdTelemetrySink;
+
+        let coordinator = Arc::new(LeaseCoordinator::new());
+        let agent = Arc::new(MockAgentClient {
+            stage_ok: AtomicBool::new(true),
+            swap_ok: AtomicBool::new(true),
+            it_passed: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let regist = Arc::new(MockMuRegistClient::default());
+        let recording_sink = Arc::new(RecordingCdTelemetrySink::new());
+
+        let orchestrator = DeploymentOrchestrator::new(coordinator, None, agent, regist)
+            .with_telemetry_sink(recording_sink.clone());
+
+        let mut config = sample_config();
+        config.target_nodes = vec!["node-a".into()];
+
+        let root_trace = TraceContext::from_seed(
+            0x1111_2222_3333_4444,
+            0x5555_6666_7777_8888,
+            0x9999_aaaa_bbbb_cccc,
+            true,
+        );
+
+        let outcome = orchestrator
+            .orchestrate_deployment_for_repo_with_trace(
+                &config,
+                "sha256-trace-test",
+                Some("dep-trace-1".into()),
+                Some("LMA1980/test-repo"),
+                Some(root_trace),
+            )
+            .await
+            .expect("deployment should succeed");
+
+        assert!(outcome.is_promoted());
+
+        let spans = recording_sink.recorded_spans().await;
+        assert_eq!(
+            spans.len(),
+            3,
+            "expected 3 spans: stage_b, gate.evaluate, deployment.start"
+        );
+
+        let stage_span = spans
+            .iter()
+            .find(|s| s.span_name == "cd.slot.stage_b")
+            .expect("cd.slot.stage_b");
+        let gate_span = spans
+            .iter()
+            .find(|s| s.span_name == "cd.gate.evaluate")
+            .expect("cd.gate.evaluate");
+        let dep_span = spans
+            .iter()
+            .find(|s| s.span_name.starts_with("cd.deployment.start:"))
+            .expect("cd.deployment.start");
+
+        let expected_trace_id = mu_observable_ipc::encode_hex(&root_trace.trace_id);
+        assert_eq!(stage_span.trace_id, expected_trace_id);
+        assert_eq!(gate_span.trace_id, expected_trace_id);
+        assert_eq!(dep_span.trace_id, expected_trace_id);
+
+        assert_eq!(
+            stage_span.parent_span_id.as_deref(),
+            Some(dep_span.span_id.as_str())
+        );
+        assert_eq!(
+            gate_span.parent_span_id.as_deref(),
+            Some(dep_span.span_id.as_str())
+        );
+        assert_eq!(
+            dep_span.parent_span_id.as_deref(),
+            Some(mu_observable_ipc::encode_hex(&root_trace.span_id).as_str())
+        );
+
+        assert_eq!(stage_span.status_code, "OK");
+        assert_eq!(gate_span.status_code, "OK");
+        assert_eq!(dep_span.status_code, "OK");
     }
 }
