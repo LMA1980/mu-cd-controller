@@ -16,6 +16,7 @@ use mu_cd_controller::orchestrator::{
     DEFAULT_REGISTRY_URL,
 };
 use mu_cd_controller::slo::MuObserveSloClient;
+use mu_cd_controller::telemetry::{CdTelemetrySink, MuObserveCdSink};
 use mu_cd_controller::tls::TlsConfig;
 
 #[tokio::main]
@@ -73,9 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent_client =
         Arc::new(IpcAgentClient::new(agent_port).with_progress_sink(cd_state.clone()));
 
+    let cd_sink: Arc<dyn CdTelemetrySink> = Arc::new(MuObserveCdSink::from_env());
     let mut orchestrator =
         DeploymentOrchestrator::new(coordinator.clone(), poller, agent_client, regist_client)
-            .with_cd_state(cd_state.clone());
+            .with_cd_state(cd_state.clone())
+            .with_telemetry_sink(cd_sink);
 
     if let Ok(muobserve_addr) = std::env::var("MUOBSERVE_ADDR") {
         let slo_client = Arc::new(MuObserveSloClient::new(muobserve_addr, tls_config.clone()));
