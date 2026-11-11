@@ -12,6 +12,7 @@ pub mod error;
 pub mod lease;
 pub mod orchestrator;
 pub mod slo;
+pub mod telemetry;
 pub mod tls;
 
 // Re-exports of common primary types for ergonomic library use
@@ -31,6 +32,7 @@ pub use orchestrator::{
 pub use slo::{
     CanarySloClient, MuObserveSloClient, DEFAULT_MUOBSERVE_ADDR, DEFAULT_MUOBSERVE_SERVER_NAME,
 };
+pub use telemetry::{CdTelemetrySink, MuObserveCdSink, RecordingCdTelemetrySink, CD_SERVICE_NAME};
 pub use tls::TlsConfig;
 
 /// Daemon version string.

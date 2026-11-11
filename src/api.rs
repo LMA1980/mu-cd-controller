@@ -447,6 +447,7 @@ pub struct DeployTriggerResponse {
 
 async fn post_deploy(
     State(state): State<CdApiState>,
+    headers: HeaderMap,
     Json(req): Json<DeployTriggerRequest>,
 ) -> Response {
     let Some(orchestrator) = state.orchestrator.clone() else {
@@ -456,6 +457,11 @@ async fn post_deploy(
         )
             .into_response();
     };
+
+    let incoming_trace = headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| mu_observable_ipc::TraceContext::parse_traceparent(s).ok());
 
     let config = if let Some(cfg) = req.config {
         if let Err(e) = cfg.validate() {
@@ -509,7 +515,12 @@ async fn post_deploy(
 
     if req.wait {
         match orchestrator
-            .orchestrate_rollout_for_repo(&config, &digest, req.repo.as_deref())
+            .orchestrate_rollout_for_repo_with_trace(
+                &config,
+                &digest,
+                req.repo.as_deref(),
+                incoming_trace,
+            )
             .await
         {
             Ok(outcomes) => {
@@ -557,9 +568,15 @@ async fn post_deploy(
         let digest_bg = digest.clone();
         let repo_bg = req.repo.clone();
         let cfg_bg = config.clone();
+        let trace_bg = incoming_trace;
         tokio::spawn(async move {
             if let Err(e) = orchestrator
-                .orchestrate_rollout_for_repo(&cfg_bg, &digest_bg, repo_bg.as_deref())
+                .orchestrate_rollout_for_repo_with_trace(
+                    &cfg_bg,
+                    &digest_bg,
+                    repo_bg.as_deref(),
+                    trace_bg,
+                )
                 .await
             {
                 tracing::error!(
