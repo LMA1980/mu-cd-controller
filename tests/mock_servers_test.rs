@@ -328,6 +328,8 @@ async fn test_end_to_end_full_success_promotes_on_mock_muregist() {
         max_error_logs: 0,
         max_p99_latency_ms: 250.0,
         integration_tests: IntegrationTestSelector::All("all".into()),
+        it_archive_digest: None,
+        ab_rules: Default::default(),
     };
 
     let digest = "sha256-canary-pass-999";
@@ -387,6 +389,8 @@ async fn test_end_to_end_it_failure_triggers_rollback_and_taints_mock_muregist()
             "it_smoke".into(),
             "it_mtls".into(),
         ]),
+        it_archive_digest: None,
+        ab_rules: Default::default(),
     };
 
     let digest = "sha256-canary-fail-000";
@@ -526,6 +530,8 @@ async fn test_end_to_end_muobserve_slo_gate_promote_and_breach_rollback_taint() 
         max_error_logs: 0,
         max_p99_latency_ms: 250.0,
         integration_tests: IntegrationTestSelector::All("all".into()),
+        it_archive_digest: None,
+        ab_rules: Default::default(),
     };
 
     // Case 1: Healthy SLO -> Promoted

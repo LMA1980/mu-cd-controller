@@ -152,4 +152,10 @@ pub enum OrchestratorError {
 
     #[error("Rollback failed: {0}")]
     RollbackFailed(String),
+
+    #[error("Deployment '{0}' not found")]
+    DeploymentNotFound(String),
+
+    #[error("Emergency rollback is unavailable without a configured orchestrator")]
+    OrchestratorUnavailable,
 }

@@ -67,6 +67,31 @@ fn default_max_p99_latency_ms() -> f64 {
 }
 
 /// Declarative continuous delivery configuration loaded from `.muconde/MuConDe.yml`.
+/// Default number of historical read-only Btrfs snapshots retained per service.
+pub const DEFAULT_KEEP_SNAPSHOTS: usize = 5;
+
+/// Declarative A/B deployment and Btrfs snapshot retention rules (`ab_rules` in `.mucd/mu-cd.yml`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AbRulesConfig {
+    /// Take a read-only Btrfs snapshot of the active slot before staging candidate bytes.
+    pub btrfs_snapshots: bool,
+    /// Maximum number of historical read-only snapshots retained per service.
+    pub keep_snapshots: usize,
+    /// Trigger immediate atomic rollback and artifact taint on critical failure.
+    pub auto_rollback_on_critical: bool,
+}
+
+impl Default for AbRulesConfig {
+    fn default() -> Self {
+        Self {
+            btrfs_snapshots: true,
+            keep_snapshots: DEFAULT_KEEP_SNAPSHOTS,
+            auto_rollback_on_critical: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MuConDeConfig {
     pub version: String,
@@ -83,6 +108,12 @@ pub struct MuConDeConfig {
     #[serde(default = "default_max_p99_latency_ms")]
     pub max_p99_latency_ms: f64,
     pub integration_tests: IntegrationTestSelector,
+    /// Optional content-addressed SHA-256 digest for sandboxed preselected integration tests.
+    #[serde(default)]
+    pub it_archive_digest: Option<String>,
+    /// Declarative symmetric A/B deployment and Btrfs snapshot rules.
+    #[serde(default)]
+    pub ab_rules: AbRulesConfig,
 }
 
 /// Selector specifying which integration test suites are required before promotion.
@@ -574,5 +605,51 @@ integration_tests: "all"
         assert_eq!(resolved, manifest_yaml);
         let config = MuConDeConfig::from_repo_root(dir.path()).unwrap();
         assert_eq!(config.service, "mu-yaml-ext");
+    }
+
+    #[test]
+    fn test_ab_rules_defaults_and_explicit_overrides() {
+        let minimal_yaml = r#"
+version: "1"
+service: "mu-service"
+target_nodes: ["node-a"]
+integration_tests: "all"
+"#;
+        let default_cfg = MuConDeConfig::from_yaml_str(minimal_yaml).unwrap();
+        assert_eq!(default_cfg.ab_rules, AbRulesConfig::default());
+        assert!(default_cfg.ab_rules.btrfs_snapshots);
+        assert_eq!(default_cfg.ab_rules.keep_snapshots, DEFAULT_KEEP_SNAPSHOTS);
+        assert!(default_cfg.ab_rules.auto_rollback_on_critical);
+        assert!(default_cfg.it_archive_digest.is_none());
+
+        let override_yaml = r#"
+version: "1"
+service: "mu-service"
+target_nodes: ["node-a", "worker-riscv64"]
+integration_tests:
+  - "smoke_health"
+  - "rollback_check"
+it_archive_digest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+ab_rules:
+  btrfs_snapshots: true
+  keep_snapshots: 3
+  auto_rollback_on_critical: true
+"#;
+        let parsed = MuConDeConfig::from_yaml_str(override_yaml).unwrap();
+        assert_eq!(parsed.ab_rules.keep_snapshots, 3);
+        assert!(parsed.ab_rules.btrfs_snapshots);
+        assert!(parsed.ab_rules.auto_rollback_on_critical);
+        assert_eq!(
+            parsed.it_archive_digest.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            parsed.selected_tests(),
+            Some(&["smoke_health".to_string(), "rollback_check".to_string()][..])
+        );
+
+        let repo_cfg = MuConDeConfig::from_repo_root(std::path::Path::new(".")).unwrap();
+        assert_eq!(repo_cfg.service, "mu-cd-controller");
+        assert_eq!(repo_cfg.ab_rules, AbRulesConfig::default());
     }
 }

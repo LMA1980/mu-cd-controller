@@ -917,7 +917,7 @@ impl DeploymentOrchestrator {
                     stage_span_ctx.span_id,
                     Some(dep_span_ctx.span_id),
                     &target_node,
-                    "cd.slot.stage_b",
+                    Self::stage_span_name(grant.candidate_slot),
                     "INTERNAL",
                     stage_start_ns,
                     stage_end_ns,
@@ -926,7 +926,7 @@ impl DeploymentOrchestrator {
                     serde_json::json!({
                         "deployment_id": &deployment_id,
                         "service": &config.service,
-                        "slot": "b",
+                        "slot": Self::slot_label(grant.candidate_slot),
                         "target_node": &target_node,
                     }),
                 ));
@@ -970,7 +970,7 @@ impl DeploymentOrchestrator {
                     stage_span_ctx.span_id,
                     Some(dep_span_ctx.span_id),
                     &target_node,
-                    "cd.slot.stage_b",
+                    Self::stage_span_name(grant.candidate_slot),
                     "INTERNAL",
                     stage_start_ns,
                     stage_end_ns,
@@ -979,7 +979,7 @@ impl DeploymentOrchestrator {
                     serde_json::json!({
                         "deployment_id": &deployment_id,
                         "service": &config.service,
-                        "slot": "b",
+                        "slot": Self::slot_label(grant.candidate_slot),
                         "target_node": &target_node,
                     }),
                 ));
@@ -1035,7 +1035,7 @@ impl DeploymentOrchestrator {
             stage_span_ctx.span_id,
             Some(dep_span_ctx.span_id),
             &target_node,
-            "cd.slot.stage_b",
+            Self::stage_span_name(grant.candidate_slot),
             "INTERNAL",
             stage_start_ns,
             stage_end_ns,
@@ -1044,7 +1044,7 @@ impl DeploymentOrchestrator {
             serde_json::json!({
                 "deployment_id": &deployment_id,
                 "service": &config.service,
-                "slot": "b",
+                "slot": Self::slot_label(grant.candidate_slot),
                 "target_node": &target_node,
             }),
         ));
@@ -1220,9 +1220,23 @@ impl DeploymentOrchestrator {
                 }),
             ));
             self.emit_telemetry_spans(spans_to_emit).await;
-            return self
-                .handle_failure_and_rollback(&grant, config, &target_node, artifact_sha256, &reason)
-                .await;
+            if config.ab_rules.auto_rollback_on_critical {
+                return self
+                    .handle_failure_and_rollback(
+                        &grant,
+                        config,
+                        &target_node,
+                        artifact_sha256,
+                        &reason,
+                    )
+                    .await;
+            }
+            let _ = self.lease_coordinator.release_lease(&grant.lease_id).await;
+            self.sync_leases().await;
+            return Err(OrchestratorError::IntegrationTestFailed {
+                failed_tests: report.failed_tests,
+                log: report.log_excerpt,
+            });
         }
 
         if !report.passed || !report.failed_tests.is_empty() {
@@ -1268,9 +1282,23 @@ impl DeploymentOrchestrator {
                 }),
             ));
             self.emit_telemetry_spans(spans_to_emit).await;
-            return self
-                .handle_failure_and_rollback(&grant, config, &target_node, artifact_sha256, &reason)
-                .await;
+            if config.ab_rules.auto_rollback_on_critical {
+                return self
+                    .handle_failure_and_rollback(
+                        &grant,
+                        config,
+                        &target_node,
+                        artifact_sha256,
+                        &reason,
+                    )
+                    .await;
+            }
+            let _ = self.lease_coordinator.release_lease(&grant.lease_id).await;
+            self.sync_leases().await;
+            return Err(OrchestratorError::IntegrationTestFailed {
+                failed_tests: report.failed_tests,
+                log: report.log_excerpt,
+            });
         }
 
         // Step 6b: Canary Bake SLO Verification via MuObserve (#12-#15)
@@ -1478,6 +1506,22 @@ impl DeploymentOrchestrator {
         })
     }
 
+    /// Canonical stage span name reflecting the candidate A/B slot.
+    const fn stage_span_name(slot: mu_cd_ipc::DeploymentSlot) -> &'static str {
+        match slot {
+            mu_cd_ipc::DeploymentSlot::SlotA => "cd.slot.stage_a",
+            mu_cd_ipc::DeploymentSlot::SlotB => "cd.slot.stage_b",
+        }
+    }
+
+    /// Canonical lowercase slot label (`"a"` / `"b"`).
+    const fn slot_label(slot: mu_cd_ipc::DeploymentSlot) -> &'static str {
+        match slot {
+            mu_cd_ipc::DeploymentSlot::SlotA => "a",
+            mu_cd_ipc::DeploymentSlot::SlotB => "b",
+        }
+    }
+
     async fn emit_telemetry_spans(&self, spans: Vec<mu_observable_ipc::OtelSpanEntry>) {
         if let Some(ref sink) = self.telemetry_sink {
             sink.emit_spans(spans).await;
@@ -1566,6 +1610,118 @@ impl DeploymentOrchestrator {
             target_node: target_node.to_string(),
             artifact_sha256: artifact_sha256.to_string(),
             reason: reason.to_string(),
+        })
+    }
+
+    /// Executes an operator-triggered emergency A|B rollback (`POST /api/cd/deployments/{id}/rollback`):
+    /// dispatches an immediate [`RollbackCommand`] to restore the prior `@a`/`@b` slot, updates
+    /// [`LeaseCoordinator`], taints the artifact digest locally and in `mu-registry`, updates
+    /// [`CdStateStore`], and emits a `cd.ab.rollback` telemetry span.
+    pub async fn emergency_rollback(
+        &self,
+        deployment_id: &str,
+        note: Option<&str>,
+    ) -> Result<crate::cd_state::AbRollbackResponseDto, OrchestratorError> {
+        let store = self
+            .cd_state
+            .as_ref()
+            .ok_or_else(|| OrchestratorError::DeploymentNotFound(deployment_id.to_string()))?;
+        let snap = store.snapshot();
+        let record = snap
+            .deployment(deployment_id)
+            .ok_or_else(|| OrchestratorError::DeploymentNotFound(deployment_id.to_string()))?
+            .clone();
+
+        let reason = match note.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(n) => format!("Manual emergency rollback: {n}"),
+            None => "Manual emergency rollback requested by operator".to_string(),
+        };
+
+        let restore_slot_ipc = match record.restore_slot {
+            Slot::A => mu_cd_ipc::DeploymentSlot::SlotA,
+            Slot::B => mu_cd_ipc::DeploymentSlot::SlotB,
+        };
+        let rollback_cmd = RollbackCommand {
+            deployment_id: record.deployment_id.clone(),
+            lease_id: record.lease_id.clone(),
+            service_name: record.service.clone(),
+            restore_slot: restore_slot_ipc,
+            failed_artifact_sha256: record.artifact_digest.clone(),
+            reason: reason.clone(),
+        };
+
+        self.agent_client
+            .rollback(&record.target_node, &rollback_cmd)
+            .await?;
+
+        if !record.lease_id.is_empty() {
+            let _ = self.lease_coordinator.release_lease(&record.lease_id).await;
+        }
+        if !record.target_node.is_empty() && !record.service.is_empty() {
+            self.lease_coordinator
+                .set_active_slot(&record.target_node, &record.service, restore_slot_ipc)
+                .await;
+        }
+
+        let tainted_digest = if !record.artifact_digest.is_empty() {
+            self.mark_local_tainted(&record.artifact_digest).await;
+            let taint_notification = ArtifactTaintNotification {
+                deployment_id: record.deployment_id.clone(),
+                service_name: record.service.clone(),
+                artifact_sha256: record.artifact_digest.clone(),
+                tainted_at_epoch_ms: LeaseCoordinator::current_epoch_ms(),
+                reason: reason.clone(),
+                rollback_completed: true,
+            };
+            self.regist_client
+                .taint_canary(&record.artifact_digest, &taint_notification)
+                .await?;
+            store.deployment_tainted(&record.deployment_id, &record.artifact_digest, &reason);
+            Some(record.artifact_digest.clone())
+        } else {
+            None
+        };
+
+        store.deployment_rolled_back(
+            &record.deployment_id,
+            record.restore_slot,
+            crate::cd_state::RollbackReason::Manual,
+            &reason,
+        );
+        self.sync_leases().await;
+
+        let now_ns = now_unix_nano();
+        let span_ctx = TraceContext::from_seed(
+            now_ns as u64,
+            (now_ns as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+            1,
+            true,
+        );
+        self.emit_telemetry_spans(vec![build_cd_span(
+            span_ctx.trace_id,
+            span_ctx.span_id,
+            None,
+            &record.target_node,
+            "cd.ab.rollback",
+            "SERVER",
+            now_ns,
+            now_ns,
+            "OK",
+            Some(reason),
+            serde_json::json!({
+                "deployment_id": &record.deployment_id,
+                "service": &record.service,
+                "target_node": &record.target_node,
+                "restore_slot": Self::slot_label(restore_slot_ipc),
+                "tainted_digest": tainted_digest,
+            }),
+        )])
+        .await;
+
+        Ok(crate::cd_state::AbRollbackResponseDto {
+            deployment_id: record.deployment_id,
+            restored_slot: record.restore_slot,
+            tainted_digest,
         })
     }
 }
@@ -1710,6 +1866,8 @@ mod tests {
             max_error_logs: 0,
             max_p99_latency_ms: 250.0,
             integration_tests: crate::contract::IntegrationTestSelector::All("all".into()),
+            it_archive_digest: None,
+            ab_rules: crate::contract::AbRulesConfig::default(),
         }
     }
 
@@ -2043,5 +2201,103 @@ mod tests {
         assert_eq!(stage_span.status_code, "OK");
         assert_eq!(gate_span.status_code, "OK");
         assert_eq!(dep_span.status_code, "OK");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_symmetric_slot_alternation_and_emergency_rollback() {
+        let store = Arc::new(CdStateStore::default());
+        let coordinator = Arc::new(LeaseCoordinator::new());
+        let agent = Arc::new(MockAgentClient {
+            stage_ok: AtomicBool::new(true),
+            swap_ok: AtomicBool::new(true),
+            it_passed: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let regist = Arc::new(MockMuRegistClient::default());
+        let sink = Arc::new(crate::telemetry::RecordingCdTelemetrySink::default());
+
+        let orchestrator =
+            DeploymentOrchestrator::new(coordinator.clone(), None, agent.clone(), regist.clone())
+                .with_cd_state(store.clone())
+                .with_telemetry_sink(sink.clone());
+
+        let config = sample_config();
+
+        // Deploy 1: active @a -> candidate @b -> promote -> active becomes @b
+        let d1 = orchestrator
+            .orchestrate_deployment(&config, "sha-sym-1", Some("dep-sym-1".into()))
+            .await
+            .unwrap();
+        assert!(d1.is_promoted());
+        assert_eq!(
+            store
+                .snapshot()
+                .deployment("dep-sym-1")
+                .unwrap()
+                .active_slot,
+            Slot::B
+        );
+        assert_eq!(
+            store
+                .snapshot()
+                .deployment("dep-sym-1")
+                .unwrap()
+                .restore_slot,
+            Slot::A
+        );
+
+        // Deploy 2: active @b -> candidate @a -> promote -> active becomes @a + stage_a span
+        let d2 = orchestrator
+            .orchestrate_deployment(&config, "sha-sym-2", Some("dep-sym-2".into()))
+            .await
+            .unwrap();
+        assert!(d2.is_promoted());
+        let rec2 = store.snapshot().deployment("dep-sym-2").unwrap().clone();
+        assert_eq!(rec2.staged_slot, Slot::A);
+        assert_eq!(rec2.restore_slot, Slot::B);
+        assert_eq!(rec2.active_slot, Slot::A);
+        assert_eq!(
+            coordinator
+                .active_slot_for("worker-riscv64", "action-runner")
+                .await,
+            DeploymentSlot::SlotA
+        );
+        let spans = sink.recorded_spans().await;
+        assert!(
+            spans.iter().any(|s| s.span_name == "cd.slot.stage_a"),
+            "second rollout must emit symmetric cd.slot.stage_a span"
+        );
+
+        // Emergency rollback on dep-sym-2 restores @b and taints sha-sym-2 in mu-registry
+        let rb = orchestrator
+            .emergency_rollback("dep-sym-2", Some("regression in production"))
+            .await
+            .unwrap();
+        assert_eq!(rb.deployment_id, "dep-sym-2");
+        assert_eq!(rb.restored_slot, Slot::B);
+        assert_eq!(rb.tainted_digest.as_deref(), Some("sha-sym-2"));
+        assert_eq!(agent.rollback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            agent
+                .last_rollback_cmd
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .restore_slot,
+            DeploymentSlot::SlotB
+        );
+        assert!(orchestrator
+            .is_digest_tainted("sha-sym-2")
+            .await
+            .expect("taint check"));
+        assert!(regist.tainted_digests.lock().await.contains("sha-sym-2"));
+        assert_eq!(
+            coordinator
+                .active_slot_for("worker-riscv64", "action-runner")
+                .await,
+            DeploymentSlot::SlotB
+        );
     }
 }
