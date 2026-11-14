@@ -6,6 +6,7 @@
 #![deny(unsafe_code)]
 
 pub mod api;
+pub mod auth;
 pub mod cd_state;
 pub mod contract;
 pub mod error;
@@ -17,11 +18,21 @@ pub mod tls;
 
 // Re-exports of common primary types for ergonomic library use
 pub use api::{CdApiConfig, CdApiState, DeploymentGate, DeploymentSummary};
-pub use cd_state::{CdEvent, CdSnapshot, CdStateStore, GateVerdict, ItProgressSink};
+pub use auth::{
+    constant_time_str_eq, default_authority, load_secret_file, AuthRejection, AuthorizedCaller,
+    BoundOperatorSession, CdAuthorizer, POLICY_AB_GATE_LOGS_READ, POLICY_AB_ROLLBACK,
+    POLICY_AB_SLOTS_READ, POLICY_CD_RUNS_READ, POLICY_CD_SERVICE_DEPLOY, POLICY_CD_STEPS_READ,
+    ROLE_AB_EMERGENCY, ROLE_GATE_INSPECTOR, ROLE_MEMBER, ROLE_PLATFORM_ADMIN,
+};
+pub use cd_state::{
+    AbRollbackRequestDto, AbRollbackResponseDto, CdEcosystem, CdEvent, CdRepoId, CdRunDto,
+    CdRunFailurePinpointDto, CdRunState, CdSnapshot, CdStateStore, CdStepDto, GateVerdict,
+    ItProgressSink, SkipReasonDto, Slot,
+};
 pub use contract::{
-    resolve_manifest_path, IntegrationTestSelector, MuCdConfig, MuConDeConfig,
-    DEFAULT_BAKE_WINDOW_SECONDS, DEFAULT_LEASE_TTL_SECONDS, DEFAULT_MAX_ERROR_LOGS,
-    DEFAULT_MAX_P99_LATENCY_MS, DEFAULT_WARMUP_TIMEOUT_SECONDS,
+    resolve_manifest_path, AbRulesConfig, IntegrationTestSelector, MuCdConfig, MuConDeConfig,
+    DEFAULT_BAKE_WINDOW_SECONDS, DEFAULT_KEEP_SNAPSHOTS, DEFAULT_LEASE_TTL_SECONDS,
+    DEFAULT_MAX_ERROR_LOGS, DEFAULT_MAX_P99_LATENCY_MS, DEFAULT_WARMUP_TIMEOUT_SECONDS,
 };
 pub use error::{ContractError, ControllerError, LeaseError, OrchestratorError, TlsError};
 pub use lease::{ClusterIdlePoller, ClusterNodeStatus, LeaseCoordinator, DEFAULT_CONTROLLER_URL};

@@ -27,6 +27,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 axum = { version = "0.8" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 subtle = "2"
+mu-auth = { git = "https://github.com/LMA1980/mu-auth.git", branch = "main", features = ["std"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

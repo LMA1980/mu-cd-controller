@@ -137,10 +137,21 @@ struct ActiveLease {
     promoted: bool,
 }
 
+/// Returns the opposite A/B slot (`SlotA <-> SlotB`) for symmetric rollouts.
+#[must_use]
+pub const fn opposite_slot(slot: DeploymentSlot) -> DeploymentSlot {
+    match slot {
+        DeploymentSlot::SlotA => DeploymentSlot::SlotB,
+        DeploymentSlot::SlotB => DeploymentSlot::SlotA,
+    }
+}
+
 /// Manages and tracks active TTL-bounded deployment leases across cluster nodes.
 #[derive(Debug, Clone, Default)]
 pub struct LeaseCoordinator {
     leases: Arc<RwLock<HashMap<String, ActiveLease>>>,
+    /// Current active baseline slot per `(node_id, service_name)` pair.
+    active_slots: Arc<RwLock<HashMap<(String, String), DeploymentSlot>>>,
 }
 
 impl LeaseCoordinator {
@@ -148,7 +159,30 @@ impl LeaseCoordinator {
     pub fn new() -> Self {
         Self {
             leases: Arc::new(RwLock::new(HashMap::new())),
+            active_slots: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Returns the currently tracked live slot for `(node_id, service_name)`,
+    /// defaulting to `SlotA` before any promotion has occurred.
+    pub async fn active_slot_for(&self, node_id: &str, service_name: &str) -> DeploymentSlot {
+        let slots = self.active_slots.read().await;
+        slots
+            .get(&(node_id.to_string(), service_name.to_string()))
+            .copied()
+            .unwrap_or(DeploymentSlot::SlotA)
+    }
+
+    /// Explicitly updates the tracked live slot for `(node_id, service_name)`
+    /// (e.g. after an emergency rollback restores the prior `@a`/`@b` slot).
+    pub async fn set_active_slot(
+        &self,
+        node_id: impl Into<String>,
+        service_name: impl Into<String>,
+        slot: DeploymentSlot,
+    ) {
+        let mut slots = self.active_slots.write().await;
+        slots.insert((node_id.into(), service_name.into()), slot);
     }
 
     /// Current timestamp in milliseconds since the Unix epoch.
@@ -164,6 +198,13 @@ impl LeaseCoordinator {
     /// Prevents overlapping active leases on the same `(node_id, service_name)`.
     pub async fn acquire_lease(&self, req: &DeploymentLeaseRequest) -> DeploymentLeaseGrant {
         let mut leases = self.leases.write().await;
+        let active_slots = self.active_slots.read().await;
+        let active_slot = active_slots
+            .get(&(req.node_id.clone(), req.service_name.clone()))
+            .copied()
+            .unwrap_or(DeploymentSlot::SlotA);
+        let candidate_slot = opposite_slot(active_slot);
+        drop(active_slots);
         let now_ms = Self::current_epoch_ms();
 
         // Check for active overlapping leases on the same (node_id, service_name)
@@ -177,8 +218,8 @@ impl LeaseCoordinator {
                     deployment_id: req.deployment_id.clone(),
                     lease_id: String::new(),
                     node_id: req.node_id.clone(),
-                    active_slot: DeploymentSlot::SlotA,
-                    candidate_slot: DeploymentSlot::SlotB,
+                    active_slot,
+                    candidate_slot,
                     expires_at_epoch_ms: 0,
                     granted: false,
                     denial_reason: Some(format!(
@@ -197,8 +238,8 @@ impl LeaseCoordinator {
             deployment_id: req.deployment_id.clone(),
             lease_id: lease_id.clone(),
             node_id: req.node_id.clone(),
-            active_slot: DeploymentSlot::SlotA,
-            candidate_slot: DeploymentSlot::SlotB,
+            active_slot,
+            candidate_slot,
             expires_at_epoch_ms,
             granted: true,
             denial_reason: None,
@@ -215,14 +256,19 @@ impl LeaseCoordinator {
         grant
     }
 
-    /// Mark a deployment as successfully promoted.
+    /// Mark a deployment as successfully promoted and advance the active `@a`/`@b` slot.
     ///
     /// Once marked promoted, the lease will not trigger rollback when its TTL passes,
-    /// and it can be released cleanly.
+    /// and subsequent leases for `(node_id, service_name)` will target the opposite slot.
     pub async fn mark_promoted(&self, lease_id: &str) -> Result<(), LeaseError> {
         let mut leases = self.leases.write().await;
         if let Some(active) = leases.get_mut(lease_id) {
             active.promoted = true;
+            let mut active_slots = self.active_slots.write().await;
+            active_slots.insert(
+                (active.grant.node_id.clone(), active.service_name.clone()),
+                active.grant.candidate_slot,
+            );
             Ok(())
         } else {
             Err(LeaseError::LeaseNotFound(lease_id.to_string()))
@@ -522,6 +568,95 @@ mod tests {
         // Sweeping again finds no remaining expired leases
         let swept2 = coordinator.sweep_expired_leases().await;
         assert!(swept2.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_lease_coordinator_alternates_slots_symmetrically() {
+        let coordinator = LeaseCoordinator::new();
+
+        // Cycle 1: active @a -> stage @b -> promote -> active becomes @b
+        let g1 = coordinator
+            .acquire_lease(&DeploymentLeaseRequest {
+                deployment_id: "dep-1".into(),
+                node_id: "node-a".into(),
+                service_name: "mu-cd-agent".into(),
+                artifact_sha256: "sha-1".into(),
+                requested_ttl_secs: 60,
+            })
+            .await;
+        assert_eq!(g1.active_slot, DeploymentSlot::SlotA);
+        assert_eq!(g1.candidate_slot, DeploymentSlot::SlotB);
+        coordinator.mark_promoted(&g1.lease_id).await.unwrap();
+        coordinator.release_lease(&g1.lease_id).await.unwrap();
+        assert_eq!(
+            coordinator.active_slot_for("node-a", "mu-cd-agent").await,
+            DeploymentSlot::SlotB
+        );
+
+        // Cycle 2: active @b -> stage @a -> revoke/rollback -> restores @b
+        let g2 = coordinator
+            .acquire_lease(&DeploymentLeaseRequest {
+                deployment_id: "dep-2".into(),
+                node_id: "node-a".into(),
+                service_name: "mu-cd-agent".into(),
+                artifact_sha256: "sha-2".into(),
+                requested_ttl_secs: 60,
+            })
+            .await;
+        assert_eq!(g2.active_slot, DeploymentSlot::SlotB);
+        assert_eq!(g2.candidate_slot, DeploymentSlot::SlotA);
+        let (_rev, rb) = coordinator
+            .revoke_lease(&g2.lease_id, "critical failure")
+            .await
+            .unwrap();
+        assert_eq!(rb.restore_slot, DeploymentSlot::SlotB);
+        assert_eq!(
+            coordinator.active_slot_for("node-a", "mu-cd-agent").await,
+            DeploymentSlot::SlotB
+        );
+
+        // Cycle 3: still active @b -> stage @a -> promote -> active becomes @a
+        let g3 = coordinator
+            .acquire_lease(&DeploymentLeaseRequest {
+                deployment_id: "dep-3".into(),
+                node_id: "node-a".into(),
+                service_name: "mu-cd-agent".into(),
+                artifact_sha256: "sha-3".into(),
+                requested_ttl_secs: 60,
+            })
+            .await;
+        assert_eq!(g3.active_slot, DeploymentSlot::SlotB);
+        assert_eq!(g3.candidate_slot, DeploymentSlot::SlotA);
+        coordinator.mark_promoted(&g3.lease_id).await.unwrap();
+        coordinator.release_lease(&g3.lease_id).await.unwrap();
+        assert_eq!(
+            coordinator.active_slot_for("node-a", "mu-cd-agent").await,
+            DeploymentSlot::SlotA
+        );
+
+        // Cycle 4: back to active @a -> stage @b
+        let g4 = coordinator
+            .acquire_lease(&DeploymentLeaseRequest {
+                deployment_id: "dep-4".into(),
+                node_id: "node-a".into(),
+                service_name: "mu-cd-agent".into(),
+                artifact_sha256: "sha-4".into(),
+                requested_ttl_secs: 60,
+            })
+            .await;
+        assert_eq!(g4.active_slot, DeploymentSlot::SlotA);
+        assert_eq!(g4.candidate_slot, DeploymentSlot::SlotB);
+        coordinator.release_lease(&g4.lease_id).await.unwrap();
+
+        // Explicit emergency rollback slot reset
+        coordinator
+            .set_active_slot("node-a", "mu-cd-agent", DeploymentSlot::SlotB)
+            .await;
+        assert_eq!(
+            coordinator.active_slot_for("node-a", "mu-cd-agent").await,
+            DeploymentSlot::SlotB
+        );
     }
 
     #[tokio::test]

@@ -15,8 +15,13 @@ use tower::ServiceExt;
 use mu_cd_controller::api::{
     load_token_file, router, serve, CdApiState, DeploymentGate, DeploymentSummary,
 };
+use mu_cd_controller::auth::{
+    ROLE_AB_EMERGENCY, ROLE_GATE_INSPECTOR, ROLE_MEMBER, ROLE_PLATFORM_ADMIN,
+};
 use mu_cd_controller::cd_state::{
-    CdStateStore, DeploymentStart, GateOutcome, GateVerdict, LeaseView, RollbackReason, Slot,
+    AbRollbackResponseDto, CdEcosystem, CdRepoId, CdRunDto, CdRunFailurePinpointDto, CdRunState,
+    CdStateStore, CdStepDto, DeploymentStart, GateOutcome, GateVerdict, LeaseView, RollbackReason,
+    SkipReasonDto, Slot,
 };
 use mu_cd_controller::contract::{IntegrationTestSelector, MuConDeConfig};
 use mu_cd_controller::error::OrchestratorError;
@@ -144,6 +149,39 @@ async fn get_with_headers(
     (status, headers, body)
 }
 
+async fn post_json(
+    app: axum::Router,
+    uri: &str,
+    auth: Option<&str>,
+    extra_headers: &[(&str, &str)],
+    json_body: &str,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(a) = auth {
+        req = req.header(header::AUTHORIZATION, a);
+    }
+    for (k, v) in extra_headers {
+        req = req.header(*k, *v);
+    }
+    let resp = app
+        .oneshot(req.body(Body::from(json_body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, headers, body)
+}
+
 fn bearer() -> String {
     format!("Bearer {TOKEN}")
 }
@@ -156,6 +194,7 @@ fn bearer() -> String {
 async fn test_every_cd_route_rejects_missing_or_wrong_token() {
     let app = router(CdApiState::new(seeded_store(), Some(TOKEN.into())));
     for uri in [
+        "/api/cd/runs",
         "/api/cd/deployments",
         "/api/cd/deployments?repo=LMA1980/example&limit=5",
         "/api/cd/deployments/dep-new/gate",
@@ -176,6 +215,17 @@ async fn test_every_cd_route_rejects_missing_or_wrong_token() {
         let (s, _, _) = get(app.clone(), uri, Some(TOKEN)).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED, "{uri} without Bearer scheme");
     }
+
+    let (s, h, _) = post_json(
+        app.clone(),
+        "/api/cd/deployments/dep-new/rollback",
+        None,
+        &[],
+        "{}",
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert!(h.get(header::WWW_AUTHENTICATE).is_some());
 }
 
 #[tokio::test]
@@ -340,11 +390,33 @@ async fn test_gate_endpoint_shape() {
 }
 
 #[tokio::test]
-async fn test_gate_redacts_log_excerpt_unless_operator_authenticated() {
-    let app = router(CdApiState::new(seeded_store(), Some(TOKEN.into())));
+async fn test_gate_redacts_log_excerpt_without_ab_gate_logs_read_folio() {
+    let state = CdApiState::new(seeded_store(), Some(TOKEN.into()))
+        .with_proxy_secret(Some("edge-secret-42".into()));
+    let now = mu_cd_controller::cd_state::now_epoch_ms();
+    state
+        .authorizer
+        .bind_operator("alice", 1, &[ROLE_MEMBER], &[], false, now)
+        .unwrap();
+    state
+        .authorizer
+        .bind_operator(
+            "bob",
+            1,
+            &[ROLE_GATE_INSPECTOR],
+            &[ROLE_GATE_INSPECTOR],
+            false,
+            now,
+        )
+        .unwrap();
+    state
+        .authorizer
+        .bind_operator("nopass", 0, &[ROLE_GATE_INSPECTOR], &[], false, now)
+        .unwrap();
+    let app = router(state);
 
-    // 1. Public read-only dashboard request (valid bearer token, no operator header):
-    // checkpoint states and durations are intact, but log_excerpt is redacted to None.
+    // 1. Service-to-service dashboard request (valid bearer token, no user session):
+    // checkpoint states and durations stay visible, but log_excerpt is redacted to None.
     let (s, _, body) = get(
         app.clone(),
         "/api/cd/deployments/dep-old/gate",
@@ -360,15 +432,46 @@ async fn test_gate_redacts_log_excerpt_unless_operator_authenticated() {
     assert_eq!(anon_gate.tests[0].duration_ms, 42);
     assert!(
         anon_gate.tests.iter().all(|t| t.log_excerpt.is_none()),
-        "anonymous public requests must redact log_excerpt"
+        "service-only dashboard requests must redact log_excerpt"
     );
 
-    // 2. Operator-authenticated request via X-Forwarded-User preserves log_excerpt.
+    // 2. Spoofed X-Operator-Authenticated header MUST NOT bypass folio redaction.
     let (s, _, body) = get_with_headers(
         app.clone(),
         "/api/cd/deployments/dep-old/gate",
         Some(&bearer()),
-        &[("x-forwarded-user", "octocat")],
+        &[("x-operator-authenticated", "true")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let spoofed_flag: DeploymentGate = serde_json::from_slice(&body).unwrap();
+    assert!(spoofed_flag.tests.iter().all(|t| t.log_excerpt.is_none()));
+
+    // 3. Authenticated baseline member (folio:cd:read + folio:ab:read, NO folio:ab:gate-logs)
+    // still receives redacted log_excerpt.
+    let (s, _, body) = get_with_headers(
+        app.clone(),
+        "/api/cd/deployments/dep-old/gate",
+        None,
+        &[
+            ("x-proxy-secret", "edge-secret-42"),
+            ("x-forwarded-user", "alice"),
+        ],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let member_gate: DeploymentGate = serde_json::from_slice(&body).unwrap();
+    assert!(member_gate.tests.iter().all(|t| t.log_excerpt.is_none()));
+
+    // 4. Operator holding elective gate-inspector folio (ab:gate.logs.read) sees full log_excerpt.
+    let (s, _, body) = get_with_headers(
+        app.clone(),
+        "/api/cd/deployments/dep-old/gate",
+        Some(&bearer()),
+        &[
+            ("x-proxy-secret", "edge-secret-42"),
+            ("x-forwarded-user", "bob"),
+        ],
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -378,36 +481,38 @@ async fn test_gate_redacts_log_excerpt_unless_operator_authenticated() {
         Some("assertion failed: smoke probe returned 503")
     );
 
-    // 3. Operator-authenticated request via X-Operator-Authenticated: true preserves log_excerpt.
-    let (s, _, body) = get_with_headers(
-        app.clone(),
-        "/api/cd/deployments/dep-old/gate",
-        Some(&bearer()),
-        &[("x-operator-authenticated", "true")],
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-    let op_gate_flag: DeploymentGate = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        op_gate_flag.tests[0].log_excerpt.as_deref(),
-        Some("assertion failed: smoke probe returned 503")
-    );
-
-    // 4. Missing or invalid bearer token still fails closed with 401 even when X-Forwarded-User is sent.
+    // 5. Spoofed X-Forwarded-User without X-Proxy-Secret fails closed with 401.
     let (s, _, _) = get_with_headers(
         app.clone(),
         "/api/cd/deployments/dep-old/gate",
-        None,
-        &[("x-forwarded-user", "octocat")],
+        Some(&bearer()),
+        &[("x-forwarded-user", "bob")],
     )
     .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 
+    // 6. Bound user with 0 enrolled Passkeys fails closed with 403 Forbidden.
+    let (s, _, _) = get_with_headers(
+        app.clone(),
+        "/api/cd/deployments/dep-old/gate",
+        None,
+        &[
+            ("x-proxy-secret", "edge-secret-42"),
+            ("x-forwarded-user", "nopass"),
+        ],
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // 7. Invalid bearer token fails closed with 401 even when valid X-Proxy-Secret + user are sent.
     let (s, _, _) = get_with_headers(
         app,
         "/api/cd/deployments/dep-old/gate",
         Some("Bearer invalid-token"),
-        &[("x-forwarded-user", "octocat")],
+        &[
+            ("x-proxy-secret", "edge-secret-42"),
+            ("x-forwarded-user", "bob"),
+        ],
     )
     .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
@@ -753,6 +858,8 @@ async fn replay(health_passes: bool) -> (String, Arc<CdStateStore>, bool) {
         max_error_logs: 0,
         max_p99_latency_ms: 250.0,
         integration_tests: IntegrationTestSelector::All("all".into()),
+        it_archive_digest: None,
+        ab_rules: Default::default(),
     };
     let outcome = orchestrator
         .orchestrate_deployment_for_repo(
@@ -829,4 +936,441 @@ async fn test_replay_critical_failure_rolls_back_and_taints() {
         .unwrap();
     assert_eq!(health.state, TestState::Failed);
     assert_eq!(health.log_excerpt.as_deref(), Some("connection refused"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ecosystem-agnostic GET /api/cd/runs & emergency POST /api/cd/deployments/{id}/rollback (#72)
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_cd_runs_endpoint_multi_ecosystem_and_auth() {
+    let store = seeded_store();
+    store.record_cd_run(CdRunDto {
+        run_id: "cd-cargo-1".into(),
+        ecosystem: CdEcosystem::Cargo,
+        repo: CdRepoId::new("LMA1980", "mu-cd-controller"),
+        ref_name: "refs/heads/main".into(),
+        commit_sha: "111aaaa".into(),
+        state: CdRunState::Succeeded,
+        started_epoch_ms: 100,
+        finished_epoch_ms: Some(150),
+        steps: vec![CdStepDto {
+            step_id: "cargo-publish".into(),
+            label: "Publish crate".into(),
+            state: CdRunState::Succeeded,
+            duration_ms: 50,
+            ..Default::default()
+        }],
+        failure: None,
+        registry_package: Some("mu-cd-controller".into()),
+        registry_version: Some("0.1.1".into()),
+        ab_deployment_id: Some("dep-new".into()),
+        artifact_digest: Some("sha256:dep-new".into()),
+    });
+    store.record_cd_run(CdRunDto {
+        run_id: "cd-dotnet-2".into(),
+        ecosystem: CdEcosystem::from_label(".NET"),
+        repo: CdRepoId::new("LMA1980", "k3-sdk-dotnet"),
+        ref_name: "refs/tags/v2.0.0".into(),
+        commit_sha: "222bbbb".into(),
+        state: CdRunState::Failed,
+        started_epoch_ms: 200,
+        finished_epoch_ms: Some(260),
+        steps: vec![
+            CdStepDto {
+                step_id: "dotnet-pack".into(),
+                label: "Pack NuGet".into(),
+                state: CdRunState::Succeeded,
+                duration_ms: 30,
+                ..Default::default()
+            },
+            CdStepDto {
+                step_id: "nuget-push".into(),
+                label: "Push NuGet".into(),
+                state: CdRunState::Failed,
+                duration_ms: 30,
+                skip_reason: Some(SkipReasonDto::Other("upstream_registry_conflict".into())),
+                error_summary: Some("409 Conflict".into()),
+                failed_package: Some("K3.Runtime".into()),
+                exit_code: Some(1),
+            },
+        ],
+        failure: Some(CdRunFailurePinpointDto {
+            step_id: "nuget-push".into(),
+            package_name: Some("K3.Runtime".into()),
+            package_version: Some("2.0.0".into()),
+            reason: "NuGet feed rejected duplicate package".into(),
+            log_excerpt: Some("Response status code: 409".into()),
+        }),
+        registry_package: Some("K3.Runtime".into()),
+        registry_version: Some("2.0.0".into()),
+        ab_deployment_id: None,
+        artifact_digest: None,
+    });
+    store.record_cd_run(CdRunDto {
+        run_id: "cd-maven-3".into(),
+        ecosystem: CdEcosystem::Maven,
+        repo: CdRepoId::new("LMA1980", "k3-java"),
+        ref_name: "refs/heads/main".into(),
+        commit_sha: "333cccc".into(),
+        state: CdRunState::Blocked,
+        started_epoch_ms: 300,
+        finished_epoch_ms: None,
+        steps: vec![],
+        failure: None,
+        registry_package: Some("org.lma1980:k3-java".into()),
+        registry_version: Some("1.0.0".into()),
+        ab_deployment_id: None,
+        artifact_digest: None,
+    });
+
+    let state =
+        CdApiState::new(store, Some(TOKEN.into())).with_proxy_secret(Some("proxy-secret".into()));
+    state
+        .authorizer
+        .bind_operator(
+            "reader",
+            1,
+            &[ROLE_MEMBER],
+            &[],
+            false,
+            mu_cd_controller::cd_state::now_epoch_ms(),
+        )
+        .unwrap();
+    let app = router(state);
+
+    // Uninvited user rejected with 403 Forbidden
+    let (s, _, _) = get_with_headers(
+        app.clone(),
+        "/api/cd/runs",
+        None,
+        &[
+            ("x-proxy-secret", "proxy-secret"),
+            ("x-forwarded-user", "stranger"),
+        ],
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // Authenticated member sees all 3 ecosystems + pinpoint failure shape
+    let (s, _, body) = get_with_headers(
+        app.clone(),
+        "/api/cd/runs",
+        None,
+        &[
+            ("x-proxy-secret", "proxy-secret"),
+            ("x-forwarded-user", "reader"),
+        ],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let runs: Vec<CdRunDto> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0].ecosystem, CdEcosystem::Maven);
+    assert_eq!(runs[1].ecosystem, CdEcosystem::DotNet);
+    assert_eq!(runs[2].ecosystem, CdEcosystem::Cargo);
+    assert_eq!(
+        runs[1].failure.as_ref().unwrap().package_name.as_deref(),
+        Some("K3.Runtime")
+    );
+
+    // Filter by ecosystem slug aliases
+    let (s, _, body) = get(app, "/api/cd/runs?ecosystem=nuget&limit=5", Some(&bearer())).await;
+    assert_eq!(s, StatusCode::OK);
+    let filtered: Vec<CdRunDto> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].run_id, "cd-dotnet-2");
+    assert_eq!(
+        serde_json::to_value(&filtered[0]).unwrap()["ecosystem"],
+        "dotnet"
+    );
+}
+
+struct MockApiAgent {
+    rollback_slots: tokio::sync::Mutex<Vec<(String, mu_cd_ipc::DeploymentSlot, String)>>,
+}
+
+impl Default for MockApiAgent {
+    fn default() -> Self {
+        Self {
+            rollback_slots: tokio::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl mu_cd_controller::orchestrator::AgentIpcClient for MockApiAgent {
+    async fn stage_deployment(
+        &self,
+        _node_id: &str,
+        req: &StageDeploymentRequest,
+    ) -> Result<StageDeploymentResponse, OrchestratorError> {
+        Ok(StageDeploymentResponse {
+            deployment_id: req.deployment_id.clone(),
+            target_slot: req.target_slot,
+            btrfs_subvolume_path: "/srv/muconde/slots".into(),
+            staged_ok: true,
+            error_message: None,
+        })
+    }
+
+    async fn slot_swap(
+        &self,
+        _node_id: &str,
+        _cmd: &mu_cd_ipc::SlotSwapCommand,
+    ) -> Result<(), OrchestratorError> {
+        Ok(())
+    }
+
+    async fn execute_integration_tests(
+        &self,
+        _node_id: &str,
+        deployment_id: &str,
+        service: &str,
+        artifact_sha256: &str,
+        _selected_tests: Option<&[String]>,
+        _timeout: Duration,
+    ) -> Result<IntegrationTestReport, OrchestratorError> {
+        Ok(IntegrationTestReport {
+            deployment_id: deployment_id.into(),
+            service_name: service.into(),
+            artifact_sha256: artifact_sha256.into(),
+            executed_tests: vec!["smoke".into()],
+            passed: true,
+            failed_tests: vec![],
+            duration_ms: 10,
+            log_excerpt: None,
+        })
+    }
+
+    async fn rollback(
+        &self,
+        _node_id: &str,
+        cmd: &mu_cd_ipc::RollbackCommand,
+    ) -> Result<(), OrchestratorError> {
+        self.rollback_slots.lock().await.push((
+            cmd.deployment_id.clone(),
+            cmd.restore_slot,
+            cmd.failed_artifact_sha256.clone(),
+        ));
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RecordingRegist {
+    taints: tokio::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl MuRegistClient for RecordingRegist {
+    async fn is_digest_tainted(&self, digest: &str) -> Result<bool, OrchestratorError> {
+        Ok(self.taints.lock().await.iter().any(|d| d == digest))
+    }
+    async fn promote_canary(&self, _digest: &str) -> Result<(), OrchestratorError> {
+        Ok(())
+    }
+    async fn taint_canary(
+        &self,
+        digest: &str,
+        _notification: &ArtifactTaintNotification,
+    ) -> Result<(), OrchestratorError> {
+        self.taints.lock().await.push(digest.to_string());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_emergency_rollback_enforces_ab_rollback_folio_restores_slot_and_taints_registry() {
+    let store = Arc::new(CdStateStore::default());
+    let coordinator = Arc::new(LeaseCoordinator::new());
+    let agent = Arc::new(MockApiAgent::default());
+    let regist = Arc::new(RecordingRegist::default());
+    let orchestrator = Arc::new(
+        DeploymentOrchestrator::new(coordinator.clone(), None, agent.clone(), regist.clone())
+            .with_cd_state(store.clone()),
+    );
+
+    let cfg = MuConDeConfig {
+        version: "1".into(),
+        service: "example-svc".into(),
+        target_nodes: vec!["node-a".into()],
+        lease_ttl_seconds: 60,
+        warmup_timeout_seconds: 5,
+        bake_window_seconds: 60,
+        max_error_logs: 0,
+        max_p99_latency_ms: 250.0,
+        integration_tests: IntegrationTestSelector::All("all".into()),
+        it_archive_digest: None,
+        ab_rules: Default::default(),
+    };
+
+    // Deploy 1 promotes @a -> @b; Deploy 2 promotes @b -> @a.
+    orchestrator
+        .orchestrate_deployment(&cfg, "sha256:d1", Some("dep-emg-1".into()))
+        .await
+        .unwrap();
+    orchestrator
+        .orchestrate_deployment(&cfg, "sha256:d2", Some("dep-emg-2".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .snapshot()
+            .deployment("dep-emg-2")
+            .unwrap()
+            .active_slot,
+        Slot::A
+    );
+    assert_eq!(
+        store
+            .snapshot()
+            .deployment("dep-emg-2")
+            .unwrap()
+            .restore_slot,
+        Slot::B
+    );
+
+    let state = CdApiState::new(store.clone(), Some(TOKEN.into()))
+        .with_orchestrator(orchestrator.clone())
+        .with_proxy_secret(Some("edge-secret".into()));
+    let now = mu_cd_controller::cd_state::now_epoch_ms();
+    state
+        .authorizer
+        .bind_operator("alice", 1, &[ROLE_MEMBER], &[], false, now)
+        .unwrap();
+    state
+        .authorizer
+        .bind_operator(
+            "bob",
+            1,
+            &[ROLE_GATE_INSPECTOR],
+            &[ROLE_GATE_INSPECTOR],
+            false,
+            now,
+        )
+        .unwrap();
+    state
+        .authorizer
+        .bind_operator(
+            "carol",
+            1,
+            &[ROLE_AB_EMERGENCY],
+            &[ROLE_AB_EMERGENCY],
+            true,
+            now,
+        )
+        .unwrap();
+    state
+        .authorizer
+        .bind_operator(
+            "admin",
+            1,
+            &[ROLE_PLATFORM_ADMIN],
+            &[ROLE_PLATFORM_ADMIN],
+            true,
+            now,
+        )
+        .unwrap();
+    let app = router(state);
+
+    // 1. Service token alone, member, and gate-inspector cannot invoke ab:rollback -> 403
+    let (s, _, _) = post_json(
+        app.clone(),
+        "/api/cd/deployments/dep-emg-2/rollback",
+        Some(&bearer()),
+        &[],
+        r#"{"note":"service-should-fail"}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    for login in ["alice", "bob", "stranger"] {
+        let (s, _, _) = post_json(
+            app.clone(),
+            "/api/cd/deployments/dep-emg-2/rollback",
+            None,
+            &[
+                ("x-proxy-secret", "edge-secret"),
+                ("x-forwarded-user", login),
+            ],
+            r#"{"note":"should-fail"}"#,
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::FORBIDDEN,
+            "{login} must not trigger rollback"
+        );
+    }
+    assert!(agent.rollback_slots.lock().await.is_empty());
+
+    // 2. Zero manual ab:promote endpoint exists anywhere, even for platform-admin.
+    let (s, _, _) = post_json(
+        app.clone(),
+        "/api/cd/deployments/dep-emg-2/promote",
+        None,
+        &[
+            ("x-proxy-secret", "edge-secret"),
+            ("x-forwarded-user", "admin"),
+        ],
+        "{}",
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // 3. Unknown deployment returns 404 for authorized operator.
+    let (s, _, _) = post_json(
+        app.clone(),
+        "/api/cd/deployments/does-not-exist/rollback",
+        None,
+        &[
+            ("x-proxy-secret", "edge-secret"),
+            ("x-forwarded-user", "carol"),
+        ],
+        "{}",
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // 4. Emergency operator with active Passkey-step-up folio triggers immediate rollback to @b + taint.
+    let (s, _, body) = post_json(
+        app,
+        "/api/cd/deployments/dep-emg-2/rollback",
+        Some(&bearer()),
+        &[
+            ("x-proxy-secret", "edge-secret"),
+            ("x-forwarded-user", "carol"),
+        ],
+        r#"{"note":"late production regression"}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let rb: AbRollbackResponseDto = serde_json::from_slice(&body).unwrap();
+    assert_eq!(rb.deployment_id, "dep-emg-2");
+    assert_eq!(rb.restored_slot, Slot::B);
+    assert_eq!(rb.tainted_digest.as_deref(), Some("sha256:d2"));
+
+    assert_eq!(
+        agent.rollback_slots.lock().await.as_slice(),
+        &[(
+            "dep-emg-2".to_string(),
+            mu_cd_ipc::DeploymentSlot::SlotB,
+            "sha256:d2".to_string()
+        )]
+    );
+    assert_eq!(
+        regist.taints.lock().await.as_slice(),
+        &["sha256:d2".to_string()]
+    );
+
+    // Restoring @b causes the next deploy to target @a rather than overwriting @b
+    orchestrator
+        .orchestrate_deployment(&cfg, "sha256:d3", Some("dep-emg-3".into()))
+        .await
+        .unwrap();
+    let d3 = store.snapshot().deployment("dep-emg-3").unwrap().clone();
+    assert_eq!(d3.staged_slot, Slot::A);
+    assert_eq!(d3.restore_slot, Slot::B);
+    assert_eq!(d3.active_slot, Slot::A);
 }

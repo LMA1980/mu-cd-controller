@@ -1144,6 +1144,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mu-auth"
+version = "0.1.0"
+source = "git+https://github.com/LMA1980/mu-auth.git?branch=main#b59f0d1c27ebc0d70d03dc605a80ab11c2b5b951"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mu-cd-controller"
 version = "0.1.1"
 dependencies = [
@@ -1152,6 +1161,7 @@ dependencies = [
  "fory",
  "futures-util",
  "http-body-util",
+ "mu-auth",
  "mu-cd-ipc",
  "mu-observable-ipc",
  "rcgen",

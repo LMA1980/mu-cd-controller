@@ -1,14 +1,12 @@
-//! Read-only, authenticated CD status and integration-gate HTTP API (`/api/cd/*`).
+//! Continuous Delivery and A/B Gate HTTP API (`/api/cd/*`) guarded by `mu-auth` policy folios.
 //!
 //! Served by axum on a **separate listener**, disabled unless `MUCONDE_CD_API_ADDR` is set.
-//! Browsers reach it only through the reverse proxy, which authenticates the session and
-//! forwards a bearer token. Service-to-service traffic (agents, MuRegist, MuObserve) keeps
-//! using mTLS and is not affected.
-//!
-//! Every `/api/cd/*` route requires `Authorization: Bearer <token>`. The token is read from a
-//! token file, trimmed, and the API **fails closed** (every request is rejected with `401`) when
-//! no file is configured, the file cannot be read, or it is empty. The file path itself is never
-//! used as a token.
+//! Interactive operator sessions authenticate through the edge reverse proxy (`X-Proxy-Secret` and
+//! `X-Forwarded-User`) and are evaluated against `mu-auth` policy folios (`cd:runs.read`,
+//! `cd:steps.read`, `ab:slots.read`, `ab:gate.logs.read`, and `ab:rollback`, with zero manual
+//! `ab:promote` endpoint). Service-to-service callers use `MUCONDE_CD_API_TOKEN_FILE` strictly for
+//! service-scoped reads and CI-to-CD triggers, failing closed (`401`/`403`) whenever credentials
+//! or required policy folios are missing.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -16,27 +14,31 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path as AxPath, Query, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
-use axum::middleware::{self, Next};
+use axum::body::Bytes;
+use axum::extract::{Path as AxPath, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
-use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
+use crate::auth::{
+    load_secret_file, AuthRejection, AuthorizedCaller, CdAuthorizer, POLICY_AB_ROLLBACK,
+    POLICY_AB_SLOTS_READ, POLICY_CD_RUNS_READ, POLICY_CD_SERVICE_DEPLOY,
+};
 use crate::cd_state::{
-    evaluate_gate, now_epoch_ms, CdEvent, CdStateStore, DeploymentRecord, GateOutcome,
-    GateTestView, GateVerdict, LeaseView, RollbackReason, Slot,
+    evaluate_gate, now_epoch_ms, AbRollbackRequestDto, CdEvent, CdStateStore, DeploymentRecord,
+    GateOutcome, GateTestView, GateVerdict, LeaseView, RollbackReason, Slot,
 };
 use crate::contract::MuConDeConfig;
+use crate::error::OrchestratorError;
 use crate::orchestrator::DeploymentOrchestrator;
 
-/// Default `limit` for `GET /api/cd/deployments`.
+/// Default `limit` for `GET /api/cd/deployments` and `GET /api/cd/runs`.
 pub const DEFAULT_DEPLOYMENTS_LIMIT: usize = 20;
 /// Maximum accepted `limit`.
 pub const MAX_DEPLOYMENTS_LIMIT: usize = 256;
@@ -48,18 +50,24 @@ pub const DEFAULT_SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
 pub struct CdApiConfig {
     /// Bind address; `None` disables the API (the default).
     pub bind_addr: Option<String>,
-    /// File containing the bearer token.
+    /// File containing the service-to-service bearer token.
     pub token_file: Option<PathBuf>,
+    /// File containing the shared edge proxy secret (`X-Proxy-Secret`).
+    pub proxy_secret_file: Option<PathBuf>,
 }
 
 impl CdApiConfig {
-    /// Reads `MUCONDE_CD_API_ADDR` and `MUCONDE_CD_API_TOKEN_FILE`.
+    /// Reads `MUCONDE_CD_API_ADDR`, `MUCONDE_CD_API_TOKEN_FILE`, and `MUCONDE_PROXY_SECRET_FILE`.
     pub fn from_env() -> Self {
         Self {
             bind_addr: std::env::var("MUCONDE_CD_API_ADDR")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             token_file: std::env::var("MUCONDE_CD_API_TOKEN_FILE")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from),
+            proxy_secret_file: std::env::var("MUCONDE_PROXY_SECRET_FILE")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .map(PathBuf::from),
@@ -94,25 +102,39 @@ pub fn load_token_file(path: &Path) -> Option<String> {
 pub struct CdApiState {
     pub store: Arc<CdStateStore>,
     pub orchestrator: Option<Arc<DeploymentOrchestrator>>,
-    token: Option<Arc<str>>,
+    pub authorizer: CdAuthorizer,
     keep_alive: Duration,
 }
 
 impl CdApiState {
-    /// `token = None` makes every request fail with `401`.
+    /// `token = None` (with no configured edge proxy secret) fails closed with `401`.
     pub fn new(store: Arc<CdStateStore>, token: Option<String>) -> Self {
         Self {
             store,
             orchestrator: None,
-            token: token.map(Arc::from),
+            authorizer: CdAuthorizer::new(token),
             keep_alive: DEFAULT_SSE_KEEP_ALIVE,
         }
     }
 
-    /// Attaches a [`DeploymentOrchestrator`] so `POST /api/cd/deploy` can dispatch rollouts.
+    /// Attaches a [`DeploymentOrchestrator`] for `POST /api/cd/deploy` and emergency rollback.
     #[must_use]
     pub fn with_orchestrator(mut self, orchestrator: Arc<DeploymentOrchestrator>) -> Self {
         self.orchestrator = Some(orchestrator);
+        self
+    }
+
+    /// Replaces the `mu-auth` policy-folio [`CdAuthorizer`].
+    #[must_use]
+    pub fn with_authorizer(mut self, authorizer: CdAuthorizer) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
+    /// Configures the expected `X-Proxy-Secret` header for authenticated `X-Forwarded-User` calls.
+    #[must_use]
+    pub fn with_proxy_secret(mut self, secret: Option<String>) -> Self {
+        self.authorizer = self.authorizer.with_proxy_secret(secret);
         self
     }
 
@@ -129,59 +151,14 @@ struct ErrorBody {
     error: &'static str,
 }
 
-fn unauthorized() -> Response {
-    let mut resp = (
-        StatusCode::UNAUTHORIZED,
-        Json(ErrorBody {
-            error: "unauthorized",
-        }),
-    )
-        .into_response();
-    resp.headers_mut().insert(
-        header::WWW_AUTHENTICATE,
-        HeaderValue::from_static("Bearer realm=\"muconde-cd\""),
-    );
-    resp
-}
-
-async fn require_bearer(State(state): State<CdApiState>, req: Request, next: Next) -> Response {
-    let Some(expected) = state.token.as_deref() else {
-        return unauthorized();
-    };
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.strip_prefix("Bearer ")
-                .or_else(|| v.strip_prefix("bearer "))
-        })
-        .map(str::trim);
-    match presented {
-        Some(p) if bool::from(p.as_bytes().ct_eq(expected.as_bytes())) => next.run(req).await,
-        _ => unauthorized(),
-    }
-}
-
-/// Returns `true` when the reverse proxy has verified an invited GitHub operator session.
-///
-/// Public read-only dashboard requests carry the reverse-proxy CD bearer token without an
-/// operator header; those requests receive full gate checkpoint state (`tests[].name`,
-/// `critical`, `state`, `duration_ms`) with `tests[].log_excerpt` redacted to `None`.
-pub fn is_operator_authenticated(headers: &HeaderMap) -> bool {
-    let op_auth = headers
-        .get("x-operator-authenticated")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
-    if op_auth {
-        return true;
-    }
-    headers
-        .get("x-forwarded-user")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .is_some_and(|v| !v.is_empty())
+fn authorize(
+    state: &CdApiState,
+    headers: &HeaderMap,
+    required_policy: &str,
+) -> Result<AuthorizedCaller, AuthRejection> {
+    state
+        .authorizer
+        .authorize_at(headers, required_policy, now_epoch_ms())
 }
 
 /// `GET /api/cd/deployments` entry (newest first).
@@ -328,10 +305,48 @@ fn matches_repo(d: &DeploymentRecord, q: &str) -> bool {
         || d.service.eq_ignore_ascii_case(q)
 }
 
+/// Query of `GET /api/cd/runs`.
+#[derive(Debug, Default, Deserialize)]
+pub struct CdRunsQuery {
+    /// Ecosystem filter (`cargo`, `dotnet`/`.net`, `maven`, or custom).
+    pub ecosystem: Option<String>,
+    /// `owner/repo` or bare repo name filter.
+    pub repo: Option<String>,
+    pub limit: Option<usize>,
+}
+
+async fn get_cd_runs(
+    State(state): State<CdApiState>,
+    headers: HeaderMap,
+    Query(q): Query<CdRunsQuery>,
+) -> Response {
+    let caller = match authorize(&state, &headers, POLICY_CD_RUNS_READ) {
+        Ok(c) => c,
+        Err(rej) => return rej.into_response(),
+    };
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_DEPLOYMENTS_LIMIT)
+        .clamp(1, MAX_DEPLOYMENTS_LIMIT);
+    let mut runs = state
+        .store
+        .list_cd_runs(q.ecosystem.as_deref(), q.repo.as_deref(), Some(limit));
+    if !caller.can_read_steps {
+        for run in &mut runs {
+            run.steps.clear();
+        }
+    }
+    Json(runs).into_response()
+}
+
 async fn get_deployments(
     State(state): State<CdApiState>,
+    headers: HeaderMap,
     Query(q): Query<DeploymentsQuery>,
-) -> Json<Vec<DeploymentSummary>> {
+) -> Response {
+    if let Err(rej) = authorize(&state, &headers, POLICY_AB_SLOTS_READ) {
+        return rej.into_response();
+    }
     let snap = state.store.snapshot();
     let now = now_epoch_ms();
     let limit = q
@@ -339,14 +354,14 @@ async fn get_deployments(
         .unwrap_or(DEFAULT_DEPLOYMENTS_LIMIT)
         .clamp(1, MAX_DEPLOYMENTS_LIMIT);
     let repo = q.repo.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let out = snap
+    let out: Vec<DeploymentSummary> = snap
         .deployments
         .iter()
         .filter(|d| repo.is_none_or(|r| matches_repo(d, r)))
         .take(limit)
         .map(|d| DeploymentSummary::from_record(d, now))
         .collect();
-    Json(out)
+    Json(out).into_response()
 }
 
 async fn get_gate(
@@ -354,11 +369,15 @@ async fn get_gate(
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
 ) -> Response {
+    let caller = match authorize(&state, &headers, POLICY_AB_SLOTS_READ) {
+        Ok(c) => c,
+        Err(rej) => return rej.into_response(),
+    };
     let snap = state.store.snapshot();
     match snap.deployment(&id) {
         Some(d) => {
             let mut gate = DeploymentGate::from_record(d, now_epoch_ms());
-            if !is_operator_authenticated(&headers) {
+            if !caller.can_read_gate_logs {
                 for test in &mut gate.tests {
                     test.log_excerpt = None;
                 }
@@ -375,19 +394,77 @@ async fn get_gate(
     }
 }
 
-async fn get_leases(State(state): State<CdApiState>) -> Json<Vec<LeaseView>> {
+async fn post_rollback(
+    State(state): State<CdApiState>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(rej) = authorize(&state, &headers, POLICY_AB_ROLLBACK) {
+        return rej.into_response();
+    }
+    let req: AbRollbackRequestDto = if body.iter().all(|b| b.is_ascii_whitespace()) {
+        AbRollbackRequestDto::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("invalid_rollback_payload: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let Some(orchestrator) = state.orchestrator.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: "orchestrator_unavailable",
+            }),
+        )
+            .into_response();
+    };
+    match orchestrator
+        .emergency_rollback(&id, req.note.as_deref())
+        .await
+    {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(OrchestratorError::DeploymentNotFound(_)) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "deployment_not_found",
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "rollback_failed",
+                "detail": e.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_leases(State(state): State<CdApiState>, headers: HeaderMap) -> Response {
+    if let Err(rej) = authorize(&state, &headers, POLICY_AB_SLOTS_READ) {
+        return rej.into_response();
+    }
     let snap = state.store.snapshot();
     let now = now_epoch_ms();
-    Json(
-        snap.leases
-            .iter()
-            .cloned()
-            .map(|mut l| {
-                l.ttl_remaining_ms = l.expires_epoch_ms.saturating_sub(now);
-                l
-            })
-            .collect(),
-    )
+    let out: Vec<LeaseView> = snap
+        .leases
+        .iter()
+        .cloned()
+        .map(|mut l| {
+            l.ttl_remaining_ms = l.expires_epoch_ms.saturating_sub(now);
+            l
+        })
+        .collect();
+    Json(out).into_response()
 }
 
 /// Converts a broadcast receiver into an SSE stream. A consumer that lags behind the buffer is
@@ -413,13 +490,18 @@ pub fn cd_event_stream(
     })
 }
 
-async fn get_events(State(state): State<CdApiState>) -> impl IntoResponse {
+async fn get_events(State(state): State<CdApiState>, headers: HeaderMap) -> Response {
+    if let Err(rej) = authorize(&state, &headers, POLICY_AB_SLOTS_READ) {
+        return rej.into_response();
+    }
     let stream = cd_event_stream(state.store.subscribe());
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(state.keep_alive)
-            .text("heartbeat"),
-    )
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(state.keep_alive)
+                .text("heartbeat"),
+        )
+        .into_response()
 }
 
 /// Request payload for `POST /api/cd/deploy`.
@@ -450,6 +532,9 @@ async fn post_deploy(
     headers: HeaderMap,
     Json(req): Json<DeployTriggerRequest>,
 ) -> Response {
+    if let Err(rej) = authorize(&state, &headers, POLICY_CD_SERVICE_DEPLOY) {
+        return rej.into_response();
+    }
     let Some(orchestrator) = state.orchestrator.clone() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -605,15 +690,13 @@ async fn post_deploy(
 /// Builds the `/api/cd/*` router; every route sits behind the bearer-token gate.
 pub fn router(state: CdApiState) -> Router {
     Router::new()
+        .route("/api/cd/runs", get(get_cd_runs))
         .route("/api/cd/deployments", get(get_deployments))
         .route("/api/cd/deployments/{id}/gate", get(get_gate))
+        .route("/api/cd/deployments/{id}/rollback", post(post_rollback))
         .route("/api/cd/leases", get(get_leases))
         .route("/api/cd/events", get(get_events))
         .route("/api/cd/deploy", post(post_deploy))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_bearer,
-        ))
         .with_state(state)
 }
 
@@ -650,7 +733,11 @@ pub async fn spawn_cd_api_with_orchestrator(
     };
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
-    let mut state = CdApiState::new(store, token);
+    let proxy_secret = config
+        .proxy_secret_file
+        .as_deref()
+        .and_then(load_secret_file);
+    let mut state = CdApiState::new(store, token).with_proxy_secret(proxy_secret);
     if let Some(orch) = orchestrator {
         state = state.with_orchestrator(orch);
     }
@@ -659,7 +746,7 @@ pub async fn spawn_cd_api_with_orchestrator(
             tracing::error!(error = %e, "CD API listener stopped");
         }
     });
-    tracing::info!(addr = %local, "MuConDe CD status API listening (bearer auth)");
+    tracing::info!(addr = %local, "MuConDe CD API listening (mu-auth folio + bearer auth)");
     Ok(Some((local, handle)))
 }
 
@@ -691,30 +778,6 @@ mod tests {
         let c = CdApiConfig::default();
         assert!(c.bind_addr.is_none());
         assert!(c.token_file.is_none());
-    }
-
-    #[test]
-    fn test_is_operator_authenticated_headers() {
-        let mut h = HeaderMap::new();
-        assert!(!is_operator_authenticated(&h));
-
-        h.insert(
-            "x-operator-authenticated",
-            HeaderValue::from_static("false"),
-        );
-        assert!(!is_operator_authenticated(&h));
-
-        h.insert("x-operator-authenticated", HeaderValue::from_static("TRUE"));
-        assert!(is_operator_authenticated(&h));
-
-        h.insert("x-operator-authenticated", HeaderValue::from_static("1"));
-        assert!(is_operator_authenticated(&h));
-
-        h.remove("x-operator-authenticated");
-        h.insert("x-forwarded-user", HeaderValue::from_static("   "));
-        assert!(!is_operator_authenticated(&h));
-
-        h.insert("x-forwarded-user", HeaderValue::from_static("octocat"));
-        assert!(is_operator_authenticated(&h));
+        assert!(c.proxy_secret_file.is_none());
     }
 }

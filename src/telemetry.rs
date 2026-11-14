@@ -3,7 +3,7 @@
 //! Emits `MUOB`-framed `OtelSpanEntry` and `OtelLogEntry` Arrow batches to `muObserve` / `mu-observable-collector`
 //! for deployment lifecycle events:
 //! - `cd.deployment.start`: Root or multi-hop span representing an entire continuous delivery rollout.
-//! - `cd.slot.stage_b`: Child span recording candidate artifact staging into Slot B (`@b`).
+//! - `cd.slot.stage_a` / `cd.slot.stage_b`: Child span recording candidate artifact staging into `@a` or `@b`.
 //! - `cd.gate.evaluate`: Child span recording canary SLO and integration test evaluation.
 
 use std::fmt;

@@ -1,7 +1,7 @@
 //! Read-only continuous-delivery state published to the `/api/cd/*` HTTP API.
 //!
 //! Writers (the [`crate::orchestrator::DeploymentOrchestrator`], the lease coordinator mirror and
-//! the agent IPC reader forwarding `IntegrationTestProgress`) mutate a private [`CdState`] and
+//! the agent IPC reader forwarding `IntegrationTestProgress`) mutate a private `CdState` and
 //! publish an immutable [`CdSnapshot`] behind an `Arc`. HTTP handlers only ever clone that `Arc`,
 //! so reads never block writers for longer than a pointer swap. Every change is also broadcast as
 //! a [`CdEvent`] for the SSE stream.
@@ -188,6 +188,8 @@ pub struct CdSnapshot {
     /// Newest first, bounded by the history limit.
     pub deployments: Vec<DeploymentRecord>,
     pub leases: Vec<LeaseView>,
+    /// Recent ecosystem-agnostic CD runs (`GET /api/cd/runs`), newest first.
+    pub cd_runs: Vec<CdRunDto>,
 }
 
 impl CdSnapshot {
@@ -195,6 +197,11 @@ impl CdSnapshot {
         self.deployments
             .iter()
             .find(|d| d.deployment_id == deployment_id)
+    }
+
+    /// Returns the matching [`CdRunDto`] by `run_id` if present.
+    pub fn cd_run(&self, run_id: &str) -> Option<&CdRunDto> {
+        self.cd_runs.iter().find(|r| r.run_id == run_id)
     }
 }
 
@@ -343,6 +350,184 @@ struct CdState {
     rev: u64,
     deployments: VecDeque<DeploymentRecord>,
     leases: Vec<LeaseView>,
+    cd_runs: VecDeque<CdRunDto>,
+}
+
+/// Ecosystem identifier carried by [`CdRunDto`] (`"cargo"`, `"dotnet"`, `"maven"`, or custom).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum CdEcosystem {
+    #[default]
+    Cargo,
+    DotNet,
+    Maven,
+    Custom(String),
+}
+
+impl CdEcosystem {
+    /// Normalizes an ecosystem label cleanly (`".net"` / `"nuget"` -> [`Self::DotNet`]).
+    #[must_use]
+    pub fn from_label(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "cargo" | "rust" => Self::Cargo,
+            "dotnet" | ".net" | "nuget" => Self::DotNet,
+            "maven" | "java" => Self::Maven,
+            other => Self::Custom(other.to_string()),
+        }
+    }
+
+    /// Canonical lowercase wire slug (`"cargo"`, `"dotnet"`, `"maven"`, or custom slug).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Cargo => "cargo",
+            Self::DotNet => "dotnet",
+            Self::Maven => "maven",
+            Self::Custom(s) => s.as_str(),
+        }
+    }
+}
+
+impl Serialize for CdEcosystem {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CdEcosystem {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::from_label(&raw))
+    }
+}
+
+/// Lifecycle state of an ecosystem-agnostic delivery run or step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdRunState {
+    #[default]
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Blocked,
+    RolledBack,
+}
+
+/// Machine-readable skip cause for an individual CD stage.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReasonDto {
+    NoCapableWorkerNode {
+        #[serde(default)]
+        capability: Option<String>,
+    },
+    UpstreamStageNotPassed {
+        #[serde(default)]
+        stage_id: Option<String>,
+    },
+    ConditionNotMet,
+    Superseded,
+    Other(String),
+}
+
+/// Repository coordinates matching `mu-console-protocol::RepoId` JSON shape.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]
+pub struct CdRepoId {
+    pub owner: String,
+    pub repo: String,
+}
+
+impl CdRepoId {
+    #[must_use]
+    pub fn new(owner: impl Into<String>, repo: impl Into<String>) -> Self {
+        Self {
+            owner: owner.into(),
+            repo: repo.into(),
+        }
+    }
+}
+
+/// One ordered delivery stage inside [`CdRunDto`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CdStepDto {
+    pub step_id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub state: CdRunState,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub skip_reason: Option<SkipReasonDto>,
+    #[serde(default)]
+    pub error_summary: Option<String>,
+    #[serde(default)]
+    pub failed_package: Option<String>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+}
+
+/// Pinpointed failure diagnosis attached to a failed [`CdRunDto`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CdRunFailurePinpointDto {
+    pub step_id: String,
+    #[serde(default)]
+    pub package_name: Option<String>,
+    #[serde(default)]
+    pub package_version: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub log_excerpt: Option<String>,
+}
+
+/// Ecosystem-agnostic `GET /api/cd/runs` release/publish record (`Area::Cd`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CdRunDto {
+    pub run_id: String,
+    #[serde(default)]
+    pub ecosystem: CdEcosystem,
+    #[serde(default)]
+    pub repo: CdRepoId,
+    #[serde(default)]
+    pub ref_name: String,
+    #[serde(default)]
+    pub commit_sha: String,
+    #[serde(default)]
+    pub state: CdRunState,
+    #[serde(default)]
+    pub started_epoch_ms: u64,
+    #[serde(default)]
+    pub finished_epoch_ms: Option<u64>,
+    #[serde(default)]
+    pub steps: Vec<CdStepDto>,
+    #[serde(default)]
+    pub failure: Option<CdRunFailurePinpointDto>,
+    #[serde(default)]
+    pub registry_package: Option<String>,
+    #[serde(default)]
+    pub registry_version: Option<String>,
+    #[serde(default)]
+    pub ab_deployment_id: Option<String>,
+    #[serde(default)]
+    pub artifact_digest: Option<String>,
+}
+
+/// `POST /api/cd/deployments/{id}/rollback` JSON request payload.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AbRollbackRequestDto {
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// `POST /api/cd/deployments/{id}/rollback` response payload.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AbRollbackResponseDto {
+    pub deployment_id: String,
+    #[serde(default)]
+    pub restored_slot: Slot,
+    #[serde(default)]
+    pub tainted_digest: Option<String>,
 }
 
 /// Mutable CD state with an `Arc` snapshot publisher and SSE broadcaster.
@@ -397,6 +582,7 @@ impl CdStateStore {
             rev: st.rev,
             deployments: st.deployments.iter().cloned().collect(),
             leases: st.leases.clone(),
+            cd_runs: st.cd_runs.iter().cloned().collect(),
         });
         *self.snapshot.write().unwrap_or_else(|e| e.into_inner()) = snap;
         r
@@ -554,13 +740,73 @@ impl CdStateStore {
         });
     }
 
+    /// Records or updates an ecosystem-agnostic Continuous Delivery run (newest-first).
+    pub fn record_cd_run(&self, run: CdRunDto) {
+        let limit = self.history_limit;
+        self.mutate(|st| {
+            st.cd_runs.retain(|r| r.run_id != run.run_id);
+            st.cd_runs.push_front(run);
+            st.cd_runs.truncate(limit);
+        });
+    }
+
+    /// Returns recent [`CdRunDto`] records filtered optionally by normalized `ecosystem`,
+    /// repository filter (`owner/repo` or bare `repo`), and bounded by `limit`.
+    #[must_use]
+    pub fn list_cd_runs(
+        &self,
+        ecosystem: Option<&str>,
+        repo: Option<&str>,
+        limit: Option<usize>,
+    ) -> Vec<CdRunDto> {
+        let eco_filter = ecosystem
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(CdEcosystem::from_label);
+        let repo_filter = repo.map(str::trim).filter(|s| !s.is_empty());
+        let snap = self.snapshot();
+        let iter = snap.cd_runs.iter().filter(|run| {
+            if let Some(ref wanted_eco) = eco_filter {
+                if &run.ecosystem != wanted_eco {
+                    return false;
+                }
+            }
+            if let Some(wanted_repo) = repo_filter {
+                let full = if run.repo.owner.is_empty() {
+                    run.repo.repo.as_str().to_string()
+                } else {
+                    format!("{}/{}", run.repo.owner, run.repo.repo)
+                };
+                if full != wanted_repo && run.repo.repo != wanted_repo {
+                    return false;
+                }
+            }
+            true
+        });
+        match limit {
+            Some(n) => iter.take(n).cloned().collect(),
+            None => iter.cloned().collect(),
+        }
+    }
+
     /// Records a promotion and broadcasts `promoted`.
     pub fn deployment_promoted(&self, deployment_id: &str, slot: Slot) {
+        let now = now_epoch_ms();
         self.mutate(|st| {
             if let Some(d) = Self::find(st, deployment_id) {
                 d.outcome = GateOutcome::Promoted;
                 d.active_slot = slot;
-                d.finished_epoch_ms = Some(now_epoch_ms());
+                d.finished_epoch_ms = Some(now);
+            }
+            for run in &mut st.cd_runs {
+                if run.ab_deployment_id.as_deref() == Some(deployment_id)
+                    && matches!(run.state, CdRunState::Pending | CdRunState::Running)
+                {
+                    run.state = CdRunState::Succeeded;
+                    if run.finished_epoch_ms.is_none() {
+                        run.finished_epoch_ms = Some(now);
+                    }
+                }
             }
         });
         self.emit(CdEvent::Promoted(PromotedEvent {
@@ -577,6 +823,7 @@ impl CdStateStore {
         reason: RollbackReason,
         detail: &str,
     ) {
+        let now = now_epoch_ms();
         self.mutate(|st| {
             if let Some(d) = Self::find(st, deployment_id) {
                 if d.outcome != GateOutcome::Tainted {
@@ -589,7 +836,22 @@ impl CdStateStore {
                 if reason == RollbackReason::LeaseExpired {
                     d.lease_expired = true;
                 }
-                d.finished_epoch_ms = Some(now_epoch_ms());
+                d.finished_epoch_ms = Some(now);
+            }
+            for run in &mut st.cd_runs {
+                if run.ab_deployment_id.as_deref() == Some(deployment_id) {
+                    run.state = CdRunState::RolledBack;
+                    run.finished_epoch_ms = Some(now);
+                    if run.failure.is_none() {
+                        run.failure = Some(CdRunFailurePinpointDto {
+                            step_id: "ab-gate".to_string(),
+                            package_name: run.registry_package.clone(),
+                            package_version: run.registry_version.clone(),
+                            reason: detail.to_string(),
+                            log_excerpt: None,
+                        });
+                    }
+                }
             }
         });
         self.emit(CdEvent::RolledBack(RolledBackEvent {
@@ -870,5 +1132,104 @@ mod tests {
             names,
             vec!["promoted", "rolled_back", "tainted", "lease_expired"]
         );
+    }
+
+    #[test]
+    fn test_cd_runs_multi_ecosystem_filter_and_ab_link() {
+        let store = CdStateStore::default();
+        store.record_cd_run(CdRunDto {
+            run_id: "run-cargo-1".into(),
+            ecosystem: CdEcosystem::Cargo,
+            repo: CdRepoId::new("LMA1980", "mu-cd-agent"),
+            ref_name: "refs/heads/main".into(),
+            commit_sha: "abc111".into(),
+            state: CdRunState::Running,
+            started_epoch_ms: 1000,
+            finished_epoch_ms: None,
+            steps: vec![CdStepDto {
+                step_id: "publish-crate".into(),
+                label: "Publish crate to MuRegist".into(),
+                state: CdRunState::Succeeded,
+                duration_ms: 420,
+                ..Default::default()
+            }],
+            failure: None,
+            registry_package: Some("mu-cd-agent".into()),
+            registry_version: Some("0.2.0".into()),
+            ab_deployment_id: Some("dep-ab-link".into()),
+            artifact_digest: Some("sha256:cargo1".into()),
+        });
+        store.record_cd_run(CdRunDto {
+            run_id: "run-dotnet-1".into(),
+            ecosystem: CdEcosystem::from_label("NuGet"),
+            repo: CdRepoId::new("LMA1980", "sample-dotnet"),
+            ref_name: "refs/heads/main".into(),
+            commit_sha: "def222".into(),
+            state: CdRunState::Failed,
+            started_epoch_ms: 2000,
+            finished_epoch_ms: Some(2500),
+            steps: vec![CdStepDto {
+                step_id: "nuget-push".into(),
+                label: "Push NuGet package".into(),
+                state: CdRunState::Failed,
+                duration_ms: 500,
+                skip_reason: None,
+                error_summary: Some("409 Conflict".into()),
+                failed_package: Some("Sample.Sdk".into()),
+                exit_code: Some(1),
+            }],
+            failure: Some(CdRunFailurePinpointDto {
+                step_id: "nuget-push".into(),
+                package_name: Some("Sample.Sdk".into()),
+                package_version: Some("1.2.3".into()),
+                reason: "Package version already published".into(),
+                log_excerpt: Some("error: 409 Conflict".into()),
+            }),
+            registry_package: Some("Sample.Sdk".into()),
+            registry_version: Some("1.2.3".into()),
+            ab_deployment_id: None,
+            artifact_digest: None,
+        });
+        store.record_cd_run(CdRunDto {
+            run_id: "run-maven-1".into(),
+            ecosystem: CdEcosystem::Maven,
+            repo: CdRepoId::new("LMA1980", "sample-java"),
+            ref_name: "refs/heads/main".into(),
+            commit_sha: "ghi333".into(),
+            state: CdRunState::Succeeded,
+            started_epoch_ms: 3000,
+            finished_epoch_ms: Some(3400),
+            ..Default::default()
+        });
+
+        assert_eq!(store.list_cd_runs(None, None, None).len(), 3);
+        let dotnet = store.list_cd_runs(Some(".net"), None, None);
+        assert_eq!(dotnet.len(), 1);
+        assert_eq!(dotnet[0].run_id, "run-dotnet-1");
+        assert_eq!(
+            dotnet[0].failure.as_ref().unwrap().package_name.as_deref(),
+            Some("Sample.Sdk")
+        );
+
+        let limited = store.list_cd_runs(None, None, Some(2));
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].run_id, "run-maven-1");
+
+        // Linked A|B rollback transitions the linked Cargo run to RolledBack
+        store.deployment_started(start("dep-ab-link", vec![]));
+        store.deployment_rolled_back(
+            "dep-ab-link",
+            Slot::B,
+            RollbackReason::Manual,
+            "emergency revert",
+        );
+        let linked = store.snapshot().cd_run("run-cargo-1").unwrap().clone();
+        assert_eq!(linked.state, CdRunState::RolledBack);
+        assert!(linked
+            .failure
+            .as_ref()
+            .unwrap()
+            .reason
+            .contains("emergency revert"));
     }
 }
