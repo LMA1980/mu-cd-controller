@@ -92,10 +92,94 @@ impl Default for AbRulesConfig {
     }
 }
 
+/// Declarative deployment target, artifact, and service placement metadata
+/// (`deployment` block in `.mucd/mu-cd.yml`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DeploymentConfig {
+    /// Target nodes scoped under `deployment` when top-level `target_nodes` is omitted.
+    pub target_nodes: Vec<String>,
+    /// Canonical service binary name installed onto target nodes.
+    pub binary: Option<String>,
+    /// Absolute installation path for the service binary (e.g. `/usr/local/bin/<service>`).
+    pub install_path: Option<String>,
+    /// Explicit systemd unit name (with or without `.service` suffix).
+    pub systemd_unit: Option<String>,
+    /// Destination document root for static web bundle deployments.
+    pub web_root: Option<String>,
+    /// Artifact directory or bundle identifier for static web deployments.
+    pub artifact: Option<String>,
+}
+
+impl DeploymentConfig {
+    /// Returns the trimmed non-empty binary name, if configured.
+    #[must_use]
+    pub fn normalized_binary(&self) -> Option<&str> {
+        self.binary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Returns the trimmed non-empty installation path, if configured.
+    #[must_use]
+    pub fn normalized_install_path(&self) -> Option<&str> {
+        self.install_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Returns the normalized systemd unit name (appending `.service` when absent), if configured.
+    #[must_use]
+    pub fn normalized_systemd_unit(&self) -> Option<String> {
+        self.systemd_unit
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(normalize_systemd_unit_name)
+    }
+
+    /// Returns the trimmed non-empty static web root path, if configured.
+    #[must_use]
+    pub fn normalized_web_root(&self) -> Option<&str> {
+        self.web_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Returns the trimmed non-empty artifact specifier, if configured.
+    #[must_use]
+    pub fn normalized_artifact(&self) -> Option<&str> {
+        self.artifact
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Returns `true` if this deployment describes a static web bundle rather than a systemd daemon.
+    #[must_use]
+    pub fn is_static_web(&self, service: &str) -> bool {
+        self.normalized_web_root().is_some()
+            || matches!(service.trim(), "muconsole" | "mu-console" | "mu-ci-web")
+    }
+}
+
+fn normalize_systemd_unit_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.ends_with(".service") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.service")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MuConDeConfig {
     pub version: String,
     pub service: String,
+    #[serde(default)]
     pub target_nodes: Vec<String>,
     #[serde(default = "default_lease_ttl")]
     pub lease_ttl_seconds: u64,
@@ -114,6 +198,9 @@ pub struct MuConDeConfig {
     /// Declarative symmetric A/B deployment and Btrfs snapshot rules.
     #[serde(default)]
     pub ab_rules: AbRulesConfig,
+    /// Declarative deployment placement, binary/web paths, and systemd unit overrides.
+    #[serde(default)]
+    pub deployment: DeploymentConfig,
 }
 
 /// Selector specifying which integration test suites are required before promotion.
@@ -227,14 +314,20 @@ impl MuConDeConfig {
             return Err(ContractError::EmptyService);
         }
 
-        if self.target_nodes.is_empty() {
-            return Err(ContractError::EmptyTargetNodes);
-        }
-
         for node in &self.target_nodes {
             if node.trim().is_empty() {
                 return Err(ContractError::EmptyTargetNode);
             }
+        }
+
+        for node in &self.deployment.target_nodes {
+            if node.trim().is_empty() {
+                return Err(ContractError::EmptyTargetNode);
+            }
+        }
+
+        if self.effective_target_nodes().is_empty() {
+            return Err(ContractError::EmptyTargetNodes);
         }
 
         if self.lease_ttl_seconds == 0 {
@@ -285,6 +378,32 @@ impl MuConDeConfig {
             IntegrationTestSelector::All(_) => true,
             IntegrationTestSelector::Selected(tests) => tests.iter().any(|t| t == test_name),
         }
+    }
+
+    /// Returns top-level `target_nodes` when non-empty, otherwise falls back to `deployment.target_nodes`.
+    #[must_use]
+    pub fn effective_target_nodes(&self) -> &[String] {
+        if !self.target_nodes.is_empty() {
+            &self.target_nodes
+        } else {
+            &self.deployment.target_nodes
+        }
+    }
+
+    /// Resolves the systemd unit name passed in `SlotSwapCommand`, preferring
+    /// `deployment.systemd_unit` when set and avoiding duplicate `.service` suffixes.
+    #[must_use]
+    pub fn effective_systemd_unit(&self) -> String {
+        if let Some(unit) = self.deployment.normalized_systemd_unit() {
+            return unit;
+        }
+        normalize_systemd_unit_name(&self.service)
+    }
+
+    /// Returns `true` when this manifest describes a static web deployment rather than a daemon.
+    #[must_use]
+    pub fn is_static_web(&self) -> bool {
+        self.deployment.is_static_web(&self.service)
     }
 }
 
@@ -651,5 +770,93 @@ ab_rules:
         let repo_cfg = MuConDeConfig::from_repo_root(std::path::Path::new(".")).unwrap();
         assert_eq!(repo_cfg.service, "mu-cd-controller");
         assert_eq!(repo_cfg.ab_rules, AbRulesConfig::default());
+        assert_eq!(
+            repo_cfg.deployment.normalized_binary(),
+            Some("mu-cd-controller")
+        );
+        assert_eq!(
+            repo_cfg.deployment.normalized_install_path(),
+            Some("/usr/local/bin/mu-cd-controller")
+        );
+        assert_eq!(
+            repo_cfg.effective_systemd_unit(),
+            "mu-cd-controller.service"
+        );
+        assert!(!repo_cfg.is_static_web());
+    }
+
+    #[test]
+    fn test_deployment_block_parsing_and_systemd_unit_normalization() {
+        let yaml = r#"
+version: "1"
+service: "mu-observable-collector.service"
+integration_tests: "all"
+deployment:
+  target_nodes:
+    - "node-a"
+    - "worker-aarch64"
+  binary: " mu-observable-collector "
+  install_path: "/usr/local/bin/mu-observable-collector"
+  systemd_unit: "custom-collector"
+"#;
+        let cfg = MuConDeConfig::from_yaml_str(yaml).expect("deployment target_nodes fallback");
+        assert!(cfg.target_nodes.is_empty());
+        assert_eq!(
+            cfg.effective_target_nodes(),
+            &["node-a".to_string(), "worker-aarch64".to_string()]
+        );
+        assert_eq!(
+            cfg.deployment.normalized_binary(),
+            Some("mu-observable-collector")
+        );
+        assert_eq!(
+            cfg.deployment.normalized_install_path(),
+            Some("/usr/local/bin/mu-observable-collector")
+        );
+        assert_eq!(cfg.effective_systemd_unit(), "custom-collector.service");
+        assert!(!cfg.is_static_web());
+
+        let fallback_service_yaml = r#"
+version: "1"
+service: "mu-observable-collector.service"
+target_nodes: ["node-a"]
+integration_tests: "all"
+"#;
+        let fallback_cfg = MuConDeConfig::from_yaml_str(fallback_service_yaml).unwrap();
+        assert_eq!(
+            fallback_cfg.effective_systemd_unit(),
+            "mu-observable-collector.service"
+        );
+
+        let web_yaml = r#"
+version: "1"
+service: "muconsole"
+target_nodes: ["node-a", "node-b"]
+integration_tests: "all"
+deployment:
+  target_nodes: ["node-a", "node-b"]
+  web_root: "/var/www/muconsole"
+  artifact: "dist"
+"#;
+        let web_cfg = MuConDeConfig::from_yaml_str(web_yaml).unwrap();
+        assert!(web_cfg.is_static_web());
+        assert_eq!(
+            web_cfg.deployment.normalized_web_root(),
+            Some("/var/www/muconsole")
+        );
+        assert_eq!(web_cfg.deployment.normalized_artifact(), Some("dist"));
+
+        let blank_dep_node = r#"
+version: "1"
+service: "mu-cd-controller"
+target_nodes: ["node-a"]
+integration_tests: "all"
+deployment:
+  target_nodes: ["   "]
+"#;
+        assert_eq!(
+            MuConDeConfig::from_yaml_str(blank_dep_node).unwrap_err(),
+            ContractError::EmptyTargetNode
+        );
     }
 }

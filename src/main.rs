@@ -10,7 +10,9 @@ use tracing_subscriber::EnvFilter;
 use mu_cd_controller::api::{spawn_cd_api_with_orchestrator, CdApiConfig};
 use mu_cd_controller::cd_state::CdStateStore;
 use mu_cd_controller::contract::MuConDeConfig;
-use mu_cd_controller::lease::{ClusterIdlePoller, LeaseCoordinator, DEFAULT_CONTROLLER_URL};
+use mu_cd_controller::lease::{
+    ClusterIdlePoller, IdleBackoffConfig, LeaseCoordinator, DEFAULT_CONTROLLER_URL,
+};
 use mu_cd_controller::orchestrator::{
     DeploymentOrchestrator, DeploymentOutcome, HttpMuRegistClient, IpcAgentClient,
     DEFAULT_REGISTRY_URL,
@@ -77,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cd_sink: Arc<dyn CdTelemetrySink> = Arc::new(MuObserveCdSink::from_env());
     let mut orchestrator =
         DeploymentOrchestrator::new(coordinator.clone(), poller, agent_client, regist_client)
+            .with_idle_backoff(IdleBackoffConfig::from_env())
             .with_cd_state(cd_state.clone())
             .with_telemetry_sink(cd_sink);
 
@@ -146,40 +149,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let config = MuConDeConfig::from_file(config_path)?;
         let repo = std::env::var("MUCONDE_REPO").ok();
-        let outcome = orchestrator
-            .orchestrate_deployment_for_repo(&config, artifact_sha256, None, repo.as_deref())
+        let outcomes = orchestrator
+            .orchestrate_rollout_for_repo(&config, artifact_sha256, repo.as_deref())
             .await?;
 
-        match outcome {
-            DeploymentOutcome::Promoted {
-                service,
-                target_node,
-                artifact_sha256,
-                ..
-            } => {
-                info!(
-                    service = %service,
-                    node = %target_node,
-                    digest = %artifact_sha256,
-                    "Deployment successfully completed and promoted"
-                );
+        let mut any_rolled_back = false;
+        for outcome in outcomes {
+            match outcome {
+                DeploymentOutcome::Promoted {
+                    service,
+                    target_node,
+                    artifact_sha256,
+                    ..
+                } => {
+                    info!(
+                        service = %service,
+                        node = %target_node,
+                        digest = %artifact_sha256,
+                        "Deployment successfully completed and promoted"
+                    );
+                }
+                DeploymentOutcome::RolledBack {
+                    service,
+                    target_node,
+                    artifact_sha256,
+                    reason,
+                    ..
+                } => {
+                    any_rolled_back = true;
+                    error!(
+                        service = %service,
+                        node = %target_node,
+                        digest = %artifact_sha256,
+                        reason = %reason,
+                        "Deployment failed and was rolled back"
+                    );
+                }
             }
-            DeploymentOutcome::RolledBack {
-                service,
-                target_node,
-                artifact_sha256,
-                reason,
-                ..
-            } => {
-                error!(
-                    service = %service,
-                    node = %target_node,
-                    digest = %artifact_sha256,
-                    reason = %reason,
-                    "Deployment failed and was rolled back"
-                );
-                std::process::exit(1);
-            }
+        }
+
+        if any_rolled_back {
+            std::process::exit(1);
         }
 
         return Ok(());

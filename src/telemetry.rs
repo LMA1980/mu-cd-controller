@@ -213,3 +213,32 @@ pub fn build_cd_span(
         attributes_json: attributes.to_string(),
     }
 }
+
+/// Builds an [`OtelLogEntry`] audit record for continuous delivery lifecycle events
+/// (single-node rollbacks, emergency operator rollbacks, and multi-node partial rollbacks).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn build_cd_log(
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+    timestamp_ns: i64,
+    severity_number: i32,
+    severity_text: &str,
+    node_id: &str,
+    body: impl Into<String>,
+    attributes: serde_json::Value,
+) -> OtelLogEntry {
+    OtelLogEntry {
+        timestamp_unix_nano: timestamp_ns,
+        trace_id: encode_hex(&trace_id),
+        span_id: encode_hex(&span_id),
+        severity_number,
+        severity_text: severity_text.to_string(),
+        service_name: CD_SERVICE_NAME.to_string(),
+        node_id: node_id.to_string(),
+        body: body.into(),
+        attributes_json: attributes.to_string(),
+        job_id: None,
+        stage_id: None,
+    }
+}
