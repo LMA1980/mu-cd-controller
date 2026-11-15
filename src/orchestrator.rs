@@ -14,8 +14,8 @@ use tokio::sync::RwLock;
 
 use mu_cd_ipc::{
     create_fory_runtime, read_frame, write_frame, ArtifactTaintNotification, DeploymentLeaseGrant,
-    DeploymentLeaseRequest, IntegrationTestProgress, IntegrationTestReport, IpcHeader,
-    RollbackCommand, SlotSwapCommand, StageDeploymentRequest, StageDeploymentResponse,
+    DeploymentLeaseRequest, DeploymentSlot, IntegrationTestProgress, IntegrationTestReport,
+    IpcHeader, RollbackCommand, SlotSwapCommand, StageDeploymentRequest, StageDeploymentResponse,
     MSG_TYPE_IT_PROGRESS, MSG_TYPE_IT_REPORT, MSG_TYPE_ROLLBACK, MSG_TYPE_SLOT_SWAP,
     MSG_TYPE_STAGE_DEPLOY_REQ, MSG_TYPE_STAGE_DEPLOY_RESP,
 };
@@ -25,12 +25,12 @@ use crate::cd_state::{
     classify_rollback_reason, CdStateStore, DeploymentStart, ItProgressSink, Slot,
 };
 use crate::contract::MuConDeConfig;
-use crate::error::{LeaseError, OrchestratorError};
-use crate::lease::{ClusterIdlePoller, LeaseCoordinator};
+use crate::error::{ContractError, LeaseError, OrchestratorError};
+use crate::lease::{ClusterIdlePoller, ClusterNodeStatus, IdleBackoffConfig, LeaseCoordinator};
 use crate::slo::CanarySloClient;
-use crate::telemetry::{build_cd_span, now_unix_nano, CdTelemetrySink};
+use crate::telemetry::{build_cd_log, build_cd_span, now_unix_nano, CdTelemetrySink};
 use crate::tls::TlsConfig;
-use mu_observable_ipc::TraceContext;
+use mu_observable_ipc::{OtelLogEntry, TraceContext};
 
 /// Default MuRegist server URL used across continuous delivery fabric.
 pub const DEFAULT_REGISTRY_URL: &str = "https://registry.ci.ci.internal:8444";
@@ -337,16 +337,23 @@ pub fn resolve_target_node_from_map(logical: &str, map_str: &str) -> String {
     trimmed.to_string()
 }
 
-/// Resolves and deduplicates a list of logical target node names while preserving order.
-pub fn resolve_target_nodes(nodes: &[String]) -> Vec<String> {
+/// Pure helper resolving and deduplicating `nodes` against a comma-separated `key=value`
+/// map string while preserving first-seen order (capped at 64 targets).
+pub fn resolve_target_nodes_from_map(nodes: &[String], map_str: &str) -> Vec<String> {
     let mut out = Vec::new();
     for n in nodes.iter().take(64) {
-        let resolved = resolve_target_node(n);
+        let resolved = resolve_target_node_from_map(n, map_str);
         if !resolved.is_empty() && !out.contains(&resolved) {
             out.push(resolved);
         }
     }
     out
+}
+
+/// Resolves and deduplicates a list of logical target node names while preserving order.
+pub fn resolve_target_nodes(nodes: &[String]) -> Vec<String> {
+    let map_str = std::env::var("MUCONDE_NODE_MAP").unwrap_or_default();
+    resolve_target_nodes_from_map(nodes, &map_str)
 }
 
 /// Network implementation of `AgentIpcClient` communicating over TCP/TLS framing.
@@ -616,12 +623,30 @@ impl AgentIpcClient for IpcAgentClient {
 pub struct DeploymentOrchestrator {
     lease_coordinator: Arc<LeaseCoordinator>,
     poller: Option<ClusterIdlePoller>,
+    idle_backoff: IdleBackoffConfig,
     agent_client: Arc<dyn AgentIpcClient>,
     regist_client: Arc<dyn MuRegistClient>,
     slo_client: Option<Arc<dyn CanarySloClient>>,
     tainted_digests: Arc<RwLock<HashSet<String>>>,
     cd_state: Option<Arc<CdStateStore>>,
     telemetry_sink: Option<Arc<dyn CdTelemetrySink>>,
+}
+
+#[derive(Debug, Clone)]
+struct PromotedNodeRecord {
+    outcome_index: usize,
+    deployment_id: String,
+    node: String,
+    restore_slot: DeploymentSlot,
+}
+
+struct CompensationRequest<'a> {
+    config: &'a MuConDeConfig,
+    artifact_sha256: &'a str,
+    failed_node: &'a str,
+    failure_reason: &'a str,
+    taint_in_state: bool,
+    parent_trace: Option<TraceContext>,
 }
 
 impl DeploymentOrchestrator {
@@ -635,6 +660,7 @@ impl DeploymentOrchestrator {
         Self {
             lease_coordinator,
             poller,
+            idle_backoff: IdleBackoffConfig::default(),
             agent_client,
             regist_client,
             slo_client: None,
@@ -642,6 +668,13 @@ impl DeploymentOrchestrator {
             cd_state: None,
             telemetry_sink: None,
         }
+    }
+
+    /// Configures bounded contention-tolerant exponential backoff parameters for idle node discovery.
+    #[must_use]
+    pub fn with_idle_backoff(mut self, idle_backoff: IdleBackoffConfig) -> Self {
+        self.idle_backoff = idle_backoff;
+        self
     }
 
     /// Attach a [`CdTelemetrySink`] (`MuObserveCdSink`) to stream W3C trace spans to `muObserve`.
@@ -687,47 +720,113 @@ impl DeploymentOrchestrator {
         local_taints.insert(digest.into());
     }
 
-    /// Discover and select the first eligible idle target node from the configured list.
+    /// Discover and select the first eligible idle target node from the configured list,
+    /// polling with bounded exponential backoff up to `self.idle_backoff.wait_timeout`.
     pub async fn select_idle_target_node(
         &self,
         target_nodes: &[String],
     ) -> Result<String, OrchestratorError> {
-        if let Some(ref poller) = self.poller {
+        self.select_idle_target_node_with_backoff(target_nodes, &self.idle_backoff)
+            .await
+    }
+
+    /// Discover and select the first eligible idle target node using explicit backoff bounds.
+    pub async fn select_idle_target_node_with_backoff(
+        &self,
+        target_nodes: &[String],
+        backoff: &IdleBackoffConfig,
+    ) -> Result<String, OrchestratorError> {
+        let candidates = Self::resolve_node_candidates(target_nodes);
+        if candidates.is_empty() {
+            return Err(OrchestratorError::Lease(LeaseError::Internal(
+                "No target nodes specified".into(),
+            )));
+        }
+
+        let Some(ref poller) = self.poller else {
+            // Standalone/mock path without cluster poller uses the first resolved node.
+            return Ok(candidates[0].1.clone());
+        };
+
+        let deadline = tokio::time::Instant::now() + backoff.wait_timeout;
+        let mut attempt: u32 = 0;
+
+        loop {
             let nodes = poller
                 .fetch_nodes()
                 .await
                 .map_err(OrchestratorError::Lease)?;
-
-            for target in target_nodes {
-                let resolved = resolve_target_node(target);
-                if let Some(node) = nodes
-                    .iter()
-                    .find(|n| n.node_id == resolved || &n.node_id == target)
-                {
-                    if node.is_idle_for_deployment() {
-                        return Ok(target.clone());
-                    }
-                }
+            if let Some(selected) = Self::find_first_eligible_idle_node(&candidates, &nodes) {
+                return Ok(selected);
             }
 
-            Err(OrchestratorError::Lease(LeaseError::NodeNotIdle(format!(
-                "None of the target nodes {:?} are currently idle and eligible",
-                target_nodes
-            ))))
-        } else if let Some(first) = target_nodes.first() {
-            // When poller is not provided (standalone/test), use first target node
-            Ok(first.clone())
-        } else {
-            Err(OrchestratorError::Lease(LeaseError::Internal(
-                "No target nodes specified".into(),
-            )))
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                let resolved_list: Vec<&str> = candidates.iter().map(|(_, r)| r.as_str()).collect();
+                return Err(OrchestratorError::Lease(LeaseError::NodeNotIdle(format!(
+                    "None of the target nodes {resolved_list:?} became idle within {}ms",
+                    backoff.wait_timeout.as_millis()
+                ))));
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let entropy =
+                (now_unix_nano().unsigned_abs()) ^ u64::from(attempt).wrapping_mul(0x9E37_79B9);
+            let delay = backoff.delay_for_attempt(attempt, entropy, remaining);
+            tracing::debug!(
+                attempt,
+                delay_ms = delay.as_millis() as u64,
+                remaining_ms = remaining.as_millis() as u64,
+                "Target nodes busy or ineligible; waiting before next idle poll"
+            );
+            if delay.is_zero() {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(delay).await;
+            }
+            attempt = attempt.saturating_add(1);
         }
     }
 
-    /// Orchestrates sequential A/B rollout across every target node in `config.target_nodes`
-    /// (resolved through `MUCONDE_NODE_MAP` when connecting to node agents).
+    fn resolve_node_candidates(target_nodes: &[String]) -> Vec<(String, String)> {
+        let map_str = std::env::var("MUCONDE_NODE_MAP").unwrap_or_default();
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        for raw in target_nodes.iter().take(64) {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let resolved = resolve_target_node_from_map(trimmed, &map_str);
+            if !resolved.is_empty() && seen.insert(resolved.clone()) {
+                candidates.push((trimmed.to_string(), resolved));
+            }
+        }
+        candidates
+    }
+
+    fn find_first_eligible_idle_node(
+        candidates: &[(String, String)],
+        nodes: &[ClusterNodeStatus],
+    ) -> Option<String> {
+        for (raw, resolved) in candidates {
+            if let Some(node) = nodes
+                .iter()
+                .find(|n| n.node_id == *resolved || n.node_id == *raw)
+            {
+                if node.is_idle_for_deployment() {
+                    return Some(resolved.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Orchestrates sequential A/B rollout across every distinct resolved target node
+    /// in `config.effective_target_nodes()`.
     ///
-    /// Stops immediately and returns the outcomes collected so far if any node rolls back.
+    /// Stops on the first failed node, compensates any previously promoted nodes to restore
+    /// cluster parity, and emits audit log records.
     pub async fn orchestrate_rollout_for_repo(
         &self,
         config: &MuConDeConfig,
@@ -747,18 +846,24 @@ impl DeploymentOrchestrator {
         parent_trace: Option<TraceContext>,
     ) -> Result<Vec<DeploymentOutcome>, OrchestratorError> {
         config.validate()?;
-        let mut targets = Vec::new();
-        for n in config.target_nodes.iter().take(64) {
-            let trimmed = n.trim().to_string();
-            if !trimmed.is_empty() && !targets.contains(&trimmed) {
-                targets.push(trimmed);
-            }
+        let targets = resolve_target_nodes(config.effective_target_nodes());
+        if targets.is_empty() {
+            return Err(OrchestratorError::Contract(ContractError::EmptyTargetNodes));
         }
+
         let mut outcomes = Vec::new();
+        let mut promoted: Vec<PromotedNodeRecord> = Vec::new();
+
         for node in targets {
+            let restore_slot = self
+                .lease_coordinator
+                .active_slot_for(&node, &config.service)
+                .await;
             let mut single_cfg = config.clone();
-            single_cfg.target_nodes = vec![node];
-            let outcome = self
+            single_cfg.target_nodes = vec![node.clone()];
+            single_cfg.deployment.target_nodes = vec![node.clone()];
+
+            match self
                 .orchestrate_deployment_for_repo_with_trace(
                     &single_cfg,
                     artifact_sha256,
@@ -766,11 +871,84 @@ impl DeploymentOrchestrator {
                     repo,
                     parent_trace,
                 )
-                .await?;
-            let rolled_back = outcome.is_rolled_back();
-            outcomes.push(outcome);
-            if rolled_back {
-                break;
+                .await
+            {
+                Ok(outcome) => match &outcome {
+                    DeploymentOutcome::Promoted { deployment_id, .. } => {
+                        let idx = outcomes.len();
+                        promoted.push(PromotedNodeRecord {
+                            outcome_index: idx,
+                            deployment_id: deployment_id.clone(),
+                            node,
+                            restore_slot,
+                        });
+                        outcomes.push(outcome);
+                    }
+                    DeploymentOutcome::RolledBack {
+                        target_node: failed_node,
+                        reason,
+                        ..
+                    } => {
+                        let failed_node = failed_node.clone();
+                        let reason = reason.clone();
+                        outcomes.push(outcome);
+                        if !promoted.is_empty() {
+                            self.compensate_promoted_nodes(
+                                CompensationRequest {
+                                    config,
+                                    artifact_sha256,
+                                    failed_node: &failed_node,
+                                    failure_reason: &reason,
+                                    taint_in_state: true,
+                                    parent_trace,
+                                },
+                                &promoted,
+                                Some(&mut outcomes),
+                            )
+                            .await?;
+                        }
+                        break;
+                    }
+                },
+                Err(err) => {
+                    let should_compensate = !promoted.is_empty()
+                        && (!matches!(err, OrchestratorError::IntegrationTestFailed { .. })
+                            || config.ab_rules.auto_rollback_on_critical);
+                    if should_compensate {
+                        let taint_digest =
+                            matches!(err, OrchestratorError::IntegrationTestFailed { .. });
+                        let err_msg = err.to_string();
+                        self.compensate_promoted_nodes(
+                            CompensationRequest {
+                                config,
+                                artifact_sha256,
+                                failed_node: &node,
+                                failure_reason: &err_msg,
+                                taint_in_state: taint_digest,
+                                parent_trace,
+                            },
+                            &promoted,
+                            None,
+                        )
+                        .await?;
+                    } else if !promoted.is_empty() {
+                        self.emit_partial_rollout_audit(
+                            parent_trace,
+                            config,
+                            artifact_sha256,
+                            &node,
+                            "WARN",
+                            13,
+                            format!(
+                                "Multi-node rollout aborted at '{node}' with {} previously promoted node(s) retained per ab_rules",
+                                promoted.len()
+                            ),
+                            Vec::new(),
+                        )
+                        .await;
+                    }
+                    return Err(err);
+                }
             }
         }
         Ok(outcomes)
@@ -849,8 +1027,10 @@ impl DeploymentOrchestrator {
         // Validate declarative contract
         config.validate()?;
 
-        // Step 2: Select idle target worker node (#4)
-        let target_node = self.select_idle_target_node(&config.target_nodes).await?;
+        // Step 2: Select idle target worker node (#4, #77)
+        let target_node = self
+            .select_idle_target_node(config.effective_target_nodes())
+            .await?;
 
         // Step 3: Acquire TTL deployment lease (#5)
         let deployment_id =
@@ -1056,7 +1236,7 @@ impl DeploymentOrchestrator {
             service_name: config.service.clone(),
             from_slot: grant.active_slot,
             to_slot: grant.candidate_slot,
-            systemd_unit: format!("{}.service", config.service),
+            systemd_unit: config.effective_systemd_unit(),
             warmup_timeout_secs: config.warmup_timeout_seconds,
         };
 
@@ -1528,6 +1708,209 @@ impl DeploymentOrchestrator {
         }
     }
 
+    async fn emit_telemetry_logs(&self, logs: Vec<OtelLogEntry>) {
+        if let Some(ref sink) = self.telemetry_sink {
+            sink.emit_logs(logs).await;
+        }
+    }
+
+    fn resolve_audit_trace(parent_trace: Option<TraceContext>, now_ns: i64) -> TraceContext {
+        parent_trace.unwrap_or_else(|| {
+            TraceContext::from_seed(
+                now_ns as u64,
+                (now_ns as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+                1,
+                true,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_partial_rollout_audit(
+        &self,
+        parent_trace: Option<TraceContext>,
+        config: &MuConDeConfig,
+        artifact_sha256: &str,
+        node_id: &str,
+        severity_text: &str,
+        severity_number: i32,
+        body: String,
+        compensated_nodes: Vec<String>,
+    ) {
+        let now_ns = now_unix_nano();
+        let trace = Self::resolve_audit_trace(parent_trace, now_ns);
+        let child = trace.next_deterministic_child(10);
+        let entry = build_cd_log(
+            trace.trace_id,
+            child.span_id,
+            now_ns,
+            severity_number,
+            severity_text,
+            node_id,
+            body,
+            serde_json::json!({
+                "event": "cd.rollout.partial_rollback",
+                "service": &config.service,
+                "failed_node": node_id,
+                "compensated_nodes": compensated_nodes,
+                "artifact_sha256": artifact_sha256,
+            }),
+        );
+        self.emit_telemetry_logs(vec![entry]).await;
+    }
+
+    async fn compensate_promoted_nodes(
+        &self,
+        req: CompensationRequest<'_>,
+        promoted: &[PromotedNodeRecord],
+        mut outcomes: Option<&mut Vec<DeploymentOutcome>>,
+    ) -> Result<(), OrchestratorError> {
+        let mut compensated_nodes = Vec::new();
+        let mut comp_failures = Vec::new();
+        let mut spans = Vec::new();
+
+        for (step, track) in promoted.iter().rev().enumerate() {
+            let comp_reason = format!(
+                "Compensating multi-node rollback after failure on '{}': {}",
+                req.failed_node, req.failure_reason
+            );
+            let cmd = RollbackCommand {
+                deployment_id: track.deployment_id.clone(),
+                lease_id: format!("compensate-{}", track.deployment_id),
+                service_name: req.config.service.clone(),
+                restore_slot: track.restore_slot,
+                failed_artifact_sha256: req.artifact_sha256.to_string(),
+                reason: comp_reason.clone(),
+            };
+            let span_start = now_unix_nano();
+            let trace = Self::resolve_audit_trace(req.parent_trace, span_start);
+            let span_ctx = trace.next_deterministic_child((100 + step) as u64);
+
+            match self.agent_client.rollback(&track.node, &cmd).await {
+                Ok(()) => {
+                    self.lease_coordinator
+                        .set_active_slot(&track.node, &req.config.service, track.restore_slot)
+                        .await;
+                    if let Some(ref store) = self.cd_state {
+                        if req.taint_in_state {
+                            store.deployment_tainted(
+                                &track.deployment_id,
+                                req.artifact_sha256,
+                                &comp_reason,
+                            );
+                        }
+                        store.deployment_rolled_back(
+                            &track.deployment_id,
+                            Slot::from(track.restore_slot),
+                            classify_rollback_reason(req.failure_reason),
+                            &comp_reason,
+                        );
+                    }
+                    spans.push(build_cd_span(
+                        trace.trace_id,
+                        span_ctx.span_id,
+                        req.parent_trace.map(|p| p.span_id),
+                        &track.node,
+                        "cd.ab.rollback",
+                        "SERVER",
+                        span_start,
+                        now_unix_nano(),
+                        "OK",
+                        Some(comp_reason.clone()),
+                        serde_json::json!({
+                            "deployment_id": &track.deployment_id,
+                            "service": &req.config.service,
+                            "target_node": &track.node,
+                            "restore_slot": Self::slot_label(track.restore_slot),
+                            "compensating": true,
+                            "failed_node": req.failed_node,
+                        }),
+                    ));
+                    compensated_nodes.push(track.node.clone());
+                    if let Some(ref mut out) = outcomes {
+                        if let Some(slot) = out.get_mut(track.outcome_index) {
+                            *slot = DeploymentOutcome::RolledBack {
+                                deployment_id: track.deployment_id.clone(),
+                                service: req.config.service.clone(),
+                                target_node: track.node.clone(),
+                                artifact_sha256: req.artifact_sha256.to_string(),
+                                reason: comp_reason,
+                            };
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        deployment_id = %track.deployment_id,
+                        node = %track.node,
+                        error = %e,
+                        "Failed compensating rollback on previously promoted node"
+                    );
+                    comp_failures.push(format!("{}: {e}", track.node));
+                    spans.push(build_cd_span(
+                        trace.trace_id,
+                        span_ctx.span_id,
+                        req.parent_trace.map(|p| p.span_id),
+                        &track.node,
+                        "cd.ab.rollback",
+                        "SERVER",
+                        span_start,
+                        now_unix_nano(),
+                        "ERROR",
+                        Some(e.to_string()),
+                        serde_json::json!({
+                            "deployment_id": &track.deployment_id,
+                            "service": &req.config.service,
+                            "target_node": &track.node,
+                            "compensating": true,
+                            "failed_node": req.failed_node,
+                        }),
+                    ));
+                }
+            }
+        }
+
+        self.sync_leases().await;
+        if !spans.is_empty() {
+            self.emit_telemetry_spans(spans).await;
+        }
+        let (severity_text, severity_num, summary) = if comp_failures.is_empty() {
+            (
+                "WARN",
+                13,
+                format!(
+                    "Multi-node partial rollback completed for '{}' after failure on '{}': rolled back {:?}",
+                    req.config.service, req.failed_node, compensated_nodes
+                ),
+            )
+        } else {
+            (
+                "ERROR",
+                17,
+                format!(
+                    "Multi-node partial rollback incomplete for '{}' after failure on '{}': rolled back {:?}, failed {:?}",
+                    req.config.service, req.failed_node, compensated_nodes, comp_failures
+                ),
+            )
+        };
+        self.emit_partial_rollout_audit(
+            req.parent_trace,
+            req.config,
+            req.artifact_sha256,
+            req.failed_node,
+            severity_text,
+            severity_num,
+            summary,
+            compensated_nodes,
+        )
+        .await;
+
+        if !comp_failures.is_empty() {
+            return Err(OrchestratorError::RollbackFailed(comp_failures.join("; ")));
+        }
+        Ok(())
+    }
+
     /// Handles failure, lease expiration, or IT regression by triggering atomic rollback
     /// and digest tainting (#9, #10).
     async fn handle_failure_and_rollback(
@@ -1603,6 +1986,31 @@ impl DeploymentOrchestrator {
             store.deployment_tainted(&grant.deployment_id, artifact_sha256, reason);
         }
         self.sync_leases().await;
+
+        let now_ns = now_unix_nano();
+        let audit_trace = Self::resolve_audit_trace(None, now_ns);
+        let audit_span = audit_trace.next_deterministic_child(9);
+        self.emit_telemetry_logs(vec![build_cd_log(
+            audit_trace.trace_id,
+            audit_span.span_id,
+            now_ns,
+            13,
+            "WARN",
+            target_node,
+            format!(
+                "Automatic A/B rollback executed for '{}' on '{}': {reason}",
+                config.service, target_node
+            ),
+            serde_json::json!({
+                "event": "cd.ab.rollback",
+                "deployment_id": &grant.deployment_id,
+                "service": &config.service,
+                "target_node": target_node,
+                "restore_slot": Self::slot_label(grant.active_slot),
+                "tainted_digest": artifact_sha256,
+            }),
+        )])
+        .await;
 
         Ok(DeploymentOutcome::RolledBack {
             deployment_id: grant.deployment_id.clone(),
@@ -1707,13 +2115,34 @@ impl DeploymentOrchestrator {
             now_ns,
             now_ns,
             "OK",
-            Some(reason),
+            Some(reason.clone()),
             serde_json::json!({
                 "deployment_id": &record.deployment_id,
                 "service": &record.service,
                 "target_node": &record.target_node,
                 "restore_slot": Self::slot_label(restore_slot_ipc),
-                "tainted_digest": tainted_digest,
+                "tainted_digest": &tainted_digest,
+            }),
+        )])
+        .await;
+        self.emit_telemetry_logs(vec![build_cd_log(
+            span_ctx.trace_id,
+            span_ctx.span_id,
+            now_ns,
+            13,
+            "WARN",
+            &record.target_node,
+            format!(
+                "Emergency A/B rollback executed for '{}' on '{}': {reason}",
+                record.service, record.target_node
+            ),
+            serde_json::json!({
+                "event": "cd.ab.rollback",
+                "deployment_id": &record.deployment_id,
+                "service": &record.service,
+                "target_node": &record.target_node,
+                "restore_slot": Self::slot_label(restore_slot_ipc),
+                "tainted_digest": &tainted_digest,
             }),
         )])
         .await;
@@ -1740,10 +2169,13 @@ mod tests {
         pub stage_calls: AtomicU32,
         pub swap_ok: AtomicBool,
         pub swap_calls: AtomicU32,
+        pub swap_commands: Mutex<Vec<(String, SlotSwapCommand)>>,
         pub it_passed: AtomicBool,
         pub it_failed_tests: Mutex<Vec<String>>,
+        pub fail_it_node: Mutex<Option<String>>,
         pub rollback_calls: AtomicU32,
         pub last_rollback_cmd: Mutex<Option<RollbackCommand>>,
+        pub rollback_nodes: Mutex<Vec<(String, DeploymentSlot)>>,
     }
 
     #[async_trait]
@@ -1770,10 +2202,14 @@ mod tests {
 
         async fn slot_swap(
             &self,
-            _node_id: &str,
-            _cmd: &SlotSwapCommand,
+            node_id: &str,
+            cmd: &SlotSwapCommand,
         ) -> Result<(), OrchestratorError> {
             self.swap_calls.fetch_add(1, Ordering::SeqCst);
+            self.swap_commands
+                .lock()
+                .await
+                .push((node_id.to_string(), cmd.clone()));
             if self.swap_ok.load(Ordering::SeqCst) {
                 Ok(())
             } else {
@@ -1783,15 +2219,25 @@ mod tests {
 
         async fn execute_integration_tests(
             &self,
-            _node_id: &str,
+            node_id: &str,
             deployment_id: &str,
             service: &str,
             artifact_sha256: &str,
             _selected_tests: Option<&[String]>,
             _timeout: Duration,
         ) -> Result<IntegrationTestReport, OrchestratorError> {
-            let passed = self.it_passed.load(Ordering::SeqCst);
-            let failed = self.it_failed_tests.lock().await.clone();
+            let force_fail = self
+                .fail_it_node
+                .lock()
+                .await
+                .as_deref()
+                .is_some_and(|n| n == node_id);
+            let passed = !force_fail && self.it_passed.load(Ordering::SeqCst);
+            let failed = if force_fail {
+                vec!["it_smoke".to_string()]
+            } else {
+                self.it_failed_tests.lock().await.clone()
+            };
             Ok(IntegrationTestReport {
                 deployment_id: deployment_id.to_string(),
                 service_name: service.to_string(),
@@ -1806,10 +2252,14 @@ mod tests {
 
         async fn rollback(
             &self,
-            _node_id: &str,
+            node_id: &str,
             cmd: &RollbackCommand,
         ) -> Result<(), OrchestratorError> {
             self.rollback_calls.fetch_add(1, Ordering::SeqCst);
+            self.rollback_nodes
+                .lock()
+                .await
+                .push((node_id.to_string(), cmd.restore_slot));
             let mut last = self.last_rollback_cmd.lock().await;
             *last = Some(cmd.clone());
             Ok(())
@@ -1868,6 +2318,7 @@ mod tests {
             integration_tests: crate::contract::IntegrationTestSelector::All("all".into()),
             it_archive_digest: None,
             ab_rules: crate::contract::AbRulesConfig::default(),
+            deployment: crate::contract::DeploymentConfig::default(),
         }
     }
 
@@ -2299,5 +2750,355 @@ mod tests {
                 .await,
             DeploymentSlot::SlotB
         );
+    }
+
+    #[test]
+    fn test_resolve_target_nodes_from_map_preserves_order_and_deduplicates() {
+        let map = "node-a=host-primary,node-b=host-secondary,standby=host-primary,worker-riscv64=host-riscv,worker-aarch64=host-arm";
+        let input = vec![
+            " node-a ".into(),
+            "node-b".into(),
+            "standby".into(),
+            "worker-riscv64".into(),
+            "  ".into(),
+            "node-b".into(),
+            "worker-aarch64".into(),
+        ];
+        let resolved = resolve_target_nodes_from_map(&input, map);
+        assert_eq!(
+            resolved,
+            vec!["host-primary", "host-secondary", "host-riscv", "host-arm",]
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_select_idle_target_node_contention_retries_then_succeeds() {
+        use axum::{routing::get, Json, Router};
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_handler = calls.clone();
+        let app = Router::new().route(
+            "/api/cluster/nodes",
+            get(move || {
+                let calls_handler = calls_handler.clone();
+                async move {
+                    let probe = calls_handler.fetch_add(1, Ordering::SeqCst);
+                    let active_slots = if probe < 2 { 1 } else { 0 };
+                    Json(vec![ClusterNodeStatus {
+                        node_id: "node-a".into(),
+                        online: true,
+                        active_slots,
+                        max_slots: 1,
+                        exclusive_locked: false,
+                    }])
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let poller =
+            ClusterIdlePoller::with_client(format!("http://{addr}"), reqwest::Client::new());
+        let orchestrator = DeploymentOrchestrator::new(
+            Arc::new(LeaseCoordinator::new()),
+            Some(poller),
+            Arc::new(MockAgentClient::default()),
+            Arc::new(MockMuRegistClient::default()),
+        )
+        .with_idle_backoff(IdleBackoffConfig {
+            wait_timeout: Duration::from_secs(2),
+            initial_interval: Duration::from_millis(5),
+            max_interval: Duration::from_millis(15),
+            jitter_percent: 20,
+        });
+
+        let selected = orchestrator
+            .select_idle_target_node(&["node-a".into()])
+            .await
+            .expect("busy node drains and succeeds within backoff deadline");
+        assert_eq!(selected, "node-a");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // Immediate idle takes a single probe
+        let immediate = orchestrator
+            .select_idle_target_node(&["node-a".into()])
+            .await
+            .expect("immediate idle");
+        assert_eq!(immediate, "node-a");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_select_idle_target_node_preserves_cross_arch_filter_and_times_out() {
+        use axum::{routing::get, Json, Router};
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_handler = calls.clone();
+        let app = Router::new().route(
+            "/api/cluster/nodes",
+            get(move || {
+                let calls_handler = calls_handler.clone();
+                async move {
+                    calls_handler.fetch_add(1, Ordering::SeqCst);
+                    // Unrequested x86_64/aarch64 nodes are idle, requested worker-riscv64 is busy.
+                    Json(vec![
+                        ClusterNodeStatus {
+                            node_id: "node-a".into(),
+                            online: true,
+                            active_slots: 0,
+                            max_slots: 1,
+                            exclusive_locked: false,
+                        },
+                        ClusterNodeStatus {
+                            node_id: "worker-aarch64".into(),
+                            online: true,
+                            active_slots: 0,
+                            max_slots: 1,
+                            exclusive_locked: false,
+                        },
+                        ClusterNodeStatus {
+                            node_id: "worker-riscv64".into(),
+                            online: true,
+                            active_slots: 1,
+                            max_slots: 1,
+                            exclusive_locked: false,
+                        },
+                    ])
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let poller =
+            ClusterIdlePoller::with_client(format!("http://{addr}"), reqwest::Client::new());
+        let orchestrator = DeploymentOrchestrator::new(
+            Arc::new(LeaseCoordinator::new()),
+            Some(poller),
+            Arc::new(MockAgentClient::default()),
+            Arc::new(MockMuRegistClient::default()),
+        )
+        .with_idle_backoff(IdleBackoffConfig {
+            wait_timeout: Duration::from_millis(35),
+            initial_interval: Duration::from_millis(5),
+            max_interval: Duration::from_millis(10),
+            jitter_percent: 0,
+        });
+
+        let err = orchestrator
+            .select_idle_target_node(&["worker-riscv64".into()])
+            .await
+            .expect_err("must not fall back to idle nodes of other architectures");
+        assert!(
+            matches!(err, OrchestratorError::Lease(LeaseError::NodeNotIdle(_))),
+            "expected NodeNotIdle, got {err:?}"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "expected retry probes before deadline expiry"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_slot_swap_command_propagates_deployment_systemd_unit() {
+        let coordinator = Arc::new(LeaseCoordinator::new());
+        let agent = Arc::new(MockAgentClient {
+            stage_ok: AtomicBool::new(true),
+            swap_ok: AtomicBool::new(true),
+            it_passed: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let regist = Arc::new(MockMuRegistClient::default());
+        let orchestrator = DeploymentOrchestrator::new(coordinator, None, agent.clone(), regist);
+
+        let mut cfg = sample_config();
+        cfg.service = "mu-observable-collector.service".into();
+        cfg.deployment.systemd_unit = Some("custom-collector".into());
+
+        let outcome = orchestrator
+            .orchestrate_deployment(&cfg, "sha256-unit-prop", Some("dep-unit-1".into()))
+            .await
+            .expect("deployment should succeed");
+        assert!(outcome.is_promoted());
+
+        let swaps = agent.swap_commands.lock().await;
+        assert_eq!(swaps.len(), 1);
+        assert_eq!(swaps[0].1.systemd_unit, "custom-collector.service");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_orchestrate_rollout_partial_failure_compensates_and_emits_audit() {
+        let store = Arc::new(CdStateStore::default());
+        let coordinator = Arc::new(LeaseCoordinator::new());
+        let agent = Arc::new(MockAgentClient {
+            stage_ok: AtomicBool::new(true),
+            swap_ok: AtomicBool::new(true),
+            it_passed: AtomicBool::new(true),
+            fail_it_node: Mutex::new(Some("node-b".into())),
+            ..Default::default()
+        });
+        let regist = Arc::new(MockMuRegistClient::default());
+        let sink = Arc::new(crate::telemetry::RecordingCdTelemetrySink::default());
+
+        let orchestrator =
+            DeploymentOrchestrator::new(coordinator.clone(), None, agent.clone(), regist.clone())
+                .with_cd_state(store.clone())
+                .with_telemetry_sink(sink.clone());
+
+        let mut config = sample_config();
+        config.target_nodes = vec!["node-a".into(), "node-b".into(), "node-c".into()];
+
+        let outcomes = orchestrator
+            .orchestrate_rollout_for_repo(
+                &config,
+                "sha256-partial-rb",
+                Some("LMA1980/mu-cd-controller"),
+            )
+            .await
+            .expect("rollout stops gracefully with compensated rollback outcomes");
+
+        // Stopped before node-c; both node-a (compensated) and node-b ended RolledBack.
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(DeploymentOutcome::is_rolled_back));
+        assert_eq!(agent.stage_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(agent.rollback_calls.load(Ordering::SeqCst), 2);
+
+        let rb_nodes = agent.rollback_nodes.lock().await.clone();
+        assert_eq!(
+            rb_nodes,
+            vec![
+                ("node-b".to_string(), DeploymentSlot::SlotA),
+                ("node-a".to_string(), DeploymentSlot::SlotA),
+            ]
+        );
+        assert_eq!(
+            coordinator.active_slot_for("node-a", "action-runner").await,
+            DeploymentSlot::SlotA
+        );
+        assert_eq!(
+            coordinator.active_slot_for("node-b", "action-runner").await,
+            DeploymentSlot::SlotA
+        );
+
+        let snap = store.snapshot();
+        assert_eq!(snap.deployments.len(), 2);
+        assert!(snap
+            .deployments
+            .iter()
+            .all(|d| d.outcome == crate::cd_state::GateOutcome::RolledBack && d.tainted));
+
+        let logs = sink.recorded_logs().await;
+        assert!(
+            logs.iter()
+                .any(|l| l.attributes_json.contains("cd.rollout.partial_rollback")),
+            "expected partial rollback audit log entry, got {logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_orchestrate_rollout_second_node_error_compensates_without_taint() {
+        use axum::{routing::get, Json, Router};
+
+        let app = Router::new().route(
+            "/api/cluster/nodes",
+            get(|| async {
+                Json(vec![
+                    ClusterNodeStatus {
+                        node_id: "node-a".into(),
+                        online: true,
+                        active_slots: 0,
+                        max_slots: 1,
+                        exclusive_locked: false,
+                    },
+                    ClusterNodeStatus {
+                        node_id: "node-b".into(),
+                        online: true,
+                        active_slots: 1,
+                        max_slots: 1,
+                        exclusive_locked: false,
+                    },
+                ])
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let coordinator = Arc::new(LeaseCoordinator::new());
+        let agent = Arc::new(MockAgentClient {
+            stage_ok: AtomicBool::new(true),
+            swap_ok: AtomicBool::new(true),
+            it_passed: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let regist = Arc::new(MockMuRegistClient::default());
+        let sink = Arc::new(crate::telemetry::RecordingCdTelemetrySink::default());
+        let poller =
+            ClusterIdlePoller::with_client(format!("http://{addr}"), reqwest::Client::new());
+
+        let orchestrator = DeploymentOrchestrator::new(
+            coordinator.clone(),
+            Some(poller),
+            agent.clone(),
+            regist.clone(),
+        )
+        .with_idle_backoff(IdleBackoffConfig {
+            wait_timeout: Duration::from_millis(15),
+            initial_interval: Duration::from_millis(5),
+            max_interval: Duration::from_millis(10),
+            jitter_percent: 0,
+        })
+        .with_telemetry_sink(sink.clone());
+
+        let mut config = sample_config();
+        config.target_nodes = vec!["node-a".into(), "node-b".into()];
+
+        let err = orchestrator
+            .orchestrate_rollout_for_repo(&config, "sha256-healthy-busy-2nd", None)
+            .await
+            .expect_err("second node timeout should abort rollout");
+        assert!(matches!(
+            err,
+            OrchestratorError::Lease(LeaseError::NodeNotIdle(_))
+        ));
+
+        // Compensating rollback restored node-a without tainting the healthy digest.
+        assert_eq!(
+            agent.rollback_nodes.lock().await.as_slice(),
+            &[("node-a".to_string(), DeploymentSlot::SlotA)]
+        );
+        assert_eq!(
+            coordinator.active_slot_for("node-a", "action-runner").await,
+            DeploymentSlot::SlotA
+        );
+        assert!(!orchestrator
+            .is_digest_tainted("sha256-healthy-busy-2nd")
+            .await
+            .unwrap());
+        assert_eq!(regist.taint_calls.load(Ordering::SeqCst), 0);
+
+        let logs = sink.recorded_logs().await;
+        assert!(logs
+            .iter()
+            .any(|l| l.attributes_json.contains("cd.rollout.partial_rollback")));
+
+        server.abort();
     }
 }

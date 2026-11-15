@@ -13,7 +13,8 @@ use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 use mu_cd_controller::api::{
-    load_token_file, router, serve, CdApiState, DeploymentGate, DeploymentSummary,
+    load_token_file, router, serve, CdApiState, DeployTriggerResponse, DeploymentGate,
+    DeploymentSummary,
 };
 use mu_cd_controller::auth::{
     ROLE_AB_EMERGENCY, ROLE_GATE_INSPECTOR, ROLE_MEMBER, ROLE_PLATFORM_ADMIN,
@@ -860,6 +861,7 @@ async fn replay(health_passes: bool) -> (String, Arc<CdStateStore>, bool) {
         integration_tests: IntegrationTestSelector::All("all".into()),
         it_archive_digest: None,
         ab_rules: Default::default(),
+        deployment: Default::default(),
     };
     let outcome = orchestrator
         .orchestrate_deployment_for_repo(
@@ -1088,12 +1090,16 @@ async fn test_cd_runs_endpoint_multi_ecosystem_and_auth() {
 
 struct MockApiAgent {
     rollback_slots: tokio::sync::Mutex<Vec<(String, mu_cd_ipc::DeploymentSlot, String)>>,
+    swap_units: tokio::sync::Mutex<Vec<(String, String)>>,
+    fail_it_node: Option<String>,
 }
 
 impl Default for MockApiAgent {
     fn default() -> Self {
         Self {
             rollback_slots: tokio::sync::Mutex::new(Vec::new()),
+            swap_units: tokio::sync::Mutex::new(Vec::new()),
+            fail_it_node: None,
         }
     }
 }
@@ -1116,28 +1122,37 @@ impl mu_cd_controller::orchestrator::AgentIpcClient for MockApiAgent {
 
     async fn slot_swap(
         &self,
-        _node_id: &str,
-        _cmd: &mu_cd_ipc::SlotSwapCommand,
+        node_id: &str,
+        cmd: &mu_cd_ipc::SlotSwapCommand,
     ) -> Result<(), OrchestratorError> {
+        self.swap_units
+            .lock()
+            .await
+            .push((node_id.to_string(), cmd.systemd_unit.clone()));
         Ok(())
     }
 
     async fn execute_integration_tests(
         &self,
-        _node_id: &str,
+        node_id: &str,
         deployment_id: &str,
         service: &str,
         artifact_sha256: &str,
         _selected_tests: Option<&[String]>,
         _timeout: Duration,
     ) -> Result<IntegrationTestReport, OrchestratorError> {
+        let should_fail = self.fail_it_node.as_deref().is_some_and(|n| n == node_id);
         Ok(IntegrationTestReport {
             deployment_id: deployment_id.into(),
             service_name: service.into(),
             artifact_sha256: artifact_sha256.into(),
             executed_tests: vec!["smoke".into()],
-            passed: true,
-            failed_tests: vec![],
+            passed: !should_fail,
+            failed_tests: if should_fail {
+                vec!["smoke".into()]
+            } else {
+                vec![]
+            },
             duration_ms: 10,
             log_excerpt: None,
         })
@@ -1203,6 +1218,7 @@ async fn test_emergency_rollback_enforces_ab_rollback_folio_restores_slot_and_ta
         integration_tests: IntegrationTestSelector::All("all".into()),
         it_archive_digest: None,
         ab_rules: Default::default(),
+        deployment: Default::default(),
     };
 
     // Deploy 1 promotes @a -> @b; Deploy 2 promotes @b -> @a.
@@ -1373,4 +1389,127 @@ async fn test_emergency_rollback_enforces_ab_rollback_folio_restores_slot_and_ta
     assert_eq!(d3.staged_slot, Slot::A);
     assert_eq!(d3.restore_slot, Slot::B);
     assert_eq!(d3.active_slot, Slot::A);
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_post_deploy_deduplicates_targets_and_promotes_all_nodes() {
+    let store = Arc::new(CdStateStore::default());
+    let coordinator = Arc::new(LeaseCoordinator::new());
+    let agent = Arc::new(MockApiAgent::default());
+    let regist = Arc::new(RecordingRegist::default());
+    let orchestrator = Arc::new(
+        DeploymentOrchestrator::new(coordinator, None, agent.clone(), regist)
+            .with_cd_state(store.clone()),
+    );
+    let app = router(CdApiState::new(store, Some(TOKEN.into())).with_orchestrator(orchestrator));
+
+    let payload = serde_json::json!({
+        "repo": "LMA1980/mu-cd-controller",
+        "artifact_sha256": "deadbeef1234",
+        "git_commit": "0123456789abcdef",
+        "binary_digest": "deadbeef1234",
+        "it_archive_digest": "cafebabe5678",
+        "manifest_yaml": r#"
+version: "1"
+service: "mu-cd-controller"
+integration_tests: "all"
+deployment:
+  target_nodes:
+    - " node-a "
+    - "node-b"
+    - "node-a"
+  binary: "mu-cd-controller"
+  install_path: "/usr/local/bin/mu-cd-controller"
+  systemd_unit: "custom-cd-ctrl"
+"#,
+        "wait": true
+    });
+
+    let (status, _, body) = post_json(
+        app,
+        "/api/cd/deploy",
+        Some(&bearer()),
+        &[],
+        &payload.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: DeployTriggerResponse = serde_json::from_slice(&body).unwrap();
+    assert!(resp.accepted);
+    assert_eq!(resp.service, "mu-cd-controller");
+    assert_eq!(resp.target_nodes, vec!["node-a", "node-b"]);
+    assert_eq!(resp.promoted_nodes, vec!["node-a", "node-b"]);
+    assert!(resp.rolled_back_nodes.is_empty());
+
+    assert_eq!(
+        agent.swap_units.lock().await.as_slice(),
+        &[
+            ("node-a".to_string(), "custom-cd-ctrl.service".to_string()),
+            ("node-b".to_string(), "custom-cd-ctrl.service".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_post_deploy_multi_node_partial_rollback_returns_422_and_compensates() {
+    let store = Arc::new(CdStateStore::default());
+    let coordinator = Arc::new(LeaseCoordinator::new());
+    let agent = Arc::new(MockApiAgent {
+        fail_it_node: Some("node-b".into()),
+        ..Default::default()
+    });
+    let regist = Arc::new(RecordingRegist::default());
+    let orchestrator = Arc::new(
+        DeploymentOrchestrator::new(coordinator.clone(), None, agent.clone(), regist.clone())
+            .with_cd_state(store.clone()),
+    );
+    let app = router(CdApiState::new(store, Some(TOKEN.into())).with_orchestrator(orchestrator));
+
+    let payload = serde_json::json!({
+        "repo": "LMA1980/mu-cd-controller",
+        "artifact_sha256": "deadbeef5678",
+        "manifest_yaml": r#"
+version: "1"
+service: "mu-cd-controller"
+target_nodes:
+  - "node-a"
+  - "node-b"
+  - "worker-riscv64"
+integration_tests: "all"
+"#,
+        "wait": true
+    });
+
+    let (status, _, body) = post_json(
+        app,
+        "/api/cd/deploy",
+        Some(&bearer()),
+        &[],
+        &payload.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let resp: DeployTriggerResponse = serde_json::from_slice(&body).unwrap();
+    assert!(!resp.accepted);
+    assert_eq!(
+        resp.target_nodes,
+        vec!["node-a", "node-b", "worker-riscv64"]
+    );
+    assert!(resp.promoted_nodes.is_empty());
+    assert_eq!(resp.rolled_back_nodes, vec!["node-a", "node-b"]);
+    assert_eq!(
+        coordinator
+            .active_slot_for("node-a", "mu-cd-controller")
+            .await,
+        mu_cd_ipc::DeploymentSlot::SlotA
+    );
+    assert_eq!(
+        coordinator
+            .active_slot_for("node-b", "mu-cd-controller")
+            .await,
+        mu_cd_ipc::DeploymentSlot::SlotA
+    );
+    assert_eq!(agent.rollback_slots.lock().await.len(), 2);
 }

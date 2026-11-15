@@ -19,6 +19,137 @@ use crate::tls::TlsConfig;
 /// Default ActionRunner controller URL used across continuous delivery fabric.
 pub const DEFAULT_CONTROLLER_URL: &str = "https://controller.ci.ci.internal:8443";
 
+/// Default maximum wall-clock duration awaiting an eligible idle target node (120 seconds).
+pub const DEFAULT_IDLE_WAIT_TIMEOUT_SECS: u64 = 120;
+
+/// Default initial backoff interval between target-node idle probes (500 ms).
+pub const DEFAULT_IDLE_POLL_INITIAL_MS: u64 = 500;
+
+/// Default upper bound on backoff interval between target-node idle probes (10 seconds).
+pub const DEFAULT_IDLE_POLL_MAX_MS: u64 = 10_000;
+
+/// Default jitter percentage `[0..=100]` applied to backoff probe intervals (20%).
+pub const DEFAULT_IDLE_JITTER_PERCENT: u64 = 20;
+
+/// Configuration for bounded contention-tolerant exponential backoff while waiting
+/// for busy target nodes to drain active stages before granting a deployment lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleBackoffConfig {
+    /// Total deadline awaiting an eligible idle node before failing with [`LeaseError::NodeNotIdle`].
+    pub wait_timeout: Duration,
+    /// Initial delay after the first busy probe before retrying.
+    pub initial_interval: Duration,
+    /// Upper bound on delay between retries.
+    pub max_interval: Duration,
+    /// Jitter percentage `[0..=100]` around the exponential interval.
+    pub jitter_percent: u64,
+}
+
+impl Default for IdleBackoffConfig {
+    fn default() -> Self {
+        Self {
+            wait_timeout: Duration::from_secs(DEFAULT_IDLE_WAIT_TIMEOUT_SECS),
+            initial_interval: Duration::from_millis(DEFAULT_IDLE_POLL_INITIAL_MS),
+            max_interval: Duration::from_millis(DEFAULT_IDLE_POLL_MAX_MS),
+            jitter_percent: DEFAULT_IDLE_JITTER_PERCENT,
+        }
+    }
+}
+
+impl IdleBackoffConfig {
+    /// Builds [`IdleBackoffConfig`] from environment variables
+    /// (`MUCONDE_IDLE_WAIT_TIMEOUT_SECS`, `MUCONDE_IDLE_POLL_INITIAL_MS`,
+    /// `MUCONDE_IDLE_POLL_MAX_MS`, `MUCONDE_IDLE_JITTER_PERCENT`), falling back to defaults.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let wait_secs = std::env::var("MUCONDE_IDLE_WAIT_TIMEOUT_SECS")
+            .or_else(|_| std::env::var("MUCD_IDLE_WAIT_TIMEOUT_SECS"))
+            .ok();
+        let initial_ms = std::env::var("MUCONDE_IDLE_POLL_INITIAL_MS")
+            .or_else(|_| std::env::var("MUCD_IDLE_POLL_INITIAL_MS"))
+            .ok();
+        let max_ms = std::env::var("MUCONDE_IDLE_POLL_MAX_MS")
+            .or_else(|_| std::env::var("MUCD_IDLE_POLL_MAX_MS"))
+            .ok();
+        let jitter_pct = std::env::var("MUCONDE_IDLE_JITTER_PERCENT")
+            .or_else(|_| std::env::var("MUCD_IDLE_JITTER_PERCENT"))
+            .ok();
+        Self::from_env_values(
+            wait_secs.as_deref(),
+            initial_ms.as_deref(),
+            max_ms.as_deref(),
+            jitter_pct.as_deref(),
+        )
+    }
+
+    /// Pure parser constructing [`IdleBackoffConfig`] from optional string values.
+    #[must_use]
+    pub fn from_env_values(
+        wait_timeout_secs: Option<&str>,
+        initial_ms: Option<&str>,
+        max_ms: Option<&str>,
+        jitter_percent: Option<&str>,
+    ) -> Self {
+        let mut cfg = Self::default();
+        if let Some(secs) = wait_timeout_secs.and_then(|s| s.trim().parse::<u64>().ok()) {
+            cfg.wait_timeout = Duration::from_secs(secs);
+        }
+        if let Some(ms) = initial_ms.and_then(|s| s.trim().parse::<u64>().ok()) {
+            cfg.initial_interval = Duration::from_millis(ms);
+        }
+        if let Some(ms) = max_ms.and_then(|s| s.trim().parse::<u64>().ok()) {
+            cfg.max_interval = Duration::from_millis(ms);
+        }
+        if cfg.max_interval < cfg.initial_interval {
+            cfg.max_interval = cfg.initial_interval;
+        }
+        if let Some(pct) = jitter_percent.and_then(|s| s.trim().parse::<u64>().ok()) {
+            cfg.jitter_percent = pct.min(100);
+        }
+        cfg
+    }
+
+    /// Computes the unjittered exponential backoff delay for zero-based `attempt`
+    /// (`initial_interval * 2^attempt`), clamped to `[initial_interval, max_interval]`.
+    #[must_use]
+    pub fn base_delay_for_attempt(&self, attempt: u32) -> Duration {
+        let init_ms = self.initial_interval.as_millis().min(u64::MAX as u128) as u64;
+        let max_ms = self
+            .max_interval
+            .as_millis()
+            .max(init_ms as u128)
+            .min(u64::MAX as u128) as u64;
+        let multiplier = 1u64.checked_shl(attempt.min(30)).unwrap_or(u64::MAX);
+        Duration::from_millis(init_ms.saturating_mul(multiplier).min(max_ms))
+    }
+
+    /// Computes a bounded jittered delay using caller-supplied entropy, clamped by `remaining`.
+    #[must_use]
+    pub fn delay_for_attempt(&self, attempt: u32, entropy: u64, remaining: Duration) -> Duration {
+        let base_ms = self.base_delay_for_attempt(attempt).as_millis() as u64;
+        let cap_ms = self
+            .max_interval
+            .as_millis()
+            .max(base_ms as u128)
+            .min(u64::MAX as u128) as u64;
+        let jitter_pct = self.jitter_percent.min(100);
+        let delay_ms = if base_ms == 0 || jitter_pct == 0 {
+            base_ms
+        } else {
+            let span = base_ms.saturating_mul(jitter_pct) / 100;
+            if span == 0 {
+                base_ms
+            } else {
+                let min_ms = base_ms.saturating_sub(span);
+                let max_ms = base_ms.saturating_add(span).min(cap_ms);
+                let range = max_ms.saturating_sub(min_ms).saturating_add(1);
+                min_ms.saturating_add(entropy % range)
+            }
+        };
+        Duration::from_millis(delay_ms).min(remaining)
+    }
+}
+
 /// Cluster node status matching ActionRunner-controller `GET /api/cluster/nodes` response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterNodeStatus {
@@ -682,5 +813,38 @@ mod tests {
 
         let swept = coordinator.sweep_expired_leases().await;
         assert!(swept.is_empty());
+    }
+
+    #[test]
+    fn test_idle_backoff_config_progression_jitter_and_env_parsing() {
+        let cfg =
+            IdleBackoffConfig::from_env_values(Some("45"), Some("100"), Some("350"), Some("20"));
+        assert_eq!(cfg.wait_timeout, Duration::from_secs(45));
+        assert_eq!(cfg.initial_interval, Duration::from_millis(100));
+        assert_eq!(cfg.max_interval, Duration::from_millis(350));
+        assert_eq!(cfg.jitter_percent, 20);
+
+        assert_eq!(cfg.base_delay_for_attempt(0), Duration::from_millis(100));
+        assert_eq!(cfg.base_delay_for_attempt(1), Duration::from_millis(200));
+        assert_eq!(cfg.base_delay_for_attempt(2), Duration::from_millis(350));
+        assert_eq!(cfg.base_delay_for_attempt(20), Duration::from_millis(350));
+
+        // Jitter stays within +/- 20% and is bounded by remaining budget.
+        for entropy in [0u64, 1, 17, 99, 10_000] {
+            let d0 = cfg.delay_for_attempt(0, entropy, Duration::from_secs(10));
+            assert!(
+                d0 >= Duration::from_millis(80) && d0 <= Duration::from_millis(120),
+                "unexpected attempt-0 jittered delay: {d0:?}"
+            );
+            let d_capped = cfg.delay_for_attempt(2, entropy, Duration::from_millis(50));
+            assert_eq!(d_capped, Duration::from_millis(50));
+        }
+
+        // max_interval < initial_interval clamps cleanly, and jitter_percent clamps at 100.
+        let clamped =
+            IdleBackoffConfig::from_env_values(Some("0"), Some("500"), Some("100"), Some("250"));
+        assert_eq!(clamped.wait_timeout, Duration::ZERO);
+        assert_eq!(clamped.max_interval, Duration::from_millis(500));
+        assert_eq!(clamped.jitter_percent, 100);
     }
 }

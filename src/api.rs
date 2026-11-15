@@ -514,6 +514,14 @@ pub struct DeployTriggerRequest {
     pub repo_path: Option<String>,
     #[serde(default)]
     pub wait: bool,
+    #[serde(default)]
+    pub git_commit: Option<String>,
+    #[serde(default)]
+    pub binary_digest: Option<String>,
+    #[serde(default)]
+    pub it_archive_digest: Option<String>,
+    #[serde(default)]
+    pub bundle_id: Option<String>,
 }
 
 /// Response payload for `POST /api/cd/deploy`.
@@ -548,7 +556,7 @@ async fn post_deploy(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| mu_observable_ipc::TraceContext::parse_traceparent(s).ok());
 
-    let config = if let Some(cfg) = req.config {
+    let mut config = if let Some(cfg) = req.config {
         if let Err(e) = cfg.validate() {
             return (
                 StatusCode::BAD_REQUEST,
@@ -587,7 +595,16 @@ async fn post_deploy(
             .into_response();
     };
 
-    let resolved_nodes = config.target_nodes.clone();
+    if config.it_archive_digest.is_none() {
+        if let Some(ref it_digest) = req.it_archive_digest {
+            let trimmed = it_digest.trim();
+            if !trimmed.is_empty() {
+                config.it_archive_digest = Some(trimmed.to_string());
+            }
+        }
+    }
+
+    let resolved_nodes = crate::orchestrator::resolve_target_nodes(config.effective_target_nodes());
     let service = config.service.clone();
     let digest = req.artifact_sha256.trim().to_string();
     if digest.is_empty() {
