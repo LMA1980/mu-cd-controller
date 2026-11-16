@@ -1146,7 +1146,7 @@ dependencies = [
 [[package]]
 name = "mu-auth"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-auth.git?branch=main#b59f0d1c27ebc0d70d03dc605a80ab11c2b5b951"
+source = "git+https://github.com/LMA1980/mu-auth.git?rev=0c8970657f3e0f2f2921ee65ed754183b9e06a47#0c8970657f3e0f2f2921ee65ed754183b9e06a47"
 dependencies = [
  "serde",
  "serde_json",
