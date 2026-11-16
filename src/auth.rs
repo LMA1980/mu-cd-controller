@@ -8,8 +8,9 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use mu_auth::{
-    AuthAuthority, FolioCatalog, FolioError, FolioId, Principal, RoleActivation, RoleCatalog,
-    RoleFolioIndex, RoleId, RoleLeases, RoleSpec, StepUpRequirement, SubsystemId,
+    canonical_super_operator_folios, AuthAuthority, FolioCatalog, FolioError, FolioId, Principal,
+    RoleActivation, RoleCatalog, RoleFolioIndex, RoleId, RoleLease, RoleLeases, RoleSpec,
+    StepUpRequirement, SubsystemId, SUPER_OPERATOR_ROLE_ID,
 };
 use serde_json::json;
 use subtle::ConstantTimeEq;
@@ -36,6 +37,8 @@ pub const ROLE_GATE_INSPECTOR: &str = "gate-inspector";
 pub const ROLE_AB_EMERGENCY: &str = "ab-emergency";
 /// Time-bounded platform admin role with full CD/A|B read + emergency rollback visibility.
 pub const ROLE_PLATFORM_ADMIN: &str = "platform-admin";
+/// Passkey-gated renewable all-access role (2m idle, 15m hard, single +15m last-2m renewal).
+pub const ROLE_SUPER_OPERATOR: &str = SUPER_OPERATOR_ROLE_ID;
 
 const HEADER_PROXY_SECRET: &str = "x-proxy-secret";
 const HEADER_FORWARDED_USER: &str = "x-forwarded-user";
@@ -128,6 +131,7 @@ pub fn default_authority() -> AuthAuthority {
             300,
         )
         .expect("valid timed platform-admin role"),
+        RoleSpec::super_operator(),
     ])
     .expect("canonical controller roles must validate");
 
@@ -178,6 +182,14 @@ pub fn default_authority() -> AuthAuthority {
             &role_catalog,
         )
         .expect("platform-admin folios must validate");
+    index
+        .set_role_folios(
+            role_id(ROLE_SUPER_OPERATOR),
+            BTreeSet::from(canonical_super_operator_folios()),
+            &folio_catalog,
+            &role_catalog,
+        )
+        .expect("super-operator folios must validate");
 
     AuthAuthority::new(folio_catalog, role_catalog, index)
         .expect("default canonical AuthAuthority must validate")
@@ -381,6 +393,47 @@ impl CdAuthorizer {
         Ok(())
     }
 
+    /// Renews a bound operator's active renewable `Timed` role lease (e.g. `super-operator`)
+    /// during its final renewal window after fresh Passkey step-up confirmation.
+    pub fn renew_operator_role(
+        &self,
+        login: &str,
+        role: &str,
+        step_up_verified: bool,
+        now_ms: u64,
+    ) -> Result<RoleLease, FolioError> {
+        let authority = self.authority.read().unwrap_or_else(|e| e.into_inner());
+        let rid = RoleId::new(role)?;
+        let key = login.trim().to_ascii_lowercase();
+        let mut ops = self.operators.write().unwrap_or_else(|e| e.into_inner());
+        let session = ops
+            .get_mut(&key)
+            .ok_or_else(|| FolioError::UnauthorizedActivation {
+                role: role.to_string(),
+            })?;
+        let lease = session.leases.renew_timed(
+            &authority.role_catalog,
+            &session.principal,
+            &rid,
+            now_ms,
+            step_up_verified,
+        )?;
+        Ok(lease.clone())
+    }
+
+    /// Records explicit user activity to extend active `Timed` idle timers up to hard limits.
+    pub fn touch_operator_activity(&self, login: &str, now_ms: u64) {
+        let key = login.trim().to_ascii_lowercase();
+        if let Some(session) = self
+            .operators
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&key)
+        {
+            let _ = session.leases.record_activity(now_ms);
+        }
+    }
+
     /// Removes a previously registered operator session binding.
     pub fn revoke_operator(&self, login: &str) {
         self.operators
@@ -418,6 +471,7 @@ impl CdAuthorizer {
                     ROLE_GATE_INSPECTOR,
                     ROLE_AB_EMERGENCY,
                     ROLE_PLATFORM_ADMIN,
+                    ROLE_SUPER_OPERATOR,
                 ],
                 &[ROLE_GATE_INSPECTOR],
                 false,
@@ -775,6 +829,66 @@ mod tests {
         assert_eq!(
             bootstrapped
                 .authorize_at(&op_hdrs, POLICY_AB_ROLLBACK, now)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        // Super-operator: Passkey required, 2m idle, 15m hard, single +15m last-2m Passkey renewal.
+        bootstrapped
+            .bind_operator(
+                "alice",
+                1,
+                &[ROLE_MEMBER, ROLE_SUPER_OPERATOR],
+                &[ROLE_SUPER_OPERATOR],
+                true,
+                0,
+            )
+            .unwrap();
+        let alice_hdrs = headers_with(&[
+            ("x-proxy-secret", "proxy-sec"),
+            ("x-forwarded-user", "alice"),
+        ]);
+        let caller = bootstrapped
+            .authorize_at(&alice_hdrs, POLICY_AB_ROLLBACK, 1_000)
+            .unwrap();
+        assert!(caller.can_read_steps);
+        assert!(caller.can_read_gate_logs);
+        assert!(caller.can_rollback);
+
+        for t in [
+            90_000, 180_000, 270_000, 360_000, 450_000, 540_000, 630_000, 720_000, 779_000,
+        ] {
+            bootstrapped.touch_operator_activity("alice", t);
+        }
+        assert!(matches!(
+            bootstrapped.renew_operator_role("alice", ROLE_SUPER_OPERATOR, true, 779_000),
+            Err(FolioError::RenewalWindowNotReached { .. })
+        ));
+        assert!(matches!(
+            bootstrapped.renew_operator_role("alice", ROLE_SUPER_OPERATOR, false, 780_000),
+            Err(FolioError::StepUpRequired { .. })
+        ));
+        let renewed = bootstrapped
+            .renew_operator_role("alice", ROLE_SUPER_OPERATOR, true, 780_000)
+            .unwrap();
+        assert_eq!(renewed.hard_expires_at_ms, 1_800_000);
+        bootstrapped.touch_operator_activity("alice", 880_000);
+        bootstrapped.touch_operator_activity("alice", 920_000);
+        assert!(
+            bootstrapped
+                .authorize_at(&alice_hdrs, POLICY_AB_ROLLBACK, 920_000)
+                .unwrap()
+                .can_rollback
+        );
+        assert!(matches!(
+            bootstrapped.renew_operator_role("alice", ROLE_SUPER_OPERATOR, true, 920_000),
+            Err(FolioError::RenewalLimitReached { .. })
+        ));
+        // Leaving idle >= 120s after last activity (at 1_040_000ms) expires super-operator cleanly.
+        assert_eq!(
+            bootstrapped
+                .authorize_at(&alice_hdrs, POLICY_AB_ROLLBACK, 1_040_000)
                 .unwrap_err()
                 .status,
             StatusCode::FORBIDDEN
