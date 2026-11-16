@@ -389,6 +389,50 @@ impl CdAuthorizer {
             .remove(&login.trim().to_ascii_lowercase());
     }
 
+    /// Bootstraps configured operator GitHub logins (from `MUCONDE_OPERATOR_USERS`) with baseline
+    /// and elective gate-inspector read/step/gate-log folios while keeping `ab:rollback` gated
+    /// behind explicit timed elevation.
+    #[must_use]
+    pub fn with_operator_users<I, S>(self, logins: I, now_ms: u64) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for raw in logins {
+            let trimmed = raw.as_ref().trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some(valid_login) = validate_github_login(trimmed) else {
+                tracing::warn!(
+                    login = trimmed,
+                    "Ignoring invalid GitHub login in MUCONDE_OPERATOR_USERS"
+                );
+                continue;
+            };
+            if let Err(err) = self.bind_operator(
+                &valid_login,
+                1,
+                &[
+                    ROLE_MEMBER,
+                    ROLE_GATE_INSPECTOR,
+                    ROLE_AB_EMERGENCY,
+                    ROLE_PLATFORM_ADMIN,
+                ],
+                &[ROLE_GATE_INSPECTOR],
+                false,
+                now_ms,
+            ) {
+                tracing::warn!(
+                    login = %valid_login,
+                    error = %err,
+                    "Failed to bootstrap MUCONDE_OPERATOR_USERS operator binding"
+                );
+            }
+        }
+        self
+    }
+
     /// Authenticates transport credentials (`Authorization: Bearer` / `X-Proxy-Secret` +
     /// `X-Forwarded-User`) and evaluates the required `mu-auth` policy at `now_ms`.
     pub fn authorize_at(
@@ -701,6 +745,36 @@ mod tests {
         ]);
         assert_eq!(
             auth.authorize_at(&nopass, POLICY_CD_RUNS_READ, now)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        // MUCONDE_OPERATOR_USERS bootstrap binds valid logins (case-insensitively) and ignores invalid ones,
+        // allowing combined Authorization: Bearer + X-Proxy-Secret/X-Forwarded-User reads while keeping
+        // ab:rollback gated behind timed elevation.
+        let bootstrapped = CdAuthorizer::new(Some("svc-tok".into()))
+            .with_proxy_secret(Some("proxy-sec".into()))
+            .with_operator_users(["Operator-One", " invalid user ", "-bad"], now);
+        let op_hdrs = headers_with(&[
+            ("authorization", "Bearer svc-tok"),
+            ("x-proxy-secret", "proxy-sec"),
+            ("x-forwarded-user", "operator-one"),
+        ]);
+        let op_caller = bootstrapped
+            .authorize_at(&op_hdrs, POLICY_AB_SLOTS_READ, now)
+            .unwrap();
+        assert_eq!(op_caller.principal_login.as_deref(), Some("Operator-One"));
+        assert!(!op_caller.service_only);
+        assert!(op_caller.can_read_steps);
+        assert!(op_caller.can_read_gate_logs);
+        assert!(!op_caller.can_rollback);
+        assert!(bootstrapped
+            .authorize_at(&op_hdrs, POLICY_CD_RUNS_READ, now)
+            .is_ok());
+        assert_eq!(
+            bootstrapped
+                .authorize_at(&op_hdrs, POLICY_AB_ROLLBACK, now)
                 .unwrap_err()
                 .status,
             StatusCode::FORBIDDEN

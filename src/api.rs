@@ -54,11 +54,25 @@ pub struct CdApiConfig {
     pub token_file: Option<PathBuf>,
     /// File containing the shared edge proxy secret (`X-Proxy-Secret`).
     pub proxy_secret_file: Option<PathBuf>,
+    /// GitHub logins bootstrapped with baseline CD/A|B read + gate-inspector folios
+    /// (`MUCONDE_OPERATOR_USERS`, comma-separated).
+    pub operator_users: Vec<String>,
 }
 
 impl CdApiConfig {
-    /// Reads `MUCONDE_CD_API_ADDR`, `MUCONDE_CD_API_TOKEN_FILE`, and `MUCONDE_PROXY_SECRET_FILE`.
+    /// Reads `MUCONDE_CD_API_ADDR`, `MUCONDE_CD_API_TOKEN_FILE`, `MUCONDE_PROXY_SECRET_FILE`,
+    /// and `MUCONDE_OPERATOR_USERS`.
     pub fn from_env() -> Self {
+        let operator_users = std::env::var("MUCONDE_OPERATOR_USERS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             bind_addr: std::env::var("MUCONDE_CD_API_ADDR")
                 .ok()
@@ -71,6 +85,7 @@ impl CdApiConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .map(PathBuf::from),
+            operator_users,
         }
     }
 }
@@ -135,6 +150,18 @@ impl CdApiState {
     #[must_use]
     pub fn with_proxy_secret(mut self, secret: Option<String>) -> Self {
         self.authorizer = self.authorizer.with_proxy_secret(secret);
+        self
+    }
+
+    /// Bootstraps configured operator logins (e.g. from `MUCONDE_OPERATOR_USERS`) on the
+    /// underlying [`CdAuthorizer`].
+    #[must_use]
+    pub fn with_operator_users<I, S>(mut self, logins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.authorizer = self.authorizer.with_operator_users(logins, now_epoch_ms());
         self
     }
 
@@ -754,7 +781,9 @@ pub async fn spawn_cd_api_with_orchestrator(
         .proxy_secret_file
         .as_deref()
         .and_then(load_secret_file);
-    let mut state = CdApiState::new(store, token).with_proxy_secret(proxy_secret);
+    let mut state = CdApiState::new(store, token)
+        .with_proxy_secret(proxy_secret)
+        .with_operator_users(&config.operator_users);
     if let Some(orch) = orchestrator {
         state = state.with_orchestrator(orch);
     }
@@ -796,5 +825,6 @@ mod tests {
         assert!(c.bind_addr.is_none());
         assert!(c.token_file.is_none());
         assert!(c.proxy_secret_file.is_none());
+        assert!(c.operator_users.is_empty());
     }
 }

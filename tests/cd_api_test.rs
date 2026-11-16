@@ -1513,3 +1513,38 @@ integration_tests: "all"
     );
     assert_eq!(agent.rollback_slots.lock().await.len(), 2);
 }
+
+#[tokio::test]
+async fn test_operator_users_bootstrap_allows_combined_bearer_and_proxy_reads() {
+    let store = seeded_store();
+    let state = CdApiState::new(store, Some(TOKEN.into()))
+        .with_proxy_secret(Some("proxy-sec".into()))
+        .with_operator_users(["alice-op"]);
+    let app = router(state);
+    let bearer_hdr = bearer();
+    let op_headers = [
+        ("x-proxy-secret", "proxy-sec"),
+        ("x-forwarded-user", "alice-op"),
+    ];
+
+    for path in ["/api/cd/deployments", "/api/cd/runs", "/api/cd/leases"] {
+        let (status, _, body) =
+            get_with_headers(app.clone(), path, Some(&bearer_hdr), &op_headers).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "expected 200 OK on {path}, got {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    let sse_req = Request::builder()
+        .uri("/api/cd/events")
+        .header(header::AUTHORIZATION, &bearer_hdr)
+        .header("x-proxy-secret", "proxy-sec")
+        .header("x-forwarded-user", "alice-op")
+        .body(Body::empty())
+        .unwrap();
+    let sse_resp = app.oneshot(sse_req).await.unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+}
