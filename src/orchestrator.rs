@@ -4,13 +4,20 @@
 //! atomic slot promotion, automatic rollback, and digest tainting.
 
 use std::collections::HashSet;
+use std::io::IoSlice;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Client;
+use rustls::pki_types::ServerName;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 use tokio::sync::RwLock;
+use tokio_rustls::client::TlsStream;
 
 use mu_cd_ipc::{
     create_fory_runtime, read_frame, write_frame, ArtifactTaintNotification, DeploymentLeaseGrant,
@@ -356,13 +363,78 @@ pub fn resolve_target_nodes(nodes: &[String]) -> Vec<String> {
     resolve_target_nodes_from_map(nodes, &map_str)
 }
 
+/// Transport stream to `mu-cd-agent`, supporting plain TCP for unconfigured tests
+/// and `rustls` mTLS when `TlsConfig` provides certificate material.
+enum AgentStream {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for AgentStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for AgentStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+        }
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(stream) => stream.is_write_vectored(),
+            Self::Tls(stream) => stream.is_write_vectored(),
+        }
+    }
+}
+
 /// Network implementation of `AgentIpcClient` communicating over TCP/TLS framing.
 #[derive(Clone)]
 pub struct IpcAgentClient {
     port: u16,
     progress_sink: Option<Arc<dyn ItProgressSink>>,
-    active_streams:
-        Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::net::TcpStream>>>,
+    tls_config: Option<TlsConfig>,
+    active_streams: Arc<tokio::sync::Mutex<std::collections::HashMap<String, AgentStream>>>,
 }
 
 impl std::fmt::Debug for IpcAgentClient {
@@ -370,6 +442,13 @@ impl std::fmt::Debug for IpcAgentClient {
         f.debug_struct("IpcAgentClient")
             .field("port", &self.port)
             .field("progress_sink", &self.progress_sink.is_some())
+            .field(
+                "tls_configured",
+                &self
+                    .tls_config
+                    .as_ref()
+                    .is_some_and(TlsConfig::has_tls_material),
+            )
             .finish()
     }
 }
@@ -380,6 +459,7 @@ impl IpcAgentClient {
         Self {
             port,
             progress_sink: None,
+            tls_config: None,
             active_streams: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
@@ -389,6 +469,48 @@ impl IpcAgentClient {
     pub fn with_progress_sink(mut self, sink: Arc<dyn ItProgressSink>) -> Self {
         self.progress_sink = Some(sink);
         self
+    }
+
+    /// Configure mutual TLS credentials for agent IPC connections (`:8446`).
+    #[must_use]
+    pub fn with_tls_config(mut self, tls_config: TlsConfig) -> Self {
+        self.tls_config = Some(tls_config);
+        self
+    }
+
+    async fn connect_stream(&self, host: &str) -> Result<AgentStream, OrchestratorError> {
+        let connector = match self
+            .tls_config
+            .as_ref()
+            .filter(|cfg| cfg.has_tls_material())
+        {
+            Some(tls_cfg) => Some((
+                tls_cfg.build_tls_connector()?,
+                ServerName::try_from(host.to_string()).map_err(|e| {
+                    OrchestratorError::Agent(format!("Invalid TLS server name '{host}': {e}"))
+                })?,
+            )),
+            None => None,
+        };
+
+        let addr = format!("{}:{}", host, self.port);
+        let tcp_stream = TcpStream::connect(&addr).await.map_err(|e| {
+            OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
+        })?;
+
+        if let Some((connector, server_name)) = connector {
+            let tls_stream = connector
+                .connect(server_name, tcp_stream)
+                .await
+                .map_err(|e| {
+                    OrchestratorError::Agent(format!(
+                        "mTLS handshake with agent {addr} failed: {e}"
+                    ))
+                })?;
+            Ok(AgentStream::Tls(Box::new(tls_stream)))
+        } else {
+            Ok(AgentStream::Plain(tcp_stream))
+        }
     }
 }
 
@@ -407,10 +529,7 @@ impl AgentIpcClient for IpcAgentClient {
     ) -> Result<StageDeploymentResponse, OrchestratorError> {
         let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
         let host = resolve_target_node(node_id);
-        let addr = format!("{}:{}", host, self.port);
-        let mut stream = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
-            OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
-        })?;
+        let mut stream = self.connect_stream(&host).await?;
 
         let payload = fory
             .serialize(req)
@@ -446,10 +565,7 @@ impl AgentIpcClient for IpcAgentClient {
     ) -> Result<(), OrchestratorError> {
         let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
         let host = resolve_target_node(node_id);
-        let addr = format!("{}:{}", host, self.port);
-        let mut stream = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
-            OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
-        })?;
+        let mut stream = self.connect_stream(&host).await?;
 
         let payload = fory
             .serialize(cmd)
@@ -479,13 +595,10 @@ impl AgentIpcClient for IpcAgentClient {
     ) -> Result<IntegrationTestReport, OrchestratorError> {
         let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
         let host = resolve_target_node(node_id);
-        let addr = format!("{}:{}", host, self.port);
         let mut stream = if let Some(s) = self.active_streams.lock().await.remove(deployment_id) {
             s
         } else {
-            tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
-                OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
-            })?
+            self.connect_stream(&host).await?
         };
 
         let executed = match selected_tests {
@@ -511,11 +624,7 @@ impl AgentIpcClient for IpcAgentClient {
                             && !reconnected_after_swap_eof =>
                     {
                         reconnected_after_swap_eof = true;
-                        stream = tokio::net::TcpStream::connect(&addr).await.map_err(|ce| {
-                            OrchestratorError::Agent(format!(
-                                "Connect to agent {addr} failed: {ce}"
-                            ))
-                        })?;
+                        stream = self.connect_stream(&host).await?;
                         continue;
                     }
                     Err(e) => return Err(OrchestratorError::Agent(e.to_string())),
@@ -601,10 +710,7 @@ impl AgentIpcClient for IpcAgentClient {
     ) -> Result<(), OrchestratorError> {
         let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
         let host = resolve_target_node(node_id);
-        let addr = format!("{}:{}", host, self.port);
-        let mut stream = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
-            OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
-        })?;
+        let mut stream = self.connect_stream(&host).await?;
 
         let payload = fory
             .serialize(cmd)
@@ -3100,5 +3206,434 @@ mod tests {
             .any(|l| l.attributes_json.contains("cd.rollout.partial_rollback")));
 
         server.abort();
+    }
+
+    struct AgentMtlsFixtures {
+        _temp_dir: tempfile::TempDir,
+        client_tls_paths: TlsConfig,
+        ca_only_tls: TlsConfig,
+        untrusted_client_tls: TlsConfig,
+        server_config: Arc<rustls::ServerConfig>,
+        untrusted_server_config: Arc<rustls::ServerConfig>,
+    }
+
+    fn build_ca_issuer(cn: &str) -> (rcgen::Certificate, rcgen::Issuer<'static, rcgen::KeyPair>) {
+        let mut ca_params = rcgen::CertificateParams::new(vec![cn.into()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_issuer = rcgen::Issuer::new(ca_params, ca_key);
+        (ca_cert, ca_issuer)
+    }
+
+    fn build_server_mtls_config(
+        ca_cert: &rcgen::Certificate,
+        server_issuer: &rcgen::Issuer<'static, rcgen::KeyPair>,
+    ) -> Arc<rustls::ServerConfig> {
+        let server_params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".into(), "localhost".into()]).unwrap();
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server_cert = server_params.signed_by(&server_key, server_issuer).unwrap();
+
+        let mut client_roots = rustls::RootCertStore::empty();
+        client_roots.add(ca_cert.der().clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+            .build()
+            .unwrap();
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![server_cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()),
+                ),
+            )
+            .unwrap();
+        Arc::new(server_config)
+    }
+
+    fn generate_agent_mtls_fixtures() -> AgentMtlsFixtures {
+        TlsConfig::ensure_crypto_provider();
+        let (ca_cert, ca_issuer) = build_ca_issuer("Test Agent Root CA");
+        let (other_ca_cert, other_ca_issuer) = build_ca_issuer("Untrusted Agent Root CA");
+
+        let client_params = rcgen::CertificateParams::new(vec!["mu-cd-controller".into()]).unwrap();
+        let client_key = rcgen::KeyPair::generate().unwrap();
+        let client_cert = client_params.signed_by(&client_key, &ca_issuer).unwrap();
+
+        let bad_client_params =
+            rcgen::CertificateParams::new(vec!["untrusted-client".into()]).unwrap();
+        let bad_client_key = rcgen::KeyPair::generate().unwrap();
+        let bad_client_cert = bad_client_params
+            .signed_by(&bad_client_key, &other_ca_issuer)
+            .unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ca_path = temp_dir.path().join("ca.pem");
+        let client_cert_path = temp_dir.path().join("client.pem");
+        let client_key_path = temp_dir.path().join("client.key");
+        std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+        std::fs::write(&client_cert_path, client_cert.pem()).unwrap();
+        std::fs::write(&client_key_path, client_key.serialize_pem()).unwrap();
+
+        let client_tls_paths = TlsConfig::from_paths(&ca_path, &client_cert_path, &client_key_path);
+        let ca_only_tls = TlsConfig {
+            ca_cert_path: Some(ca_path),
+            ..Default::default()
+        };
+        let untrusted_client_tls = TlsConfig::from_pem_strings(
+            ca_cert.pem(),
+            bad_client_cert.pem(),
+            bad_client_key.serialize_pem(),
+        );
+
+        let server_config = build_server_mtls_config(&ca_cert, &ca_issuer);
+        let untrusted_server_config = build_server_mtls_config(&other_ca_cert, &other_ca_issuer);
+
+        AgentMtlsFixtures {
+            _temp_dir: temp_dir,
+            client_tls_paths,
+            ca_only_tls,
+            untrusted_client_tls,
+            server_config,
+            untrusted_server_config,
+        }
+    }
+
+    async fn spawn_mtls_agent_server(
+        server_config: Arc<rustls::ServerConfig>,
+        close_after_swap: bool,
+        rollback_seen: Arc<AtomicBool>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                let rollback_seen = rollback_seen.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let fory = create_fory_runtime().unwrap();
+                    let read_res =
+                        tokio::time::timeout(Duration::from_millis(300), read_frame(&mut tls))
+                            .await;
+                    match read_res {
+                        Ok(Ok((hdr, payload))) if hdr.msg_type == MSG_TYPE_STAGE_DEPLOY_REQ => {
+                            let req: StageDeploymentRequest = fory.deserialize(&payload).unwrap();
+                            let resp = StageDeploymentResponse {
+                                deployment_id: req.deployment_id,
+                                target_slot: req.target_slot,
+                                btrfs_subvolume_path: "/srv/muconde/example/@b".into(),
+                                staged_ok: true,
+                                error_message: None,
+                            };
+                            let bytes = fory.serialize(&resp).unwrap();
+                            let rh = IpcHeader::new(
+                                MSG_TYPE_STAGE_DEPLOY_RESP,
+                                bytes.len() as u32,
+                                0,
+                                hdr.sequence,
+                            );
+                            let _ = write_frame(&mut tls, &rh, &bytes).await;
+                            let _ = tls.shutdown().await;
+                        }
+                        Ok(Ok((hdr, payload))) if hdr.msg_type == MSG_TYPE_SLOT_SWAP => {
+                            let cmd: SlotSwapCommand = fory.deserialize(&payload).unwrap();
+                            if close_after_swap {
+                                let _ = tls.shutdown().await;
+                                return;
+                            }
+                            let prog = IntegrationTestProgress {
+                                deployment_id: cmd.deployment_id.clone(),
+                                test_name: "mtls_smoke".into(),
+                                critical: true,
+                                state: mu_cd_ipc::TestState::Passed,
+                                duration_ms: 12,
+                                timestamp_epoch_ms: 1_700_000_000_000,
+                            };
+                            let pb = fory.serialize(&prog).unwrap();
+                            let ph = IpcHeader::new(MSG_TYPE_IT_PROGRESS, pb.len() as u32, 0, 2);
+                            let _ = write_frame(&mut tls, &ph, &pb).await;
+                            let report = IntegrationTestReport {
+                                deployment_id: cmd.deployment_id,
+                                service_name: cmd.service_name,
+                                artifact_sha256: "sha256-mtls".into(),
+                                executed_tests: vec!["mtls_smoke".into()],
+                                passed: true,
+                                failed_tests: vec![],
+                                duration_ms: 12,
+                                log_excerpt: None,
+                            };
+                            let rb = fory.serialize(&report).unwrap();
+                            let rh = IpcHeader::new(MSG_TYPE_IT_REPORT, rb.len() as u32, 0, 3);
+                            let _ = write_frame(&mut tls, &rh, &rb).await;
+                            let _ = tls.shutdown().await;
+                        }
+                        Ok(Ok((hdr, _))) if hdr.msg_type == MSG_TYPE_ROLLBACK => {
+                            rollback_seen.store(true, Ordering::SeqCst);
+                            let _ = tls.shutdown().await;
+                        }
+                        Err(_) if close_after_swap => {
+                            let report = IntegrationTestReport {
+                                deployment_id: "dep-mtls-reconn".into(),
+                                service_name: "svc-mtls".into(),
+                                artifact_sha256: "sha256-mtls".into(),
+                                executed_tests: vec!["mtls_reconnect".into()],
+                                passed: true,
+                                failed_tests: vec![],
+                                duration_ms: 15,
+                                log_excerpt: None,
+                            };
+                            let rb = fory.serialize(&report).unwrap();
+                            let rh = IpcHeader::new(MSG_TYPE_IT_REPORT, rb.len() as u32, 0, 1);
+                            let _ = write_frame(&mut tls, &rh, &rb).await;
+                            let _ = tls.shutdown().await;
+                        }
+                        _ => {}
+                    }
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_ipc_agent_client_mtls_stage_swap_it_stream_and_rollback() {
+        let fixtures = generate_agent_mtls_fixtures();
+        let rollback_seen = Arc::new(AtomicBool::new(false));
+        let (port, server) =
+            spawn_mtls_agent_server(fixtures.server_config.clone(), false, rollback_seen.clone())
+                .await;
+
+        let store = Arc::new(CdStateStore::default());
+        store.deployment_started(crate::cd_state::DeploymentStart {
+            deployment_id: "dep-mtls-1".into(),
+            repo: Some("LMA1980/example".into()),
+            service: "svc-mtls".into(),
+            target_node: "127.0.0.1".into(),
+            artifact_digest: "sha256-mtls".into(),
+            active_slot: crate::cd_state::Slot::A,
+            staged_slot: crate::cd_state::Slot::B,
+            restore_slot: crate::cd_state::Slot::A,
+            lease_id: "lease-mtls-1".into(),
+            lease_expires_epoch_ms: u64::MAX / 2,
+            tests: vec![("mtls_smoke".into(), true)],
+        });
+
+        let client = IpcAgentClient::new(port)
+            .with_progress_sink(store.clone())
+            .with_tls_config(fixtures.client_tls_paths.clone());
+
+        let stage_req = StageDeploymentRequest {
+            deployment_id: "dep-mtls-1".into(),
+            lease_id: "lease-mtls-1".into(),
+            service_name: "svc-mtls".into(),
+            artifact_sha256: "sha256-mtls".into(),
+            target_slot: DeploymentSlot::SlotB,
+        };
+        let stage_resp = client
+            .stage_deployment("127.0.0.1", &stage_req)
+            .await
+            .expect("mTLS stage_deployment succeeds");
+        assert!(stage_resp.staged_ok);
+
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: "dep-mtls-1".into(),
+            lease_id: "lease-mtls-1".into(),
+            service_name: "svc-mtls".into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: "svc-mtls.service".into(),
+            warmup_timeout_secs: 5,
+        };
+        client
+            .slot_swap("127.0.0.1", &swap_cmd)
+            .await
+            .expect("mTLS slot_swap succeeds");
+
+        let report = client
+            .execute_integration_tests(
+                "127.0.0.1",
+                "dep-mtls-1",
+                "svc-mtls",
+                "sha256-mtls",
+                None,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("mTLS execute_integration_tests succeeds");
+        assert!(report.passed);
+        assert_eq!(report.executed_tests, vec!["mtls_smoke"]);
+        assert_eq!(
+            store
+                .snapshot()
+                .deployment("dep-mtls-1")
+                .unwrap()
+                .tests
+                .len(),
+            1
+        );
+
+        let rb_cmd = RollbackCommand {
+            deployment_id: "dep-mtls-1".into(),
+            lease_id: "lease-mtls-1".into(),
+            service_name: "svc-mtls".into(),
+            restore_slot: DeploymentSlot::SlotA,
+            failed_artifact_sha256: "sha256-mtls".into(),
+            reason: "test rollback".into(),
+        };
+        client
+            .rollback("127.0.0.1", &rb_cmd)
+            .await
+            .expect("mTLS rollback succeeds");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(rollback_seen.load(Ordering::SeqCst));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_ipc_agent_client_mtls_reconnects_after_swap_eof() {
+        let fixtures = generate_agent_mtls_fixtures();
+        let (port, server) = spawn_mtls_agent_server(
+            fixtures.server_config.clone(),
+            true,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+        let client = IpcAgentClient::new(port).with_tls_config(fixtures.client_tls_paths.clone());
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: "dep-mtls-reconn".into(),
+            lease_id: "lease-mtls-reconn".into(),
+            service_name: "svc-mtls".into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: "svc-mtls.service".into(),
+            warmup_timeout_secs: 5,
+        };
+        client
+            .slot_swap("127.0.0.1", &swap_cmd)
+            .await
+            .expect("mTLS slot_swap");
+
+        let report = client
+            .execute_integration_tests(
+                "127.0.0.1",
+                "dep-mtls-reconn",
+                "svc-mtls",
+                "sha256-mtls",
+                None,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("mTLS post-swap EOF reconnect succeeds");
+        assert!(report.passed);
+        assert_eq!(report.executed_tests, vec!["mtls_reconnect"]);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_ipc_agent_client_mtls_rejects_untrusted_certs_and_falls_back_when_unset() {
+        let fixtures = generate_agent_mtls_fixtures();
+        let stage_req = StageDeploymentRequest {
+            deployment_id: "dep-untrusted".into(),
+            lease_id: "lease-untrusted".into(),
+            service_name: "svc-mtls".into(),
+            artifact_sha256: "sha256-untrusted".into(),
+            target_slot: DeploymentSlot::SlotB,
+        };
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: "dep-untrusted".into(),
+            lease_id: "lease-untrusted".into(),
+            service_name: "svc-mtls".into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: "svc-mtls.service".into(),
+            warmup_timeout_secs: 5,
+        };
+
+        // 1. Untrusted server certificate rejected by client CA trust store.
+        let (bad_srv_port, bad_srv) = spawn_mtls_agent_server(
+            fixtures.untrusted_server_config.clone(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        let good_client =
+            IpcAgentClient::new(bad_srv_port).with_tls_config(fixtures.client_tls_paths.clone());
+        assert!(good_client
+            .stage_deployment("127.0.0.1", &stage_req)
+            .await
+            .is_err());
+        assert!(good_client.slot_swap("127.0.0.1", &swap_cmd).await.is_err());
+        bad_srv.abort();
+
+        // 2. Untrusted client certificate and CA-only config rejected by mTLS server.
+        let (srv_port, srv) = spawn_mtls_agent_server(
+            fixtures.server_config.clone(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        let bad_client =
+            IpcAgentClient::new(srv_port).with_tls_config(fixtures.untrusted_client_tls.clone());
+        assert!(bad_client
+            .stage_deployment("127.0.0.1", &stage_req)
+            .await
+            .is_err());
+        let ca_only_client =
+            IpcAgentClient::new(srv_port).with_tls_config(fixtures.ca_only_tls.clone());
+        assert!(ca_only_client
+            .stage_deployment("127.0.0.1", &stage_req)
+            .await
+            .is_err());
+        srv.abort();
+
+        // 3. Empty TlsConfig::default() keeps plain TCP compatibility.
+        let plain_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let plain_port = plain_listener.local_addr().unwrap().port();
+        let plain_srv = tokio::spawn(async move {
+            let (mut stream, _) = plain_listener.accept().await.unwrap();
+            let fory = create_fory_runtime().unwrap();
+            let (hdr, payload) = read_frame(&mut stream).await.unwrap();
+            let req: StageDeploymentRequest = fory.deserialize(&payload).unwrap();
+            let resp = StageDeploymentResponse {
+                deployment_id: req.deployment_id,
+                target_slot: req.target_slot,
+                btrfs_subvolume_path: "/srv/muconde/example/@b".into(),
+                staged_ok: true,
+                error_message: None,
+            };
+            let bytes = fory.serialize(&resp).unwrap();
+            let rh = IpcHeader::new(
+                MSG_TYPE_STAGE_DEPLOY_RESP,
+                bytes.len() as u32,
+                0,
+                hdr.sequence,
+            );
+            write_frame(&mut stream, &rh, &bytes).await.unwrap();
+        });
+        let plain_client = IpcAgentClient::new(plain_port).with_tls_config(TlsConfig::default());
+        let plain_resp = plain_client
+            .stage_deployment("127.0.0.1", &stage_req)
+            .await
+            .expect("default TlsConfig falls back to plain TCP");
+        assert!(plain_resp.staged_ok);
+        plain_srv.await.unwrap();
     }
 }

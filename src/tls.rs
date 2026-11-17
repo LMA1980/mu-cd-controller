@@ -55,6 +55,16 @@ impl TlsConfig {
         }
     }
 
+    /// Returns `true` when any CA certificate or client identity material is configured.
+    pub fn has_tls_material(&self) -> bool {
+        self.ca_cert_path.is_some()
+            || self.client_cert_path.is_some()
+            || self.client_key_path.is_some()
+            || self.ca_cert_pem.is_some()
+            || self.client_cert_pem.is_some()
+            || self.client_key_pem.is_some()
+    }
+
     /// Ensures the default crypto provider is installed.
     pub fn ensure_crypto_provider() {
         if rustls::crypto::CryptoProvider::get_default().is_none() {
@@ -171,6 +181,16 @@ impl TlsConfig {
 
         let config = match (client_certs, client_key) {
             (certs, Some(key)) if !certs.is_empty() => builder.with_client_auth_cert(certs, key)?,
+            (certs, None) if !certs.is_empty() => {
+                return Err(TlsError::InvalidPrivateKey(
+                    "Client certificate configured without a private key".into(),
+                ));
+            }
+            (certs, Some(_)) if certs.is_empty() => {
+                return Err(TlsError::InvalidCertificate(
+                    "Client private key configured without a certificate".into(),
+                ));
+            }
             _ => builder.with_no_client_auth(),
         };
 
@@ -307,5 +327,51 @@ mod tests {
             client.is_ok(),
             "Client should successfully build with client mTLS certificate and key PEM"
         );
+    }
+
+    #[test]
+    fn test_has_tls_material_reflects_configured_fields() {
+        assert!(!TlsConfig::default().has_tls_material());
+        assert!(TlsConfig {
+            ca_cert_path: Some(PathBuf::from("/tmp/ca.pem")),
+            ..Default::default()
+        }
+        .has_tls_material());
+        assert!(TlsConfig {
+            client_cert_pem: Some("cert".into()),
+            ..Default::default()
+        }
+        .has_tls_material());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_build_rustls_client_config_rejects_partial_client_identity() {
+        let mut ca_params = rcgen::CertificateParams::new(vec!["Test CA".into()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+        let client_params = rcgen::CertificateParams::new(vec!["client-identity".into()]).unwrap();
+        let client_key = rcgen::KeyPair::generate().unwrap();
+        let client_cert = client_params.signed_by(&client_key, &ca_issuer).unwrap();
+
+        let cert_only = TlsConfig {
+            client_cert_pem: Some(client_cert.pem()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            cert_only.build_rustls_client_config(),
+            Err(TlsError::InvalidPrivateKey(_))
+        ));
+
+        let key_only = TlsConfig {
+            client_key_pem: Some(client_key.serialize_pem()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            key_only.build_rustls_client_config(),
+            Err(TlsError::InvalidCertificate(_))
+        ));
     }
 }

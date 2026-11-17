@@ -73,8 +73,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // optional `/api/cd/*` listener.
     let cd_state = Arc::new(CdStateStore::default());
 
-    let agent_client =
-        Arc::new(IpcAgentClient::new(agent_port).with_progress_sink(cd_state.clone()));
+    let agent_client = Arc::new(
+        IpcAgentClient::new(agent_port)
+            .with_progress_sink(cd_state.clone())
+            .with_tls_config(tls_config.clone()),
+    );
 
     let cd_sink: Arc<dyn CdTelemetrySink> = Arc::new(MuObserveCdSink::from_env());
     let mut orchestrator =
