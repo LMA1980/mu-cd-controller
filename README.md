@@ -13,33 +13,33 @@
   <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-cd-controller/benchmark.svg" alt="Benchmark"/></a>
 </p>
 
----
+______________________________________________________________________
 
-Continuous Delivery (CD) control plane orchestrator managing zero-downtime, safe, autonomous deployment across cluster worker nodes over `mu-cd-ipc` and `rustls` mTLS (`step-ca` PKI).
+Continuous Delivery (CD) control plane orchestrator in the [`mu-cd`](https://github.com/LMA1980/mu-cd) workspace managing zero-downtime, autonomous deployments across cluster worker nodes over [`mu-cd-ipc`](https://github.com/LMA1980/mu-cd-ipc) and `rustls` mTLS (`step-ca` PKI).
 
-`mu-cd-controller` coordinates with `ActionRunner-controller` (`GET https://controller.ci.internal:8443/api/cluster/nodes`), pulls verified artifacts from `MuRegist` (`https://registry.ci.internal:8444`), and drives node-level `mu-cd-agent` daemons over `mu-cd-ipc`.
+`mu-cd-controller` coordinates with [`mu-ci-controller`](https://github.com/LMA1980/mu-ci-controller) (`GET https://controller.ci.internal:8443/api/cluster/nodes` and incoming `POST /api/cd/deploy` triggers), pulls verified artifacts from [`mu-registry`](https://github.com/LMA1980/mu-registry) (`https://registry.ci.internal:8444`), queries canary bake SLOs from [`mu-observable-hub`](https://github.com/LMA1980/mu-observable-hub), emits W3C trace spans and audit logs (`MuObserveCdSink` via `mu-observable-ipc`) to [`mu-observable-collector`](https://github.com/LMA1980/mu-observable-collector), and drives node-level [`mu-cd-agent`](https://github.com/LMA1980/mu-cd-agent) daemons over `mu-cd-ipc`.
 
----
+______________________________________________________________________
 
 ## Core Responsibilities
 
-- **Idle Runner Discovery**: Inspects target host worker utilization and pending queue depths (`active_slots == 0 && !exclusive_locked`) to schedule deployments during verified idle windows without interrupting active factory pipelines.
-- **TTL-Bounded Deployment Leases**: Negotiates time-to-live leases (e.g. 300s) on target nodes. If lease renewal fails or verification stalls, the target node autonomously rolls back.
-- **Declarative IT Failure Contracts (`.mucd/mu-cd.yml` with `.muconde/MuConDe.yml` fallback)**:
-  - Parses deployment requirements: target node, target slot, probe endpoints, and required critical Integration Test suites (`integration_tests: [...]` or `"all"`).
-- **Atomic Promotion / Rollback State Machine**:
-  - Stages candidate release in inactive slot (Slot B).
-  - Swaps active execution pointer to candidate slot.
-  - Executes live integration tests and health probes against Slot B.
-  - **Success Path**: Dispatches atomic promotion trigger to swap Slot B to baseline Slot A and marks release healthy in `MuRegist` (`POST /api/v1/canary/{digest}/promote`).
-  - **Failure Path**: Dispatches immediate rollback trigger to restore baseline Slot A, sweeps lease, and marks artifact digest as tainted in `MuRegist` (`POST /api/v1/canary/{digest}/taint`).
+- **Idle Runner Discovery**: Inspects target host worker utilization and pending queue depths (`active_slots == 0 && !exclusive_locked`) with exponential backoff (`MUCONDE_IDLE_*`) to schedule deployments during verified idle windows without interrupting active CI pipelines.
+- **TTL-Bounded Deployment Leases**: Negotiates time-to-live leases (default `300s`) on target nodes. If lease renewal fails or verification stalls, the target node autonomously rolls back.
+- **Declarative Deployment Contracts (`.mucd/mu-cd.yml` with `.muconde/MuConDe.yml` fallback)**:
+  - Parses target nodes, service binary / static `web_root` / `systemd_unit` placement (`deployment`), Btrfs snapshot retention (`ab_rules`), bake SLO bounds (`bake_window_seconds`, `max_error_logs`, `max_p99_latency_ms`), and required Integration Test suites (`integration_tests: [...]` or `"all"`, plus optional `it_archive_digest`).
+- **Symmetric A/B Promotion / Rollback State Machine (`@a` \<-> `@b`)**:
+  - Snapshots the currently active slot (`snapshots/@snap-<digest>`) and stages the candidate release into the opposite inactive slot (`@b` when `@a` is active, `@a` when `@b` is active).
+  - Atomically swaps `<service>/current` to the candidate slot and triggers warmup and live integration tests on the agent.
+  - Verifies the canary bake window against [`mu-observable-hub`](https://github.com/LMA1980/mu-observable-hub) via `MuObserveSloClient` (`CanarySloAssertionRequest` over `step-ca` mTLS `MUOB` Fory RPC).
+  - **Success Path**: Commits the symmetric active slot transition (`@a <-> @b`) and marks the release healthy in [`mu-registry`](https://github.com/LMA1980/mu-registry) (`POST /api/v1/canary/{digest}/promote`).
+  - **Failure Path**: Dispatches immediate rollback to restore `restore_slot`, sweeps the lease, and taints the artifact digest in [`mu-registry`](https://github.com/LMA1980/mu-registry) (`POST /api/v1/canary/{digest}/taint`).
 
----
+______________________________________________________________________
 
 ## Deployment State Machine
 
 ```text
-[ Idle ]
+[ Idle ]  <── POST /api/cd/deploy (mu-ci-controller) or CLI
    │
    ▼
 [ Discover Idle Node ] ──(Node Busy)──> [ Wait / Backoff ]
@@ -48,72 +48,86 @@ Continuous Delivery (CD) control plane orchestrator managing zero-downtime, safe
 [ Acquire TTL Lease ]
    │
    ▼
-[ Stage Deployment (Slot B) ]
+[ Stage Candidate in Inactive Slot (@a <-> @b) ]
    │
    ▼
-[ Slot Swap to Slot B ]
+[ Atomic Swap (<service>/current -> candidate) ]
    │
    ▼
-[ Execute Health Probes & ITs ]
-   ├── All Passed ──> [ Promote Slot B ➔ Slot A ] ──> [ MuRegist Promote ] ──> [ Complete ]
-   └── Probe Fail / Timeout ──> [ Rollback to Slot A ] ──> [ MuRegist Taint Digest ]
+[ Execute Health Probes, IT Gate & Canary Bake SLO (MuObserveSloClient) ]
+   ├── All Passed ──> [ Commit Slot (@a <-> @b) ] ──> [ mu-registry Promote ] ──> [ Complete ]
+   └── Fail / Timeout ──> [ Rollback to restore_slot ] ──> [ mu-registry Taint Digest ]
 ```
 
----
+______________________________________________________________________
 
 ## Declarative Contract (`.mucd/mu-cd.yml`)
 
-Phase 1 supports both `.mucd/mu-cd.yml` (and `.yaml`) and legacy `.muconde/MuConDe.yml` (with fallback warning).
+Phase 1 supports `.mucd/mu-cd.yml` (`.yaml`) with automatic fallback to `.muconde/MuConDe.yml`:
 
 ```yaml
 version: "1"
-service: "action-runner"
+service: "mu-ci-worker"
+
 target_nodes:
+  - "node-a"
+  - "node-b"
   - "worker-riscv64"
+
 lease_ttl_seconds: 300
 warmup_timeout_seconds: 30
+bake_window_seconds: 60
+max_error_logs: 0
+max_p99_latency_ms: 250.0
 integration_tests: "all"
+
+ab_rules:
+  btrfs_snapshots: true
+  keep_snapshots: 5
+  auto_rollback_on_critical: true
+
+deployment:
+  target_nodes:
+    - "node-a"
+    - "node-b"
+    - "worker-riscv64"
+  binary: "mu-ci-worker"
+  install_path: "/usr/local/bin/mu-ci-worker"
+  systemd_unit: "mu-ci-worker.service"
 ```
 
-Or target specific integration test suites:
+______________________________________________________________________
 
-```yaml
-version: "1"
-service: "action-runner"
-target_nodes:
-  - "worker-riscv64"
-lease_ttl_seconds: 300
-warmup_timeout_seconds: 30
-integration_tests:
-  - "it_smoke"
-  - "it_mtls_handshake"
-```
+## CD Status, Rollout & A/B Gate API (`/api/cd/*`)
 
----
+> Source of truth for the `/api/cd/*` JSON contract consumed by [`mu-console`](https://github.com/LMA1980/mu-console) and [`mu-ci-controller`](https://github.com/LMA1980/mu-ci-controller).
+> Field names and enums are `snake_case`; timestamps are Unix epoch milliseconds; clients must ignore unknown fields.
 
-## Read-only CD Status & Integration-Gate API (`/api/cd/*`)
+### Listener & Dual Authorization (`mu-auth` + Service Tokens)
 
-> This section is the source of truth for the `/api/cd/*` JSON contract consumed by MuConsole.
-> Field names and enums are `snake_case`; timestamps are Unix epoch milliseconds; clients must
-> ignore unknown fields so the server can add fields without breaking them.
+| Env var                                       | Default                          | Meaning                                                                                                                              |
+| --------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `MUCONDE_CD_API_ADDR`                         | unset (API **disabled**)         | Bind address of the separate axum listener, e.g. `127.0.0.1:8447`                                                                    |
+| `MUCONDE_CD_API_TOKEN_FILE`                   | unset                            | File holding the service-to-service bearer token (`cd:service.deploy` and service-scoped reads)                                      |
+| `MUCONDE_PROXY_SECRET_FILE`                   | unset                            | File holding the shared edge proxy secret (`X-Proxy-Secret`) for interactive [`mu-auth`](https://github.com/LMA1980/mu-auth) callers |
+| `MUCONDE_OPERATOR_USERS`                      | unset                            | Comma-separated GitHub logins bootstrapped with baseline CD/A\|B operator folios                                                     |
+| `MUCONDE_REPO`                                | unset                            | `owner/repo` recorded for CLI `deploy` runs (used by `?repo=`)                                                                       |
+| `MUOBSERVE_ADDR` / `MUOBSERVE_COLLECTOR_ADDR` | `observe.ci.internal:9445` (SLO) | `mu-observable-hub` SLO RPC endpoint (`MuObserveSloClient`) and `mu-observable-collector` sink (`MuObserveCdSink`)                   |
 
-### Listener and authentication
+`mu-cd-controller` enforces **dual authorization** (`CdAuthorizer` backed by [`mu-auth`](https://github.com/LMA1980/mu-auth)):
 
-| Env var | Default | Meaning |
-|---|---|---|
-| `MUCONDE_CD_API_ADDR` | unset (API **disabled**) | Bind address of the separate axum listener, e.g. `127.0.0.1:8447` |
-| `MUCONDE_CD_API_TOKEN_FILE` | unset | Path of a file holding the bearer token |
-| `MUCONDE_REPO` | unset | `owner/repo` recorded for CLI `deploy` runs (used by `?repo=`) |
+1. **Interactive Edge-Proxied Operators (`mu-console` via [`mu-auth`](https://github.com/LMA1980/mu-auth))**:
+   - The edge reverse proxy presents `X-Proxy-Secret` (validated in constant time against `MUCONDE_PROXY_SECRET_FILE`) and `X-Forwarded-User` (GitHub login).
+   - `CdAuthorizer` evaluates `PolicyFolio`s and `RoleLeases` (`member`, `gate-inspector`, `ab-emergency`, `platform-admin`, and passkey-gated `super-operator`) against canonical capabilities: `cd:runs.read`, `cd:steps.read`, `ab:slots.read`, `ab:gate.logs.read` (redacting `log_excerpt` when absent), and `ab:rollback` (there is zero `ab:promote` endpoint).
+1. **Service-to-Service Bearer Tokens (`mu-ci-controller`)**:
+   - Callers present `Authorization: Bearer <token>` matched in constant time against `MUCONDE_CD_API_TOKEN_FILE` for service-scoped reads and automated `POST /api/cd/deploy` triggers (`cd:service.deploy`).
+   - Fails closed (`401`/`403`) if credentials are missing, unreadable, empty, or lack the required `PolicyFolio`.
 
-- The listener is plain HTTP and **read-only** (`GET` only). Bind it to loopback; browsers reach it only through the reverse proxy, which authenticates the session and forwards `Authorization: Bearer <token>`.
-- **Every** `/api/cd/*` route, including the SSE stream, requires `Authorization: Bearer <token>`. Without it, or with a wrong token, the response is `401` with `WWW-Authenticate: Bearer realm="muconde-cd"` and `{"error":"unauthorized"}`.
-- The token is read from `MUCONDE_CD_API_TOKEN_FILE` and trimmed. The API **fails closed**: if the variable is unset or the file is missing, unreadable or empty, every request gets `401`. The path is never used as the token.
-- Tokens are compared in constant time.
-- Service-to-service traffic (agents, MuRegist, MuObserve) keeps using mTLS and is unaffected.
+Service-to-service IPC and observability traffic (`mu-cd-agent`, `mu-registry`, `mu-observable-hub`, `mu-observable-collector`) uses `step-ca` mTLS or `MUOB` framing independently of the loopback HTTP API.
 
-### State model
+### State Model & Endpoints
 
-State is held as an immutable `Arc` snapshot. The snapshot is replaced by the orchestrator (deployment start, IT report, promotion, rollback, taint), by the lease coordinator (lease mirror every 1 s, plus expiry sweeps) and by agent IPC (`IntegrationTestProgress`, `MSG_TYPE_IT_PROGRESS = 0x0C`, forwarded by `IpcAgentClient::with_progress_sink`). Handlers only clone the `Arc`. Unknown agent message types are skipped without decoding the payload (`dispatch_agent_frame`).
+State is held as an immutable `Arc` snapshot updated by the orchestrator, lease coordinator, and agent `IntegrationTestProgress` frames (`MSG_TYPE_IT_PROGRESS = 0x0C`).
 
 **Gate state machine** (`verdict`):
 
@@ -121,14 +135,21 @@ State is held as an immutable `Arc` snapshot. The snapshot is replaced by the or
 - `promote` when every critical test is `passed`; if there are no critical tests, when every test is terminal.
 - `pending` otherwise, including an empty test list.
 
-The contract has no per-test criticality yet, so every contract test is critical (`[C]`). The agent announces its own flags.
+| Method & Route                                        | Policy Required                                                    | Purpose                                                                                   |
+| ----------------------------------------------------- | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| `GET /api/cd/runs?ecosystem=&repo=&limit=N`           | `cd:runs.read` (`cd:steps.read` for step details)                  | Lists ecosystem-agnostic CD staging/publish runs                                          |
+| `GET /api/cd/deployments?repo={owner}/{repo}&limit=N` | `ab:slots.read`                                                    | Lists newest A/B deployments first (history strip and active slot)                        |
+| `GET /api/cd/deployments/{id}/gate`                   | `ab:slots.read` (`ab:gate.logs.read` for unredacted `log_excerpt`) | Returns full `DeploymentGate` and per-test progress                                       |
+| `POST /api/cd/deployments/{id}/rollback`              | `ab:rollback`                                                      | Triggers emergency rollback of a deployment to `restore_slot`                             |
+| `GET /api/cd/leases`                                  | `ab:slots.read`                                                    | Lists active node deployment leases and remaining TTL                                     |
+| `GET /api/cd/events`                                  | `ab:slots.read`                                                    | Server-Sent Events (`it_progress`, `promoted`, `rolled_back`, `tainted`, `lease_expired`) |
+| `POST /api/cd/deploy`                                 | `cd:service.deploy`                                                | Triggers asynchronous or synchronous (`wait: true`) rollout from `mu-ci-controller`       |
 
 ### `GET /api/cd/deployments?repo={owner}/{repo}&limit=N`
 
-Returns the newest deployments first. This list is the history strip, and each entry's `active_slot` gives the current A/B slot on its target.
-
-- `repo` matches `owner/repo`, the bare repo name, or the service name. Omit it to get every repo.
-- `limit` defaults to 20 and is clamped to 1..=256.
+- `repo` matches `owner/repo`, bare repo name, or service name. `limit` defaults to 20 and clamps to `1..=256`.
+- `outcome`: `pending` | `promoted` | `rolled_back` | `tainted`.
+- `rollback_reason`: `critical_test_failed` | `lease_expired` | `manual` | `null`.
 
 ```json
 [
@@ -155,12 +176,9 @@ Returns the newest deployments first. This list is the history strip, and each e
 ]
 ```
 
-- `outcome`: `pending` | `promoted` | `rolled_back` | `tainted`.
-- `rollback_reason`: `critical_test_failed` | `lease_expired` | `manual` | `null`. Staging, swap, health and SLO verification failures map to `critical_test_failed`; the full text is in the gate's `rollback_detail`.
-
 ### `GET /api/cd/deployments/{id}/gate`
 
-Returns a `DeploymentGate`, or `404 {"error":"deployment_not_found"}`.
+Returns a `DeploymentGate` (`404 {"error":"deployment_not_found"}` when missing). `log_excerpt` is populated for failed tests when the caller holds `ab:gate.logs.read` and redacted otherwise.
 
 ```json
 {
@@ -190,12 +208,7 @@ Returns a `DeploymentGate`, or `404 {"error":"deployment_not_found"}`.
 }
 ```
 
-- `tests[]` follows contract order. With `integration_tests: "all"`, tests appear in the order the agent announces them in its `Pending` frames.
-- `state`: `pending` | `running` | `passed` | `failed`.
-- `log_excerpt` is filled for failed tests from the final `IntegrationTestReport`.
-- `lease_ttl_remaining_ms` is computed per request and is `0` once the gate is final.
-
-### `GET /api/cd/leases`
+### `GET /api/cd/leases` & `GET /api/cd/events` (SSE)
 
 ```json
 [
@@ -214,30 +227,17 @@ Returns a `DeploymentGate`, or `404 {"error":"deployment_not_found"}`.
 ]
 ```
 
-### `GET /api/cd/events` (SSE)
+`/api/cd/events` streams `text/event-stream` with `: heartbeat` every 15 s (lagged consumers > 1024 events disconnect to reconnect and resync):
 
-The stream is `text/event-stream`. It sends a `: heartbeat` comment every 15 s while idle. A consumer that falls more than 1024 events behind is disconnected so it reconnects and re-fetches the snapshot.
+| `event:`        | `data:`                                                                               |
+| --------------- | ------------------------------------------------------------------------------------- |
+| `it_progress`   | `{"deployment_id","test_name","critical","state","duration_ms","timestamp_epoch_ms"}` |
+| `promoted`      | `{"deployment_id","slot"}`                                                            |
+| `rolled_back`   | `{"deployment_id","restore_slot","reason","detail"}`                                  |
+| `tainted`       | `{"deployment_id","artifact_digest","reason"}`                                        |
+| `lease_expired` | `{"deployment_id","lease_id"}`                                                        |
 
-| `event:` | `data:` |
-|---|---|
-| `it_progress` | `{"deployment_id","test_name","critical","state","duration_ms","timestamp_epoch_ms"}` |
-| `promoted` | `{"deployment_id","slot"}` (the slot now serving traffic) |
-| `rolled_back` | `{"deployment_id","restore_slot","reason","detail"}` |
-| `tainted` | `{"deployment_id","artifact_digest","reason"}` |
-| `lease_expired` | `{"deployment_id","lease_id"}` |
-
-```text
-event: it_progress
-data: {"deployment_id":"dep-7f3c","test_name":"health_endpoint_ready","critical":true,"state":"failed","duration_ms":740,"timestamp_epoch_ms":1793563004321}
-
-event: rolled_back
-data: {"deployment_id":"dep-7f3c","restore_slot":"a","reason":"critical_test_failed","detail":"Integration tests failed: [\"health_endpoint_ready\"]"}
-
-event: tainted
-data: {"deployment_id":"dep-7f3c","artifact_digest":"sha256:4be1…","reason":"Integration tests failed: [\"health_endpoint_ready\"]"}
-```
-
----
+______________________________________________________________________
 
 ## License
 
