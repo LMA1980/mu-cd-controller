@@ -65,10 +65,32 @@ impl MuObserveCdSink {
 
     #[must_use]
     pub fn from_env() -> Self {
-        let addr = std::env::var("MUOBSERVE_COLLECTOR_ADDR")
-            .or_else(|_| std::env::var("MUOBSERVE_ADDR"))
-            .ok();
-        let node_id = std::env::var("MUCONDE_NODE_ID").unwrap_or_else(|_| "node-a".to_string());
+        Self::from_env_lookup(&|key| std::env::var(key).ok())
+    }
+
+    /// Pure parser constructing [`MuObserveCdSink`] via a caller-supplied environment lookup.
+    #[must_use]
+    pub fn from_env_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        let addr = crate::first_non_empty_var(
+            lookup,
+            &[
+                "MU_OBSERVABLE_COLLECTOR_ADDR",
+                "MU_CD_CONTROLLER_COLLECTOR_ADDR",
+                "MU_CD_COLLECTOR_ADDR",
+                "MUOBSERVE_COLLECTOR_ADDR",
+                "MU_OBSERVABLE_ADDR",
+                "MUOBSERVE_ADDR",
+            ],
+        );
+        let node_id = crate::first_non_empty_var(
+            lookup,
+            &[
+                "MU_CD_CONTROLLER_NODE_ID",
+                "MU_CD_NODE_ID",
+                "MUCONDE_NODE_ID",
+            ],
+        )
+        .unwrap_or_else(|| "node-a".to_string());
         Self::new(addr, node_id)
     }
 
@@ -240,5 +262,38 @@ pub fn build_cd_log(
         attributes_json: attributes.to_string(),
         job_id: None,
         stage_id: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_muobserve_cd_sink_env_precedence_and_legacy_fallback() {
+        let canonical = HashMap::from([
+            ("MU_OBSERVABLE_COLLECTOR_ADDR", "127.0.0.1:4319"),
+            ("MUOBSERVE_COLLECTOR_ADDR", "127.0.0.1:9999"),
+            ("MU_CD_CONTROLLER_NODE_ID", "node-b"),
+            ("MUCONDE_NODE_ID", "node-legacy"),
+        ]);
+        let sink = MuObserveCdSink::from_env_lookup(&|k| canonical.get(k).map(|v| (*v).into()));
+        assert_eq!(sink.collector_addr.as_deref(), Some("127.0.0.1:4319"));
+        assert_eq!(sink.node_id(), "node-b");
+
+        // Legacy collector addr beats generic MU_OBSERVABLE_ADDR
+        let mixed = HashMap::from([
+            ("MUOBSERVE_COLLECTOR_ADDR", "127.0.0.1:4320"),
+            ("MU_OBSERVABLE_ADDR", "observe.ci.internal:9445"),
+            ("MUCONDE_NODE_ID", "node-legacy"),
+        ]);
+        let sink_mixed = MuObserveCdSink::from_env_lookup(&|k| mixed.get(k).map(|v| (*v).into()));
+        assert_eq!(sink_mixed.collector_addr.as_deref(), Some("127.0.0.1:4320"));
+        assert_eq!(sink_mixed.node_id(), "node-legacy");
+
+        let default_sink = MuObserveCdSink::from_env_lookup(&|_| None);
+        assert!(default_sink.collector_addr.is_none());
+        assert_eq!(default_sink.node_id(), "node-a");
     }
 }

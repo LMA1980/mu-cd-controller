@@ -66,7 +66,8 @@ fn default_max_p99_latency_ms() -> f64 {
     DEFAULT_MAX_P99_LATENCY_MS
 }
 
-/// Declarative continuous delivery configuration loaded from `.muconde/MuConDe.yml`.
+/// Declarative continuous delivery configuration loaded from `.mucd/mu-cd.yml`
+/// (with legacy `.muconde/MuConDe.yml` fallback).
 /// Default number of historical read-only Btrfs snapshots retained per service.
 pub const DEFAULT_KEEP_SNAPSHOTS: usize = 5;
 

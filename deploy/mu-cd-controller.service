@@ -1,0 +1,30 @@
+[Unit]
+Description=MuCD Distributed Continuous Delivery Control Plane
+Documentation=https://github.com/LMA1980/mu-cd-controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mu-cd-controller
+Group=mu-cd-controller
+StateDirectory=mu-cd-controller
+WorkingDirectory=/var/lib/mu-cd-controller
+EnvironmentFile=/etc/mu-cd-controller/controller.env
+ExecStart=/usr/local/bin/mu-cd-controller
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+ReadWritePaths=/var/lib/mu-cd-controller
+InaccessiblePaths=/etc/shadow /root
+
+[Install]
+WantedBy=multi-user.target

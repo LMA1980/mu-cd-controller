@@ -1,6 +1,6 @@
-//! Daemon and CLI entry point for MuConDe-controller.
+//! `mu-cd-controller` daemon and CLI entry point.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,8 +8,10 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use mu_cd_controller::api::{spawn_cd_api_with_orchestrator, CdApiConfig};
+use mu_cd_controller::auth::load_secret_file;
 use mu_cd_controller::cd_state::CdStateStore;
 use mu_cd_controller::contract::MuConDeConfig;
+use mu_cd_controller::first_non_empty_var;
 use mu_cd_controller::lease::{
     ClusterIdlePoller, IdleBackoffConfig, LeaseCoordinator, DEFAULT_CONTROLLER_URL,
 };
@@ -20,6 +22,149 @@ use mu_cd_controller::orchestrator::{
 use mu_cd_controller::slo::MuObserveSloClient;
 use mu_cd_controller::telemetry::{CdTelemetrySink, MuObserveCdSink};
 use mu_cd_controller::tls::TlsConfig;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControllerEnvConfig {
+    controller_url: String,
+    regist_url: String,
+    agent_port: u16,
+    auth_token: Option<String>,
+    ca_path: Option<PathBuf>,
+    client_cert_path: Option<PathBuf>,
+    client_key_path: Option<PathBuf>,
+    muobserve_addr: Option<String>,
+    repo: Option<String>,
+}
+
+impl ControllerEnvConfig {
+    fn from_env_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        let controller_url = first_non_empty_var(
+            lookup,
+            &[
+                "MU_CD_CONTROLLER_CI_URL",
+                "MU_CD_CONTROLLER_URL",
+                "MU_CD_CI_CONTROLLER_URL",
+                "MU_CI_CONTROLLER_URL",
+                "MUCONDE_CONTROLLER_URL",
+            ],
+        )
+        .unwrap_or_else(|| DEFAULT_CONTROLLER_URL.to_string());
+
+        let regist_url = first_non_empty_var(
+            lookup,
+            &[
+                "MU_CD_CONTROLLER_REGISTRY_URL",
+                "MU_CD_REGISTRY_URL",
+                "MU_REGISTRY_URL",
+                "MUCONDE_REGISTRY_URL",
+                "MUREGIST_URL",
+            ],
+        )
+        .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string());
+
+        let agent_port = first_non_empty_var(
+            lookup,
+            &[
+                "MU_CD_CONTROLLER_AGENT_PORT",
+                "MU_CD_AGENT_PORT",
+                "MUCONDE_AGENT_PORT",
+            ],
+        )
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8446);
+
+        let auth_token = resolve_registry_token(lookup);
+
+        let ca_path = first_non_empty_var(
+            lookup,
+            &[
+                "MU_CD_CONTROLLER_TLS_CA_CERT",
+                "MU_CD_TLS_CA_CERT",
+                "MUCONDE_TLS_CA_CERT",
+                "TLS_CA_CERT",
+            ],
+        )
+        .map(PathBuf::from);
+        let client_cert_path = first_non_empty_var(
+            lookup,
+            &[
+                "MU_CD_CONTROLLER_TLS_CLIENT_CERT",
+                "MU_CD_TLS_CLIENT_CERT",
+                "MUCONDE_TLS_CLIENT_CERT",
+                "TLS_CLIENT_CERT",
+            ],
+        )
+        .map(PathBuf::from);
+        let client_key_path = first_non_empty_var(
+            lookup,
+            &[
+                "MU_CD_CONTROLLER_TLS_CLIENT_KEY",
+                "MU_CD_TLS_CLIENT_KEY",
+                "MUCONDE_TLS_CLIENT_KEY",
+                "TLS_CLIENT_KEY",
+            ],
+        )
+        .map(PathBuf::from);
+
+        let muobserve_addr = first_non_empty_var(
+            lookup,
+            &[
+                "MU_CD_CONTROLLER_OBSERVABLE_ADDR",
+                "MU_OBSERVABLE_HUB_ADDR",
+                "MU_OBSERVABLE_ADDR",
+                "MUOBSERVE_ADDR",
+            ],
+        );
+
+        let repo = first_non_empty_var(
+            lookup,
+            &["MU_CD_CONTROLLER_REPO", "MU_CD_REPO", "MUCONDE_REPO"],
+        );
+
+        Self {
+            controller_url,
+            regist_url,
+            agent_port,
+            auth_token,
+            ca_path,
+            client_cert_path,
+            client_key_path,
+            muobserve_addr,
+            repo,
+        }
+    }
+}
+
+fn resolve_registry_token(lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    if let Some(path) = first_non_empty_var(
+        lookup,
+        &[
+            "MU_CD_CONTROLLER_REGISTRY_TOKEN_FILE",
+            "MU_CD_REGISTRY_TOKEN_FILE",
+            "MU_REGISTRY_TOKEN_FILE",
+            "MUCONDE_REGISTRY_TOKEN_FILE",
+            "MUREGIST_TOKEN_FILE",
+        ],
+    ) {
+        return load_secret_file(Path::new(&path));
+    }
+    if let Some(raw) = first_non_empty_var(
+        lookup,
+        &[
+            "MU_CD_CONTROLLER_REGISTRY_TOKEN",
+            "MU_CD_REGISTRY_TOKEN",
+            "MU_REGISTRY_TOKEN",
+            "MUCONDE_REGISTRY_TOKEN",
+            "MUREGIST_TOKEN",
+        ],
+    ) {
+        if raw.starts_with('/') {
+            return load_secret_file(Path::new(&raw));
+        }
+        return Some(raw);
+    }
+    None
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,29 +179,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Starting mu-cd-controller CD control plane"
     );
 
-    let controller_url = std::env::var("MUCONDE_CONTROLLER_URL")
-        .unwrap_or_else(|_| DEFAULT_CONTROLLER_URL.to_string());
-    let regist_url =
-        std::env::var("MUREGIST_URL").unwrap_or_else(|_| DEFAULT_REGISTRY_URL.to_string());
-    let agent_port: u16 = std::env::var("MUCONDE_AGENT_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8446);
-    let auth_token = std::env::var("MUREGIST_TOKEN").ok();
-
-    let ca_path = std::env::var("TLS_CA_CERT").ok().map(PathBuf::from);
-    let client_cert_path = std::env::var("TLS_CLIENT_CERT").ok().map(PathBuf::from);
-    let client_key_path = std::env::var("TLS_CLIENT_KEY").ok().map(PathBuf::from);
+    let env_cfg = ControllerEnvConfig::from_env_lookup(&|key| std::env::var(key).ok());
 
     let tls_config = TlsConfig {
-        ca_cert_path: ca_path,
-        client_cert_path,
-        client_key_path,
+        ca_cert_path: env_cfg.ca_path,
+        client_cert_path: env_cfg.client_cert_path,
+        client_key_path: env_cfg.client_key_path,
         ..Default::default()
     };
 
     let coordinator = Arc::new(LeaseCoordinator::new());
-    let poller = match ClusterIdlePoller::new(&controller_url, &tls_config) {
+    let poller = match ClusterIdlePoller::new(&env_cfg.controller_url, &tls_config) {
         Ok(p) => Some(p),
         Err(e) => {
             error!(error = %e, "Failed to initialize cluster poller; proceeding with poller disabled");
@@ -65,16 +198,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let regist_client = Arc::new(HttpMuRegistClient::new(
-        &regist_url,
+        &env_cfg.regist_url,
         &tls_config,
-        auth_token,
+        env_cfg.auth_token,
     )?);
     // Read-only CD state shared by the orchestrator, lease watcher, agent IPC reader and the
     // optional `/api/cd/*` listener.
     let cd_state = Arc::new(CdStateStore::default());
 
     let agent_client = Arc::new(
-        IpcAgentClient::new(agent_port)
+        IpcAgentClient::new(env_cfg.agent_port)
             .with_progress_sink(cd_state.clone())
             .with_tls_config(tls_config.clone()),
     );
@@ -86,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_cd_state(cd_state.clone())
             .with_telemetry_sink(cd_sink);
 
-    if let Ok(muobserve_addr) = std::env::var("MUOBSERVE_ADDR") {
+    if let Some(muobserve_addr) = env_cfg.muobserve_addr {
         let slo_client = Arc::new(MuObserveSloClient::new(muobserve_addr, tls_config.clone()));
         orchestrator = orchestrator.with_slo_client(slo_client);
     }
@@ -127,7 +260,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Optional CD status & deploy API on a separate listener (disabled unless
-    // MUCONDE_CD_API_ADDR is set; bearer token from MUCONDE_CD_API_TOKEN_FILE).
+    // MU_CD_CONTROLLER_API_ADDR / MUCONDE_CD_API_ADDR is set; bearer token from
+    // MU_CD_CONTROLLER_API_TOKEN_FILE / MUCONDE_CD_API_TOKEN_FILE).
     let cd_api_config = CdApiConfig::from_env();
     let _cd_api = spawn_cd_api_with_orchestrator(
         &cd_api_config,
@@ -151,9 +285,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let config = MuConDeConfig::from_file(config_path)?;
-        let repo = std::env::var("MUCONDE_REPO").ok();
         let outcomes = orchestrator
-            .orchestrate_rollout_for_repo(&config, artifact_sha256, repo.as_deref())
+            .orchestrate_rollout_for_repo(&config, artifact_sha256, env_cfg.repo.as_deref())
             .await?;
 
         let mut any_rolled_back = false;
@@ -198,9 +331,130 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    info!("MuConDe-controller daemon running; waiting for shutdown signal");
+    info!("mu-cd-controller daemon running; waiting for shutdown signal");
     tokio::signal::ctrl_c().await?;
     info!("Received termination signal; shutting down");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_controller_env_config_precedence_and_legacy_fallback() {
+        let canonical = HashMap::from([
+            (
+                "MU_CD_CONTROLLER_CI_URL",
+                "https://ci.cluster.internal:8443",
+            ),
+            ("MUCONDE_CONTROLLER_URL", "https://legacy-ci.example:8443"),
+            (
+                "MU_CD_CONTROLLER_REGISTRY_URL",
+                "https://reg.cluster.internal:8444",
+            ),
+            ("MU_REGISTRY_URL", "https://mid-reg.example:8444"),
+            ("MUREGIST_URL", "https://legacy-reg.example:8444"),
+            ("MU_CD_CONTROLLER_AGENT_PORT", "9446"),
+            ("MUCONDE_AGENT_PORT", "8446"),
+            ("MU_REGISTRY_TOKEN", "reg-token-primary"),
+            ("MUREGIST_TOKEN", "reg-token-legacy"),
+            ("MU_CD_CONTROLLER_TLS_CA_CERT", "/etc/mu-cd/ca.crt"),
+            ("TLS_CA_CERT", "/etc/legacy/ca.crt"),
+            ("MU_CD_TLS_CLIENT_CERT", "/etc/mu-cd/client.crt"),
+            ("TLS_CLIENT_CERT", "/etc/legacy/client.crt"),
+            ("MU_CD_TLS_CLIENT_KEY", "/etc/mu-cd/client.key"),
+            ("TLS_CLIENT_KEY", "/etc/legacy/client.key"),
+            ("MU_OBSERVABLE_ADDR", "observe.cluster.internal:9445"),
+            ("MUOBSERVE_ADDR", "legacy-observe.example:9445"),
+            ("MU_CD_CONTROLLER_REPO", "LMA1980/mu-cd-controller"),
+            ("MUCONDE_REPO", "LMA1980/legacy"),
+        ]);
+        let cfg = ControllerEnvConfig::from_env_lookup(&|k| canonical.get(k).map(|v| (*v).into()));
+        assert_eq!(cfg.controller_url, "https://ci.cluster.internal:8443");
+        assert_eq!(cfg.regist_url, "https://reg.cluster.internal:8444");
+        assert_eq!(cfg.agent_port, 9446);
+        assert_eq!(cfg.auth_token.as_deref(), Some("reg-token-primary"));
+        assert_eq!(cfg.ca_path, Some(PathBuf::from("/etc/mu-cd/ca.crt")));
+        assert_eq!(
+            cfg.client_cert_path,
+            Some(PathBuf::from("/etc/mu-cd/client.crt"))
+        );
+        assert_eq!(
+            cfg.client_key_path,
+            Some(PathBuf::from("/etc/mu-cd/client.key"))
+        );
+        assert_eq!(
+            cfg.muobserve_addr.as_deref(),
+            Some("observe.cluster.internal:9445")
+        );
+        assert_eq!(cfg.repo.as_deref(), Some("LMA1980/mu-cd-controller"));
+
+        let legacy = HashMap::from([
+            ("MUCONDE_CONTROLLER_URL", "https://legacy-ci.example:8443"),
+            ("MUREGIST_URL", "https://legacy-reg.example:8444"),
+            ("MUCONDE_AGENT_PORT", "7446"),
+            ("MUREGIST_TOKEN", "legacy-tok"),
+            ("TLS_CA_CERT", "/etc/legacy/ca.crt"),
+            ("TLS_CLIENT_CERT", "/etc/legacy/client.crt"),
+            ("TLS_CLIENT_KEY", "/etc/legacy/client.key"),
+            ("MUOBSERVE_ADDR", "legacy-observe.example:9445"),
+            ("MUCONDE_REPO", "LMA1980/legacy"),
+        ]);
+        let cfg_legacy =
+            ControllerEnvConfig::from_env_lookup(&|k| legacy.get(k).map(|v| (*v).into()));
+        assert_eq!(cfg_legacy.controller_url, "https://legacy-ci.example:8443");
+        assert_eq!(cfg_legacy.regist_url, "https://legacy-reg.example:8444");
+        assert_eq!(cfg_legacy.agent_port, 7446);
+        assert_eq!(cfg_legacy.auth_token.as_deref(), Some("legacy-tok"));
+        assert_eq!(
+            cfg_legacy.ca_path,
+            Some(PathBuf::from("/etc/legacy/ca.crt"))
+        );
+        assert_eq!(
+            cfg_legacy.client_cert_path,
+            Some(PathBuf::from("/etc/legacy/client.crt"))
+        );
+        assert_eq!(
+            cfg_legacy.client_key_path,
+            Some(PathBuf::from("/etc/legacy/client.key"))
+        );
+        assert_eq!(
+            cfg_legacy.muobserve_addr.as_deref(),
+            Some("legacy-observe.example:9445")
+        );
+        assert_eq!(cfg_legacy.repo.as_deref(), Some("LMA1980/legacy"));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_controller_registry_token_file_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("reg_token");
+        std::fs::write(&tok, "  tok-from-file\n").unwrap();
+
+        let good = HashMap::from([(
+            "MU_CD_CONTROLLER_REGISTRY_TOKEN_FILE",
+            tok.to_str().unwrap().to_string(),
+        )]);
+        assert_eq!(
+            resolve_registry_token(&|k| good.get(k).cloned()).as_deref(),
+            Some("tok-from-file")
+        );
+
+        let missing = HashMap::from([(
+            "MU_REGISTRY_TOKEN_FILE",
+            "/nonexistent/mu-registry/token".to_string(),
+        )]);
+        assert_eq!(resolve_registry_token(&|k| missing.get(k).cloned()), None);
+
+        let missing_path_raw =
+            HashMap::from([("MUREGIST_TOKEN", "/nonexistent/muregist/token".to_string())]);
+        assert_eq!(
+            resolve_registry_token(&|k| missing_path_raw.get(k).cloned()),
+            None
+        );
+    }
 }

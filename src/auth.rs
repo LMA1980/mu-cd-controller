@@ -43,7 +43,8 @@ pub const ROLE_SUPER_OPERATOR: &str = SUPER_OPERATOR_ROLE_ID;
 const HEADER_PROXY_SECRET: &str = "x-proxy-secret";
 const HEADER_FORWARDED_USER: &str = "x-forwarded-user";
 
-/// Reads and trims a secret file (e.g. `MUCONDE_CD_API_TOKEN_FILE` or `MUCONDE_PROXY_SECRET_FILE`),
+/// Reads and trims a secret file (e.g. `MU_CD_CONTROLLER_API_TOKEN_FILE` /
+/// `MUCONDE_CD_API_TOKEN_FILE` or `MU_CD_CONTROLLER_PROXY_SECRET_FILE` / `MUCONDE_PROXY_SECRET_FILE`),
 /// failing closed (`None`) if the path does not exist, cannot be read, or trims to empty.
 #[must_use]
 pub fn load_secret_file(path: &Path) -> Option<String> {
@@ -442,9 +443,9 @@ impl CdAuthorizer {
             .remove(&login.trim().to_ascii_lowercase());
     }
 
-    /// Bootstraps configured operator GitHub logins (from `MUCONDE_OPERATOR_USERS`) with baseline
-    /// and elective gate-inspector read/step/gate-log folios while keeping `ab:rollback` gated
-    /// behind explicit timed elevation.
+    /// Bootstraps configured operator GitHub logins (from `MU_CD_CONTROLLER_OPERATOR_USERS` /
+    /// `MUCONDE_OPERATOR_USERS`) with baseline and elective gate-inspector read/step/gate-log folios
+    /// while keeping `ab:rollback` gated behind explicit timed elevation.
     #[must_use]
     pub fn with_operator_users<I, S>(self, logins: I, now_ms: u64) -> Self
     where
@@ -459,7 +460,7 @@ impl CdAuthorizer {
             let Some(valid_login) = validate_github_login(trimmed) else {
                 tracing::warn!(
                     login = trimmed,
-                    "Ignoring invalid GitHub login in MUCONDE_OPERATOR_USERS"
+                    "Ignoring invalid GitHub login in MU_CD_CONTROLLER_OPERATOR_USERS / MUCONDE_OPERATOR_USERS"
                 );
                 continue;
             };
@@ -480,7 +481,7 @@ impl CdAuthorizer {
                 tracing::warn!(
                     login = %valid_login,
                     error = %err,
-                    "Failed to bootstrap MUCONDE_OPERATOR_USERS operator binding"
+                    "Failed to bootstrap MU_CD_CONTROLLER_OPERATOR_USERS / MUCONDE_OPERATOR_USERS operator binding"
                 );
             }
         }
@@ -615,8 +616,8 @@ impl CdAuthorizer {
             });
         }
 
-        // Pure service-to-service caller (MUCONDE_CD_API_TOKEN_FILE) with no proxied user:
-        // permits read-only CD/A|B slots + automated CI->CD trigger, never gate logs or ab:rollback.
+        // Pure service-to-service caller (MU_CD_CONTROLLER_API_TOKEN_FILE / MUCONDE_CD_API_TOKEN_FILE)
+        // with no proxied user: permits read-only CD/A|B slots + automated CI->CD trigger, never gate logs or ab:rollback.
         if service_verified {
             let service_allowed = matches!(
                 required_policy,
