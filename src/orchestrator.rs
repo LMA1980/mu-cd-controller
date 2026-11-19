@@ -321,10 +321,26 @@ pub fn dispatch_agent_frame(
     }
 }
 
+/// Reads the node mapping string (`MU_CD_CONTROLLER_NODE_MAP` -> `MU_CD_NODE_MAP` ->
+/// `MUCONDE_NODE_MAP`) using a caller-supplied environment lookup.
+pub fn resolve_node_map(lookup: &dyn Fn(&str) -> Option<String>) -> String {
+    crate::first_non_empty_var(
+        lookup,
+        &[
+            "MU_CD_CONTROLLER_NODE_MAP",
+            "MU_CD_NODE_MAP",
+            "MUCONDE_NODE_MAP",
+        ],
+    )
+    .unwrap_or_default()
+}
+
 /// Resolves a logical target node identifier (e.g. `node-a`, `node-b`, `worker-riscv64`)
-/// using `MUCONDE_NODE_MAP` (`"node-a=host1,node-b=host2"`).
+/// using `MU_CD_CONTROLLER_NODE_MAP` / `MU_CD_NODE_MAP` / `MUCONDE_NODE_MAP`
+/// (`"node-a=host1,node-b=host2"`).
 pub fn resolve_target_node(logical: &str) -> String {
-    if let Ok(map_str) = std::env::var("MUCONDE_NODE_MAP") {
+    let map_str = resolve_node_map(&|key| std::env::var(key).ok());
+    if !map_str.is_empty() {
         resolve_target_node_from_map(logical, &map_str)
     } else {
         logical.trim().to_string()
@@ -359,7 +375,7 @@ pub fn resolve_target_nodes_from_map(nodes: &[String], map_str: &str) -> Vec<Str
 
 /// Resolves and deduplicates a list of logical target node names while preserving order.
 pub fn resolve_target_nodes(nodes: &[String]) -> Vec<String> {
-    let map_str = std::env::var("MUCONDE_NODE_MAP").unwrap_or_default();
+    let map_str = resolve_node_map(&|key| std::env::var(key).ok());
     resolve_target_nodes_from_map(nodes, &map_str)
 }
 
@@ -895,7 +911,7 @@ impl DeploymentOrchestrator {
     }
 
     fn resolve_node_candidates(target_nodes: &[String]) -> Vec<(String, String)> {
-        let map_str = std::env::var("MUCONDE_NODE_MAP").unwrap_or_default();
+        let map_str = resolve_node_map(&|key| std::env::var(key).ok());
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
         for raw in target_nodes.iter().take(64) {
@@ -3635,5 +3651,41 @@ mod tests {
             .expect("default TlsConfig falls back to plain TCP");
         assert!(plain_resp.staged_ok);
         plain_srv.await.unwrap();
+    }
+
+    #[test]
+    fn test_resolve_node_map_env_precedence_and_legacy_fallback() {
+        use std::collections::HashMap;
+
+        let canonical = HashMap::from([
+            (
+                "MU_CD_CONTROLLER_NODE_MAP",
+                "node-a=node-a.cluster.internal",
+            ),
+            ("MU_CD_NODE_MAP", "node-a=mid.cluster.internal"),
+            ("MUCONDE_NODE_MAP", "node-a=legacy.cluster.internal"),
+        ]);
+        let map = resolve_node_map(&|k| canonical.get(k).map(|v| (*v).into()));
+        assert_eq!(
+            resolve_target_node_from_map("node-a", &map),
+            "node-a.cluster.internal"
+        );
+
+        let mid = HashMap::from([
+            ("MU_CD_NODE_MAP", "node-a=mid.cluster.internal"),
+            ("MUCONDE_NODE_MAP", "node-a=legacy.cluster.internal"),
+        ]);
+        let map_mid = resolve_node_map(&|k| mid.get(k).map(|v| (*v).into()));
+        assert_eq!(
+            resolve_target_node_from_map("node-a", &map_mid),
+            "mid.cluster.internal"
+        );
+
+        let legacy = HashMap::from([("MUCONDE_NODE_MAP", "node-a=legacy.cluster.internal")]);
+        let map_legacy = resolve_node_map(&|k| legacy.get(k).map(|v| (*v).into()));
+        assert_eq!(
+            resolve_target_node_from_map("node-a", &map_legacy),
+            "legacy.cluster.internal"
+        );
     }
 }

@@ -57,23 +57,52 @@ impl Default for IdleBackoffConfig {
 }
 
 impl IdleBackoffConfig {
-    /// Builds [`IdleBackoffConfig`] from environment variables
-    /// (`MUCONDE_IDLE_WAIT_TIMEOUT_SECS`, `MUCONDE_IDLE_POLL_INITIAL_MS`,
-    /// `MUCONDE_IDLE_POLL_MAX_MS`, `MUCONDE_IDLE_JITTER_PERCENT`), falling back to defaults.
+    /// Builds [`IdleBackoffConfig`] from `MU_CD_CONTROLLER_IDLE_*` / `MU_CD_IDLE_*` environment
+    /// variables with fallback to legacy `MUCONDE_IDLE_*` / `MUCD_IDLE_*` names and defaults.
     #[must_use]
     pub fn from_env() -> Self {
-        let wait_secs = std::env::var("MUCONDE_IDLE_WAIT_TIMEOUT_SECS")
-            .or_else(|_| std::env::var("MUCD_IDLE_WAIT_TIMEOUT_SECS"))
-            .ok();
-        let initial_ms = std::env::var("MUCONDE_IDLE_POLL_INITIAL_MS")
-            .or_else(|_| std::env::var("MUCD_IDLE_POLL_INITIAL_MS"))
-            .ok();
-        let max_ms = std::env::var("MUCONDE_IDLE_POLL_MAX_MS")
-            .or_else(|_| std::env::var("MUCD_IDLE_POLL_MAX_MS"))
-            .ok();
-        let jitter_pct = std::env::var("MUCONDE_IDLE_JITTER_PERCENT")
-            .or_else(|_| std::env::var("MUCD_IDLE_JITTER_PERCENT"))
-            .ok();
+        Self::from_env_lookup(&|key| std::env::var(key).ok())
+    }
+
+    /// Pure parser constructing [`IdleBackoffConfig`] via a caller-supplied environment lookup.
+    #[must_use]
+    pub fn from_env_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        let wait_secs = crate::first_non_empty_var(
+            lookup,
+            &[
+                "MU_CD_CONTROLLER_IDLE_WAIT_TIMEOUT_SECS",
+                "MU_CD_IDLE_WAIT_TIMEOUT_SECS",
+                "MUCONDE_IDLE_WAIT_TIMEOUT_SECS",
+                "MUCD_IDLE_WAIT_TIMEOUT_SECS",
+            ],
+        );
+        let initial_ms = crate::first_non_empty_var(
+            lookup,
+            &[
+                "MU_CD_CONTROLLER_IDLE_POLL_INITIAL_MS",
+                "MU_CD_IDLE_POLL_INITIAL_MS",
+                "MUCONDE_IDLE_POLL_INITIAL_MS",
+                "MUCD_IDLE_POLL_INITIAL_MS",
+            ],
+        );
+        let max_ms = crate::first_non_empty_var(
+            lookup,
+            &[
+                "MU_CD_CONTROLLER_IDLE_POLL_MAX_MS",
+                "MU_CD_IDLE_POLL_MAX_MS",
+                "MUCONDE_IDLE_POLL_MAX_MS",
+                "MUCD_IDLE_POLL_MAX_MS",
+            ],
+        );
+        let jitter_pct = crate::first_non_empty_var(
+            lookup,
+            &[
+                "MU_CD_CONTROLLER_IDLE_JITTER_PERCENT",
+                "MU_CD_IDLE_JITTER_PERCENT",
+                "MUCONDE_IDLE_JITTER_PERCENT",
+                "MUCD_IDLE_JITTER_PERCENT",
+            ],
+        );
         Self::from_env_values(
             wait_secs.as_deref(),
             initial_ms.as_deref(),
@@ -846,5 +875,37 @@ mod tests {
         assert_eq!(clamped.wait_timeout, Duration::ZERO);
         assert_eq!(clamped.max_interval, Duration::from_millis(500));
         assert_eq!(clamped.jitter_percent, 100);
+    }
+
+    #[test]
+    fn test_idle_backoff_config_env_precedence_and_legacy_fallback() {
+        let canonical = HashMap::from([
+            ("MU_CD_CONTROLLER_IDLE_WAIT_TIMEOUT_SECS", "90"),
+            ("MUCONDE_IDLE_WAIT_TIMEOUT_SECS", "30"),
+            ("MU_CD_IDLE_POLL_INITIAL_MS", "250"),
+            ("MUCONDE_IDLE_POLL_INITIAL_MS", "500"),
+            ("MU_CD_CONTROLLER_IDLE_POLL_MAX_MS", "4000"),
+            ("MUCD_IDLE_POLL_MAX_MS", "9000"),
+            ("MU_CD_IDLE_JITTER_PERCENT", "15"),
+            ("MUCONDE_IDLE_JITTER_PERCENT", "25"),
+        ]);
+        let cfg = IdleBackoffConfig::from_env_lookup(&|k| canonical.get(k).map(|v| (*v).into()));
+        assert_eq!(cfg.wait_timeout, Duration::from_secs(90));
+        assert_eq!(cfg.initial_interval, Duration::from_millis(250));
+        assert_eq!(cfg.max_interval, Duration::from_millis(4000));
+        assert_eq!(cfg.jitter_percent, 15);
+
+        let legacy = HashMap::from([
+            ("MUCONDE_IDLE_WAIT_TIMEOUT_SECS", "60"),
+            ("MUCD_IDLE_POLL_INITIAL_MS", "300"),
+            ("MUCONDE_IDLE_POLL_MAX_MS", "2000"),
+            ("MUCD_IDLE_JITTER_PERCENT", "10"),
+        ]);
+        let cfg_legacy =
+            IdleBackoffConfig::from_env_lookup(&|k| legacy.get(k).map(|v| (*v).into()));
+        assert_eq!(cfg_legacy.wait_timeout, Duration::from_secs(60));
+        assert_eq!(cfg_legacy.initial_interval, Duration::from_millis(300));
+        assert_eq!(cfg_legacy.max_interval, Duration::from_millis(2000));
+        assert_eq!(cfg_legacy.jitter_percent, 10);
     }
 }

@@ -41,9 +41,10 @@ pub use lease::{
     DEFAULT_IDLE_POLL_MAX_MS, DEFAULT_IDLE_WAIT_TIMEOUT_SECS,
 };
 pub use orchestrator::{
-    dispatch_agent_frame, resolve_target_node, resolve_target_node_from_map, resolve_target_nodes,
-    resolve_target_nodes_from_map, AgentFrame, AgentIpcClient, DeploymentOrchestrator,
-    DeploymentOutcome, HttpMuRegistClient, IpcAgentClient, MuRegistClient, DEFAULT_REGISTRY_URL,
+    dispatch_agent_frame, resolve_node_map, resolve_target_node, resolve_target_node_from_map,
+    resolve_target_nodes, resolve_target_nodes_from_map, AgentFrame, AgentIpcClient,
+    DeploymentOrchestrator, DeploymentOutcome, HttpMuRegistClient, IpcAgentClient, MuRegistClient,
+    DEFAULT_REGISTRY_URL,
 };
 pub use slo::{
     CanarySloClient, MuObserveSloClient, DEFAULT_MUOBSERVE_ADDR, DEFAULT_MUOBSERVE_SERVER_NAME,
@@ -53,6 +54,27 @@ pub use telemetry::{
     CD_SERVICE_NAME,
 };
 pub use tls::TlsConfig;
+
+/// Returns the first non-empty trimmed value across `keys` using `lookup`.
+pub fn first_non_empty_var(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    keys: &[&str],
+) -> Option<String> {
+    for key in keys {
+        if let Some(val) = lookup(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Returns the first non-empty trimmed environment variable value across `keys`.
+pub fn first_non_empty_env(keys: &[&str]) -> Option<String> {
+    first_non_empty_var(&|key| std::env::var(key).ok(), keys)
+}
 
 /// Daemon version string.
 pub const CONTROLLER_VERSION: &str = env!("CARGO_PKG_VERSION");

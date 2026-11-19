@@ -1,12 +1,13 @@
 //! Continuous Delivery and A/B Gate HTTP API (`/api/cd/*`) guarded by `mu-auth` policy folios.
 //!
-//! Served by axum on a **separate listener**, disabled unless `MUCONDE_CD_API_ADDR` is set.
+//! Served by axum on a **separate listener**, disabled unless `MU_CD_CONTROLLER_API_ADDR` (or
+//! `MUCONDE_CD_API_ADDR`) is set.
 //! Interactive operator sessions authenticate through the edge reverse proxy (`X-Proxy-Secret` and
 //! `X-Forwarded-User`) and are evaluated against `mu-auth` policy folios (`cd:runs.read`,
 //! `cd:steps.read`, `ab:slots.read`, `ab:gate.logs.read`, and `ab:rollback`, with zero manual
-//! `ab:promote` endpoint). Service-to-service callers use `MUCONDE_CD_API_TOKEN_FILE` strictly for
-//! service-scoped reads and CI-to-CD triggers, failing closed (`401`/`403`) whenever credentials
-//! or required policy folios are missing.
+//! `ab:promote` endpoint). Service-to-service callers use `MU_CD_CONTROLLER_API_TOKEN_FILE` (or
+//! `MUCONDE_CD_API_TOKEN_FILE`) strictly for service-scoped reads and CI-to-CD triggers, failing
+//! closed (`401`/`403`) whenever credentials or required policy folios are missing.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -55,36 +56,62 @@ pub struct CdApiConfig {
     /// File containing the shared edge proxy secret (`X-Proxy-Secret`).
     pub proxy_secret_file: Option<PathBuf>,
     /// GitHub logins bootstrapped with baseline CD/A|B read + gate-inspector folios
-    /// (`MUCONDE_OPERATOR_USERS`, comma-separated).
+    /// (`MU_CD_CONTROLLER_OPERATOR_USERS` / `MUCONDE_OPERATOR_USERS`, comma-separated).
     pub operator_users: Vec<String>,
 }
 
 impl CdApiConfig {
-    /// Reads `MUCONDE_CD_API_ADDR`, `MUCONDE_CD_API_TOKEN_FILE`, `MUCONDE_PROXY_SECRET_FILE`,
-    /// and `MUCONDE_OPERATOR_USERS`.
+    /// Reads `MU_CD_CONTROLLER_*` / `MU_CD_*` environment variables with fallback to legacy
+    /// `MUCONDE_*` names.
     pub fn from_env() -> Self {
-        let operator_users = std::env::var("MUCONDE_OPERATOR_USERS")
-            .ok()
-            .map(|raw| {
-                raw.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        Self::from_env_lookup(&|key| std::env::var(key).ok())
+    }
+
+    /// Pure parser reading CD API configuration via a caller-supplied environment lookup.
+    pub fn from_env_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        let operator_users = crate::first_non_empty_var(
+            lookup,
+            &[
+                "MU_CD_CONTROLLER_OPERATOR_USERS",
+                "MU_CD_OPERATOR_USERS",
+                "MUCONDE_OPERATOR_USERS",
+            ],
+        )
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
         Self {
-            bind_addr: std::env::var("MUCONDE_CD_API_ADDR")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
-            token_file: std::env::var("MUCONDE_CD_API_TOKEN_FILE")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .map(PathBuf::from),
-            proxy_secret_file: std::env::var("MUCONDE_PROXY_SECRET_FILE")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .map(PathBuf::from),
+            bind_addr: crate::first_non_empty_var(
+                lookup,
+                &[
+                    "MU_CD_CONTROLLER_API_ADDR",
+                    "MU_CD_API_ADDR",
+                    "MUCONDE_CD_API_ADDR",
+                ],
+            ),
+            token_file: crate::first_non_empty_var(
+                lookup,
+                &[
+                    "MU_CD_CONTROLLER_API_TOKEN_FILE",
+                    "MU_CD_API_TOKEN_FILE",
+                    "MUCONDE_CD_API_TOKEN_FILE",
+                ],
+            )
+            .map(PathBuf::from),
+            proxy_secret_file: crate::first_non_empty_var(
+                lookup,
+                &[
+                    "MU_CD_CONTROLLER_PROXY_SECRET_FILE",
+                    "MU_CD_PROXY_SECRET_FILE",
+                    "MUCONDE_PROXY_SECRET_FILE",
+                ],
+            )
+            .map(PathBuf::from),
             operator_users,
         }
     }
@@ -153,8 +180,8 @@ impl CdApiState {
         self
     }
 
-    /// Bootstraps configured operator logins (e.g. from `MUCONDE_OPERATOR_USERS`) on the
-    /// underlying [`CdAuthorizer`].
+    /// Bootstraps configured operator logins (e.g. from `MU_CD_CONTROLLER_OPERATOR_USERS` or
+    /// `MUCONDE_OPERATOR_USERS`) on the underlying [`CdAuthorizer`].
     #[must_use]
     pub fn with_operator_users<I, S>(mut self, logins: I) -> Self
     where
@@ -236,7 +263,7 @@ pub struct DeploymentGate {
     pub tainted: bool,
     pub started_epoch_ms: u64,
     pub finished_epoch_ms: Option<u64>,
-    /// Contract order (`.muconde/MuConDe.yml` -> `integration_tests`, `"all"` expanded by the agent).
+    /// Contract order (`.mucd/mu-cd.yml` / legacy `.muconde/MuConDe.yml` -> `integration_tests`, `"all"` expanded by the agent).
     pub tests: Vec<GateTestView>,
 }
 
@@ -770,7 +797,7 @@ pub async fn spawn_cd_api_with_orchestrator(
         Some(p) => load_token_file(p),
         None => {
             tracing::error!(
-                "MUCONDE_CD_API_TOKEN_FILE not set; /api/cd/* will reject all requests"
+                "MU_CD_CONTROLLER_API_TOKEN_FILE / MUCONDE_CD_API_TOKEN_FILE not set; /api/cd/* will reject all requests"
             );
             None
         }
@@ -792,7 +819,7 @@ pub async fn spawn_cd_api_with_orchestrator(
             tracing::error!(error = %e, "CD API listener stopped");
         }
     });
-    tracing::info!(addr = %local, "MuConDe CD API listening (mu-auth folio + bearer auth)");
+    tracing::info!(addr = %local, "mu-cd-controller CD API listening (mu-auth folio + bearer auth)");
     Ok(Some((local, handle)))
 }
 
@@ -826,5 +853,54 @@ mod tests {
         assert!(c.token_file.is_none());
         assert!(c.proxy_secret_file.is_none());
         assert!(c.operator_users.is_empty());
+    }
+
+    #[test]
+    fn test_cd_api_config_env_precedence_and_legacy_fallback() {
+        use std::collections::HashMap;
+
+        let canonical = HashMap::from([
+            ("MU_CD_CONTROLLER_API_ADDR", "127.0.0.1:9447"),
+            ("MU_CD_API_ADDR", "127.0.0.1:8448"),
+            ("MUCONDE_CD_API_ADDR", "127.0.0.1:8447"),
+            (
+                "MU_CD_CONTROLLER_API_TOKEN_FILE",
+                "/etc/mu-cd-controller/api.token",
+            ),
+            ("MUCONDE_CD_API_TOKEN_FILE", "/etc/muconde/api.token"),
+            ("MU_CD_PROXY_SECRET_FILE", "/etc/mu-cd/proxy.secret"),
+            ("MUCONDE_PROXY_SECRET_FILE", "/etc/muconde/proxy.secret"),
+            ("MU_CD_CONTROLLER_OPERATOR_USERS", "alice, bob"),
+            ("MUCONDE_OPERATOR_USERS", "legacy"),
+        ]);
+        let cfg = CdApiConfig::from_env_lookup(&|k| canonical.get(k).map(|v| (*v).to_string()));
+        assert_eq!(cfg.bind_addr.as_deref(), Some("127.0.0.1:9447"));
+        assert_eq!(
+            cfg.token_file,
+            Some(PathBuf::from("/etc/mu-cd-controller/api.token"))
+        );
+        assert_eq!(
+            cfg.proxy_secret_file,
+            Some(PathBuf::from("/etc/mu-cd/proxy.secret"))
+        );
+        assert_eq!(cfg.operator_users, vec!["alice", "bob"]);
+
+        let legacy = HashMap::from([
+            ("MUCONDE_CD_API_ADDR", "127.0.0.1:8447"),
+            ("MUCONDE_CD_API_TOKEN_FILE", "/etc/muconde/api.token"),
+            ("MUCONDE_PROXY_SECRET_FILE", "/etc/muconde/proxy.secret"),
+            ("MUCONDE_OPERATOR_USERS", "carol"),
+        ]);
+        let cfg_legacy = CdApiConfig::from_env_lookup(&|k| legacy.get(k).map(|v| (*v).to_string()));
+        assert_eq!(cfg_legacy.bind_addr.as_deref(), Some("127.0.0.1:8447"));
+        assert_eq!(
+            cfg_legacy.token_file,
+            Some(PathBuf::from("/etc/muconde/api.token"))
+        );
+        assert_eq!(
+            cfg_legacy.proxy_secret_file,
+            Some(PathBuf::from("/etc/muconde/proxy.secret"))
+        );
+        assert_eq!(cfg_legacy.operator_users, vec!["carol"]);
     }
 }
