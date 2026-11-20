@@ -758,9 +758,21 @@ async fn post_deploy(
     }
 }
 
-/// Builds the `/api/cd/*` router; every route sits behind the bearer-token gate.
+async fn get_health() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({
+            "status": "ok",
+            "service": "mu-cd-controller",
+        })),
+    )
+}
+
+/// Builds the `/api/cd/*` router; every `/api/cd/*` route sits behind the bearer-token gate.
 pub fn router(state: CdApiState) -> Router {
     Router::new()
+        .route("/health", get(get_health))
         .route("/api/cd/runs", get(get_cd_runs))
         .route("/api/cd/deployments", get(get_deployments))
         .route("/api/cd/deployments/{id}/gate", get(get_gate))
