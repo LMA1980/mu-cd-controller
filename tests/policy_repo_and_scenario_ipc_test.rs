@@ -971,6 +971,361 @@ async fn test_wire_scenario_plan_transmission_v0_3_and_v0_2_compat_and_fail_clos
     );
 }
 
+fn run_git_isolated(repo_dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["-C", repo_dir.to_str().unwrap()])
+        .args(args)
+        .output()
+        .expect("spawn isolated git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[tokio::test]
+async fn test_two_parent_merge_ssh_verification_and_fail_closed_cases() {
+    use mu_cd_controller::error::PolicyRepoError;
+
+    // Case 1: Clean 2-parent PR merge (gh pr merge --merge style) where P1 is ancestor of
+    // SSH-signed P2 and HEAD^{tree} == P2^{tree} -> PASS (even if P1 itself was unsigned).
+    let fixture_clean =
+        TestPolicyFixture::create("node-a.cluster.internal", "worker-riscv64.cluster.internal");
+    let nodes_yaml =
+        sample_nodes_yaml("node-a.cluster.internal", "worker-riscv64.cluster.internal");
+    // Simulate a prior unsigned base commit on main (e.g. a legacy squash commit) as P1.
+    let p1_yaml =
+        sample_service_yaml().replace("bake_window_seconds: 60", "bake_window_seconds: 65");
+    fixture_clean.commit_files(&nodes_yaml, &p1_yaml, false, "prior base commit P1");
+    let sink_clean = Arc::new(RecordingCdTelemetrySink::new());
+    let repo_clean = fixture_clean.policy_repo(sink_clean);
+    assert!(
+        matches!(
+            repo_clean.refresh_and_verify().await,
+            Err(PolicyRepoError::Unverified(_))
+        ),
+        "single-parent unsigned P1 must fail closed before clean merge"
+    );
+
+    // Branch from P1, add SSH-signed P2, merge into main with --no-ff (unsigned 2-parent merge).
+    run_git_isolated(
+        &fixture_clean.repo_dir,
+        &["checkout", "-b", "feat/pr-merge"],
+    );
+    let p2_yaml =
+        sample_service_yaml().replace("bake_window_seconds: 60", "bake_window_seconds: 75");
+    fixture_clean.commit_files(&nodes_yaml, &p2_yaml, true, "signed PR commit P2");
+    run_git_isolated(&fixture_clean.repo_dir, &["checkout", "main"]);
+    run_git_isolated(
+        &fixture_clean.repo_dir,
+        &[
+            "merge",
+            "--no-ff",
+            "-m",
+            "Merge pull request #12",
+            "feat/pr-merge",
+        ],
+    );
+
+    let verified_summary = repo_clean
+        .refresh_and_verify()
+        .await
+        .expect("clean 2-parent tree-equivalent merge of SSH-signed P2 must PASS");
+    let snap = repo_clean
+        .pin_deployment_snapshot(
+            "dep-merge-ok",
+            "example-service",
+            Some(&"a".repeat(64)),
+            None,
+        )
+        .await
+        .expect("pin verified snapshot");
+    assert_eq!(snap.policy_commit_sha, verified_summary.policy_commit_sha);
+    assert_eq!(snap.service_contract.bake_window_seconds, 75);
+
+    // Case 1b: GitHub `gh pr merge --merge` style 2-parent merge commit carrying a PGP signature
+    // header (`web-flow`) with P1 ancestor of SSH-signed P2 and HEAD^{tree} == P2^{tree} ->
+    // direct SSH check rejects the PGP header, then step-2 fallback verifies P2's SSH signature.
+    let p1_sha = run_git_isolated(&fixture_clean.repo_dir, &["rev-parse", "HEAD^1"]);
+    let p2_sha = run_git_isolated(&fixture_clean.repo_dir, &["rev-parse", "HEAD^2"]);
+    let p2_tree = run_git_isolated(&fixture_clean.repo_dir, &["rev-parse", "HEAD^2^{tree}"]);
+    let gh_merge_raw = format!(
+        "tree {p2_tree}\nparent {p1_sha}\nparent {p2_sha}\nauthor GitHub <noreply@github.com> 1795330000 +0000\ncommitter GitHub <noreply@github.com> 1795330000 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n iQIzBAABCAAdFiEEsyntheticGitHubWebFlowMergeSig==\n -----END PGP SIGNATURE-----\n\nMerge pull request #12 from org/feat/pr-merge\n"
+    );
+    let mut gh_merge_child = std::process::Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args([
+            "-C",
+            fixture_clean.repo_dir.to_str().unwrap(),
+            "hash-object",
+            "-t",
+            "commit",
+            "-w",
+            "--stdin",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn git hash-object");
+    {
+        use std::io::Write;
+        gh_merge_child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(gh_merge_raw.as_bytes())
+            .unwrap();
+    }
+    let gh_merge_out = gh_merge_child.wait_with_output().unwrap();
+    assert!(gh_merge_out.status.success());
+    let gh_merge_sha = String::from_utf8_lossy(&gh_merge_out.stdout)
+        .trim()
+        .to_string();
+    run_git_isolated(
+        &fixture_clean.repo_dir,
+        &["update-ref", "refs/heads/main", &gh_merge_sha],
+    );
+    let gh_verified = repo_clean
+        .refresh_and_verify()
+        .await
+        .expect("PGP-armored 2-parent merge commit with tree-equivalent SSH-signed P2 must PASS");
+    assert_eq!(gh_verified.policy_commit_sha, gh_merge_sha);
+
+    // Case 2: Tampered 2-parent merge (HEAD^{tree} != P2^{tree}) -> FAIL CLOSED (503).
+    let fixture_tamper =
+        TestPolicyFixture::create("node-a.cluster.internal", "worker-riscv64.cluster.internal");
+    run_git_isolated(&fixture_tamper.repo_dir, &["checkout", "-b", "feat/tamper"]);
+    let signed_yaml =
+        sample_service_yaml().replace("bake_window_seconds: 60", "bake_window_seconds: 80");
+    fixture_tamper.commit_files(&nodes_yaml, &signed_yaml, true, "signed P2 before tamper");
+    run_git_isolated(&fixture_tamper.repo_dir, &["checkout", "main"]);
+    run_git_isolated(
+        &fixture_tamper.repo_dir,
+        &["merge", "--no-ff", "--no-commit", "feat/tamper"],
+    );
+    let tampered_yaml =
+        sample_service_yaml().replace("bake_window_seconds: 60", "bake_window_seconds: 999");
+    std::fs::write(
+        fixture_tamper
+            .repo_dir
+            .join("contracts/services/example-service.yml"),
+        &tampered_yaml,
+    )
+    .unwrap();
+    run_git_isolated(&fixture_tamper.repo_dir, &["add", "."]);
+    run_git_isolated(
+        &fixture_tamper.repo_dir,
+        &["commit", "-m", "tampered 2-parent merge"],
+    );
+    let repo_tamper = fixture_tamper.policy_repo(Arc::new(RecordingCdTelemetrySink::new()));
+    let tamper_err = repo_tamper.refresh_and_verify().await.unwrap_err();
+    assert!(
+        matches!(tamper_err, PolicyRepoError::Unverified(ref msg) if msg.contains("tree")),
+        "tampered 2-parent merge must fail closed on tree mismatch, got: {tamper_err}"
+    );
+
+    // Case 3a: Clean 2-parent merge whose P2 is unsigned -> FAIL CLOSED.
+    let fixture_unsigned_p2 =
+        TestPolicyFixture::create("node-a.cluster.internal", "worker-riscv64.cluster.internal");
+    run_git_isolated(
+        &fixture_unsigned_p2.repo_dir,
+        &["checkout", "-b", "feat/unsigned-p2"],
+    );
+    let unsigned_p2_yaml =
+        sample_service_yaml().replace("bake_window_seconds: 60", "bake_window_seconds: 85");
+    fixture_unsigned_p2.commit_files(&nodes_yaml, &unsigned_p2_yaml, false, "unsigned P2");
+    run_git_isolated(&fixture_unsigned_p2.repo_dir, &["checkout", "main"]);
+    run_git_isolated(
+        &fixture_unsigned_p2.repo_dir,
+        &[
+            "merge",
+            "--no-ff",
+            "-m",
+            "merge unsigned P2",
+            "feat/unsigned-p2",
+        ],
+    );
+    let repo_unsigned_p2 =
+        fixture_unsigned_p2.policy_repo(Arc::new(RecordingCdTelemetrySink::new()));
+    assert!(
+        matches!(
+            repo_unsigned_p2.refresh_and_verify().await,
+            Err(PolicyRepoError::Unverified(_))
+        ),
+        "2-parent merge with unsigned P2 must fail closed"
+    );
+
+    // Case 3b: Non-ancestor P2 (main diverged with another commit P1' before merge) -> FAIL CLOSED.
+    let fixture_diverged =
+        TestPolicyFixture::create("node-a.cluster.internal", "worker-riscv64.cluster.internal");
+    run_git_isolated(
+        &fixture_diverged.repo_dir,
+        &["checkout", "-b", "feat/diverged-p2"],
+    );
+    let diverged_p2_yaml =
+        sample_service_yaml().replace("bake_window_seconds: 60", "bake_window_seconds: 90");
+    fixture_diverged.commit_files(&nodes_yaml, &diverged_p2_yaml, true, "signed diverged P2");
+    run_git_isolated(&fixture_diverged.repo_dir, &["checkout", "main"]);
+    let main_diverge_yaml =
+        sample_service_yaml().replace("bake_window_seconds: 60", "bake_window_seconds: 95");
+    fixture_diverged.commit_files(&nodes_yaml, &main_diverge_yaml, true, "main advanced P1'");
+    // Force merge commit to match P2's tree via -X theirs so only ancestry distinguishes it.
+    run_git_isolated(
+        &fixture_diverged.repo_dir,
+        &[
+            "merge",
+            "--no-ff",
+            "-X",
+            "theirs",
+            "-m",
+            "merge non-ancestor P2",
+            "feat/diverged-p2",
+        ],
+    );
+    let repo_diverged = fixture_diverged.policy_repo(Arc::new(RecordingCdTelemetrySink::new()));
+    let diverged_err = repo_diverged.refresh_and_verify().await.unwrap_err();
+    assert!(
+        matches!(diverged_err, PolicyRepoError::Unverified(ref msg) if msg.contains("ancestor")),
+        "2-parent merge where P1 is not ancestor of P2 must fail closed, got: {diverged_err}"
+    );
+
+    // Case 3c: 3-parent octopus merge -> FAIL CLOSED (>2 parents).
+    let fixture_octopus =
+        TestPolicyFixture::create("node-a.cluster.internal", "worker-riscv64.cluster.internal");
+    run_git_isolated(&fixture_octopus.repo_dir, &["checkout", "-b", "feat/oct-1"]);
+    std::fs::write(fixture_octopus.repo_dir.join("NOTE_A.txt"), "branch a\n").unwrap();
+    run_git_isolated(&fixture_octopus.repo_dir, &["add", "NOTE_A.txt"]);
+    run_git_isolated(
+        &fixture_octopus.repo_dir,
+        &[
+            "-c",
+            "gpg.format=ssh",
+            "-c",
+            &format!("user.signingkey={}", fixture_octopus.signing_key.display()),
+            "commit",
+            "-S",
+            "-m",
+            "signed oct branch 1",
+        ],
+    );
+    run_git_isolated(&fixture_octopus.repo_dir, &["checkout", "main"]);
+    run_git_isolated(&fixture_octopus.repo_dir, &["checkout", "-b", "feat/oct-2"]);
+    std::fs::write(fixture_octopus.repo_dir.join("NOTE_B.txt"), "branch b\n").unwrap();
+    run_git_isolated(&fixture_octopus.repo_dir, &["add", "NOTE_B.txt"]);
+    run_git_isolated(
+        &fixture_octopus.repo_dir,
+        &[
+            "-c",
+            "gpg.format=ssh",
+            "-c",
+            &format!("user.signingkey={}", fixture_octopus.signing_key.display()),
+            "commit",
+            "-S",
+            "-m",
+            "signed oct branch 2",
+        ],
+    );
+    run_git_isolated(&fixture_octopus.repo_dir, &["checkout", "main"]);
+    run_git_isolated(
+        &fixture_octopus.repo_dir,
+        &[
+            "merge",
+            "--no-ff",
+            "-m",
+            "octopus 3-parent merge",
+            "feat/oct-1",
+            "feat/oct-2",
+        ],
+    );
+    let repo_octopus = fixture_octopus.policy_repo(Arc::new(RecordingCdTelemetrySink::new()));
+    let oct_err = repo_octopus.refresh_and_verify().await.unwrap_err();
+    assert!(
+        matches!(oct_err, PolicyRepoError::Unverified(ref msg) if msg.contains("3 parent")),
+        "3-parent octopus merge must fail closed, got: {oct_err}"
+    );
+
+    // Case 4: Single-parent PGP-only commit (simulating GitHub web-flow squash signature)
+    // fails closed with HTTP 503 deploy_repo_unverified.
+    let fixture_pgp =
+        TestPolicyFixture::create("node-a.cluster.internal", "worker-riscv64.cluster.internal");
+    let tree_sha = run_git_isolated(&fixture_pgp.repo_dir, &["rev-parse", "HEAD^{tree}"]);
+    let parent_sha = run_git_isolated(&fixture_pgp.repo_dir, &["rev-parse", "HEAD"]);
+    let pgp_commit_raw = format!(
+        "tree {tree_sha}\nparent {parent_sha}\nauthor GitHub <noreply@github.com> 1795330000 +0000\ncommitter GitHub <noreply@github.com> 1795330000 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n iQIzBAABCAAdFiEEsyntheticPGPsignaturePayloadOnly==\n -----END PGP SIGNATURE-----\n\nsynthetic pgp-only squash commit\n"
+    );
+    let mut hash_child = std::process::Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args([
+            "-C",
+            fixture_pgp.repo_dir.to_str().unwrap(),
+            "hash-object",
+            "-t",
+            "commit",
+            "-w",
+            "--stdin",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn git hash-object");
+    {
+        use std::io::Write;
+        hash_child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(pgp_commit_raw.as_bytes())
+            .unwrap();
+    }
+    let hash_out = hash_child.wait_with_output().unwrap();
+    assert!(hash_out.status.success());
+    let pgp_sha = String::from_utf8_lossy(&hash_out.stdout).trim().to_string();
+    run_git_isolated(
+        &fixture_pgp.repo_dir,
+        &["update-ref", "refs/heads/main", &pgp_sha],
+    );
+
+    let sink_pgp = Arc::new(RecordingCdTelemetrySink::new());
+    let repo_pgp = fixture_pgp.policy_repo(sink_pgp);
+    let store = Arc::new(CdStateStore::default());
+    let orch = Arc::new(
+        DeploymentOrchestrator::new(
+            Arc::new(LeaseCoordinator::new()),
+            None,
+            Arc::new(RecordingAgent::default()),
+            Arc::new(RecordingRegist::default()),
+        )
+        .with_cd_state(store.clone())
+        .with_policy_repo(repo_pgp.clone()),
+    );
+    let app = router(
+        CdApiState::new(store, Some(API_TOKEN.into()))
+            .with_orchestrator(orch)
+            .with_policy_repo(repo_pgp),
+    );
+    let (status, json) = post_api(
+        app,
+        "/api/cd/deploy",
+        &serde_json::json!({
+            "service": "example-service",
+            "git_commit": "a".repeat(40),
+            "binary_digest": "1".repeat(64),
+            "it_archive_digest": "2".repeat(64)
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json["error"], "deploy_repo_unverified");
+}
+
 #[test]
 fn test_privacy_fixture_helper_clean_path_check() {
     assert!(!Path::new("/etc/mu-cd-canary/tls/ca.crt")

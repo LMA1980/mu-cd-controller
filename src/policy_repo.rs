@@ -2014,11 +2014,59 @@ pub fn validate_allowed_signers_file(path: &Path) -> Result<(), PolicyRepoError>
     Ok(())
 }
 
-async fn verify_git_ssh_commit_signature(
+/// Verifies that the raw commit object header contains an SSH signature armor block
+/// (`gpgsig -----BEGIN SSH SIGNATURE-----`) strictly before the commit message separator,
+/// preventing PGP/GPG signatures from satisfying SSH-only policy verification.
+async fn assert_commit_has_ssh_gpgsig_header(
+    repo_dir: &Path,
+    commit_sha: &str,
+) -> Result<(), PolicyRepoError> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["cat-file", "-p", commit_sha])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .await
+        .map_err(|e| {
+            PolicyRepoError::Unverified(format!(
+                "failed spawning git cat-file for {commit_sha}: {e}"
+            ))
+        })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(PolicyRepoError::Unverified(format!(
+            "git cat-file -p {commit_sha} failed: {}",
+            stderr.trim()
+        )));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let header_block = raw.split("\n\n").next().unwrap_or("");
+    let gpgsig_headers: Vec<&str> = header_block
+        .lines()
+        .filter(|line| line.starts_with("gpgsig"))
+        .collect();
+    let has_only_ssh_sig = gpgsig_headers.len() == 1
+        && gpgsig_headers[0].starts_with("gpgsig -----BEGIN SSH SIGNATURE-----");
+    if !has_only_ssh_sig {
+        return Err(PolicyRepoError::Unverified(format!(
+            "commit {commit_sha} does not carry a single SSH signature header (strict SSH-only policy)"
+        )));
+    }
+    Ok(())
+}
+
+/// Verifies a single commit's direct SSH signature against `allowed_signers` in complete
+/// isolation from host/user Git configuration.
+async fn verify_single_commit_ssh_signature(
     repo_dir: &Path,
     commit_sha: &str,
     allowed_signers: &Path,
 ) -> Result<(), PolicyRepoError> {
+    assert_commit_has_ssh_gpgsig_header(repo_dir, commit_sha).await?;
+
     let signers_opt = format!("gpg.ssh.allowedSignersFile={}", allowed_signers.display());
 
     let verify_out = Command::new("git")
@@ -2085,6 +2133,161 @@ async fn verify_git_ssh_commit_signature(
             "commit {commit_sha} signature status is '{status_code}', expected 'G'"
         )));
     }
+
+    Ok(())
+}
+
+async fn git_commit_parents(
+    repo_dir: &Path,
+    commit_sha: &str,
+) -> Result<Vec<String>, PolicyRepoError> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["rev-list", "--parents", "-n", "1", commit_sha])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .await
+        .map_err(|e| {
+            PolicyRepoError::Unverified(format!(
+                "failed spawning git rev-list --parents for {commit_sha}: {e}"
+            ))
+        })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(PolicyRepoError::Unverified(format!(
+            "git rev-list --parents failed for {commit_sha}: {}",
+            stderr.trim()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut tokens = stdout.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return Err(PolicyRepoError::Unverified(format!(
+            "empty rev-list output for {commit_sha}"
+        )));
+    };
+    if first != commit_sha {
+        return Err(PolicyRepoError::Unverified(format!(
+            "rev-list commit mismatch: expected {commit_sha}, got {first}"
+        )));
+    }
+    Ok(tokens.map(ToOwned::to_owned).collect())
+}
+
+async fn git_is_ancestor(
+    repo_dir: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, PolicyRepoError> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .status()
+        .await
+        .map_err(|e| {
+            PolicyRepoError::Unverified(format!(
+                "failed spawning git merge-base --is-ancestor: {e}"
+            ))
+        })?;
+    Ok(status.success())
+}
+
+async fn git_tree_oid(repo_dir: &Path, commit_sha: &str) -> Result<String, PolicyRepoError> {
+    let tree_spec = format!("{commit_sha}^{{tree}}");
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["rev-parse", "--verify", "--quiet", &tree_spec])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .await
+        .map_err(|e| {
+            PolicyRepoError::Unverified(format!("failed spawning git rev-parse {tree_spec}: {e}"))
+        })?;
+    if !out.status.success() {
+        return Err(PolicyRepoError::Unverified(format!(
+            "failed resolving tree OID for {commit_sha}"
+        )));
+    }
+    let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if oid.len() < 40 || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(PolicyRepoError::Unverified(format!(
+            "unexpected tree OID '{oid}' for {commit_sha}"
+        )));
+    }
+    Ok(oid)
+}
+
+/// Verifies `commit_sha` under strict SSH-only (`allowed_signers`) commit policy:
+///
+/// 1. **Direct SSH-signed commit (any parent count)**: passes if `commit_sha` carries an SSH
+///    signature header and isolated `git verify-commit` + `%G? == G` succeed.
+/// 2. **Clean 2-parent PR merge commit fallback**: when direct verification does not pass and
+///    `commit_sha` has strictly 2 parents `(P1, P2)`, passes if and only if:
+///    - `P1` is an ancestor of `P2` (`git merge-base --is-ancestor P1 P2`),
+///    - `commit_sha^{tree} == P2^{tree}` (zero tree delta introduced by the merge commit), and
+///    - `P2` passes direct SSH signature verification (`verify-commit` + `%G? == G`).
+/// 3. All other commits (unsigned, PGP-only, tampered merge tree, non-ancestor `P2`, or
+///    `> 2`-parent octopus merges) fail closed.
+async fn verify_git_ssh_commit_signature(
+    repo_dir: &Path,
+    commit_sha: &str,
+    allowed_signers: &Path,
+) -> Result<(), PolicyRepoError> {
+    let direct_err =
+        match verify_single_commit_ssh_signature(repo_dir, commit_sha, allowed_signers).await {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+
+    let parents = git_commit_parents(repo_dir, commit_sha).await?;
+    if parents.len() != 2 {
+        return Err(PolicyRepoError::Unverified(format!(
+            "{direct_err}; 2-parent merge fallback inapplicable (commit {commit_sha} has {} parent(s))",
+            parents.len()
+        )));
+    }
+
+    let p1 = &parents[0];
+    let p2 = &parents[1];
+
+    if !git_is_ancestor(repo_dir, p1, p2).await? {
+        return Err(PolicyRepoError::Unverified(format!(
+            "2-parent merge commit {commit_sha} rejected: first parent {p1} is not an ancestor of second parent {p2}"
+        )));
+    }
+
+    let merge_tree = git_tree_oid(repo_dir, commit_sha).await?;
+    let p2_tree = git_tree_oid(repo_dir, p2).await?;
+    if merge_tree != p2_tree {
+        return Err(PolicyRepoError::Unverified(format!(
+            "2-parent merge commit {commit_sha} rejected: tree {merge_tree} differs from second parent {p2} tree {p2_tree}"
+        )));
+    }
+
+    verify_single_commit_ssh_signature(repo_dir, p2, allowed_signers)
+        .await
+        .map_err(|p2_err| {
+            PolicyRepoError::Unverified(format!(
+                "2-parent merge commit {commit_sha} rejected: second parent {p2} failed SSH verification ({p2_err})"
+            ))
+        })?;
+
+    tracing::info!(
+        commit = %commit_sha,
+        verified_parent = %p2,
+        tree = %merge_tree,
+        "Verified clean 2-parent PR merge commit via tree-equivalent SSH-signed second parent"
+    );
 
     Ok(())
 }
