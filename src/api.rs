@@ -9,6 +9,7 @@
 //! `MUCONDE_CD_API_TOKEN_FILE`) strictly for service-scoped reads and CI-to-CD triggers, failing
 //! closed (`401`/`403`) whenever credentials or required policy folios are missing.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -37,9 +38,10 @@ use crate::cd_state::{
 };
 use crate::contract::MuConDeConfig;
 use crate::error::{OrchestratorError, PolicyRepoError};
-use crate::orchestrator::DeploymentOrchestrator;
+use crate::orchestrator::{is_controller_self_upgrade_service, DeploymentOrchestrator};
 use crate::policy_repo::{
-    validate_git_commit_sha, validate_service_identifier, validate_sha256_hex, PolicyRepository,
+    normalize_arch_digest_map, validate_git_commit_sha, validate_service_identifier,
+    validate_sha256_hex, ArchDigestMaps, PolicyRepository,
 };
 use crate::telemetry::{build_cd_log, now_unix_nano};
 use mu_observable_ipc::TraceContext;
@@ -596,6 +598,10 @@ pub struct DeployTriggerRequest {
     #[serde(default)]
     pub it_archive_digest: Option<String>,
     #[serde(default)]
+    pub binary_digests_by_arch: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub it_archive_digests_by_arch: Option<HashMap<String, String>>,
+    #[serde(default)]
     pub bundle_id: Option<String>,
 }
 
@@ -608,6 +614,8 @@ pub struct DeployTriggerResponse {
     pub artifact_sha256: String,
     pub promoted_nodes: Vec<String>,
     pub rolled_back_nodes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
 }
 
 fn collect_legacy_fields(req: &DeployTriggerRequest) -> Vec<&'static str> {
@@ -748,6 +756,15 @@ fn rollout_outcomes_response(
                     artifact_sha256: digest,
                     promoted_nodes,
                     rolled_back_nodes,
+                    deployment_id: outcomes.first().map(|o| match o {
+                        crate::orchestrator::DeploymentOutcome::Promoted {
+                            deployment_id, ..
+                        }
+                        | crate::orchestrator::DeploymentOutcome::RolledBack {
+                            deployment_id,
+                            ..
+                        } => deployment_id.clone(),
+                    }),
                 }),
             )
                 .into_response()
@@ -791,9 +808,53 @@ async fn post_deploy_with_policy_repo(
         }
     };
 
-    let digest = match raw_digest.as_deref().map(validate_sha256_hex) {
-        Some(Ok(hex)) => hex,
-        _ => {
+    let arch_binary_map = match req.binary_digests_by_arch.as_ref() {
+        Some(raw) => match normalize_arch_digest_map("binary_digests_by_arch", raw) {
+            Ok(map) => Some(map),
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_binary_digests_by_arch",
+                        "detail": err.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    let arch_it_map = match req.it_archive_digests_by_arch.as_ref() {
+        Some(raw) => match normalize_arch_digest_map("it_archive_digests_by_arch", raw) {
+            Ok(map) => Some(map),
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_it_archive_digests_by_arch",
+                        "detail": err.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    let single_digest = match raw_digest.as_deref() {
+        Some(raw) => match validate_sha256_hex(raw) {
+            Ok(hex) => Some(hex),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "invalid_digest" })),
+                )
+                    .into_response();
+            }
+        },
+        None if arch_binary_map.is_some() => None,
+        None => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": "invalid_digest" })),
@@ -882,6 +943,7 @@ async fn post_deploy_with_policy_repo(
                     .into_response();
             }
         },
+        None if arch_it_map.is_some() => None,
         None if contract.requires_it_archive() => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -892,41 +954,105 @@ async fn post_deploy_with_policy_repo(
         None => None,
     };
 
-    match orchestrator.is_digest_tainted(&digest).await {
-        Ok(true) => {
+    // Resolve and validate every target node's architecture digest before touching node 1.
+    let mut participating_digests: Vec<String> = Vec::new();
+    for node_id in contract.effective_target_nodes() {
+        let Some(node_spec) = verified.nodes_inventory.find_node(node_id) else {
             return (
-                StatusCode::CONFLICT,
+                StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
-                    "error": "artifact_tainted",
-                    "digest": digest,
+                    "error": "unknown_target_node",
+                    "node_id": node_id,
                 })),
             )
                 .into_response();
+        };
+        let node_bin_digest = if let Some(ref bin_map) = arch_binary_map {
+            let Some(hex) = bin_map.get(&node_spec.arch) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "missing_arch_binary_digest",
+                        "node_id": node_id,
+                        "arch": node_spec.arch.as_canonical_str(),
+                    })),
+                )
+                    .into_response();
+            };
+            hex.clone()
+        } else if let Some(ref single) = single_digest {
+            single.clone()
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid_digest" })),
+            )
+                .into_response();
+        };
+        if let Some(ref it_map) = arch_it_map {
+            if !it_map.contains_key(&node_spec.arch) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "missing_arch_it_archive_digest",
+                        "node_id": node_id,
+                        "arch": node_spec.arch.as_canonical_str(),
+                    })),
+                )
+                    .into_response();
+            }
         }
-        Ok(false) => {}
-        Err(err) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "registry_unavailable",
-                    "detail": err.to_string(),
-                })),
-            )
-                .into_response();
+        if !participating_digests.contains(&node_bin_digest) {
+            participating_digests.push(node_bin_digest);
         }
     }
 
-    let rollout_id = format!("rollout-{}", uuid::Uuid::new_v4());
+    let summary_digest = single_digest
+        .or_else(|| participating_digests.first().cloned())
+        .unwrap_or_default();
+
+    for participating in &participating_digests {
+        match orchestrator.is_digest_tainted(participating).await {
+            Ok(true) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "artifact_tainted",
+                        "digest": participating,
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(false) => {}
+            Err(err) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "registry_unavailable",
+                        "detail": err.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let rollout_id = if is_controller_self_upgrade_service(&service) {
+        format!("dep-{}", uuid::Uuid::new_v4())
+    } else {
+        format!("rollout-{}", uuid::Uuid::new_v4())
+    };
     let bundle_id = req
         .bundle_id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let snapshot = match policy_repo.pin_deployment_snapshot_from_verified(
+    let snapshot = match policy_repo.pin_deployment_snapshot_from_verified_with_arch_it(
         &verified,
         &rollout_id,
         &service,
         it_archive_digest.as_deref(),
+        arch_it_map.as_ref(),
         bundle_id,
     ) {
         Ok(snap) => snap,
@@ -952,26 +1078,37 @@ async fn post_deploy_with_policy_repo(
         }
     };
 
+    let arch_maps = if arch_binary_map.is_some() || arch_it_map.is_some() {
+        Some(ArchDigestMaps {
+            binary_digests: arch_binary_map.unwrap_or_default(),
+            it_archive_digests: arch_it_map.unwrap_or_default(),
+        })
+    } else {
+        None
+    };
+
     let target_nodes = snapshot.service_contract.effective_target_nodes().to_vec();
     if req.wait {
         let res = orchestrator
-            .orchestrate_rollout_with_snapshot(
+            .orchestrate_rollout_with_snapshot_and_arch_digests(
                 snapshot,
-                &digest,
+                &summary_digest,
+                arch_maps.as_ref(),
                 req.repo.as_deref(),
                 incoming_trace,
             )
             .await;
-        rollout_outcomes_response(res, service, target_nodes, digest)
+        rollout_outcomes_response(res, service, target_nodes, summary_digest)
     } else {
-        let digest_bg = digest.clone();
+        let digest_bg = summary_digest.clone();
         let repo_bg = req.repo.clone();
         let svc_bg = service.clone();
         tokio::spawn(async move {
             if let Err(e) = orchestrator
-                .orchestrate_rollout_with_snapshot(
+                .orchestrate_rollout_with_snapshot_and_arch_digests(
                     snapshot,
                     &digest_bg,
+                    arch_maps.as_ref(),
                     repo_bg.as_deref(),
                     incoming_trace,
                 )
@@ -991,9 +1128,10 @@ async fn post_deploy_with_policy_repo(
                 accepted: true,
                 service,
                 target_nodes,
-                artifact_sha256: digest,
+                artifact_sha256: summary_digest,
                 promoted_nodes: Vec::new(),
                 rolled_back_nodes: Vec::new(),
+                deployment_id: Some(rollout_id),
             }),
         )
             .into_response()
@@ -1201,6 +1339,7 @@ async fn post_deploy(
                 artifact_sha256: digest,
                 promoted_nodes: Vec::new(),
                 rolled_back_nodes: Vec::new(),
+                deployment_id: None,
             }),
         )
             .into_response()

@@ -16,8 +16,8 @@ use mu_cd_controller::lease::{
     ClusterIdlePoller, IdleBackoffConfig, LeaseCoordinator, DEFAULT_CONTROLLER_URL,
 };
 use mu_cd_controller::orchestrator::{
-    DeploymentOrchestrator, DeploymentOutcome, HttpMuRegistClient, IpcAgentClient,
-    DEFAULT_REGISTRY_URL,
+    resolve_controller_state_dir, DeploymentOrchestrator, DeploymentOutcome, HttpMuRegistClient,
+    IpcAgentClient, DEFAULT_REGISTRY_URL,
 };
 use mu_cd_controller::policy_repo::{PolicyRepoConfig, PolicyRepository};
 use mu_cd_controller::slo::MuObserveSloClient;
@@ -35,6 +35,7 @@ struct ControllerEnvConfig {
     client_key_path: Option<PathBuf>,
     muobserve_addr: Option<String>,
     repo: Option<String>,
+    state_dir: PathBuf,
 }
 
 impl ControllerEnvConfig {
@@ -121,6 +122,7 @@ impl ControllerEnvConfig {
             lookup,
             &["MU_CD_CONTROLLER_REPO", "MU_CD_REPO", "MUCONDE_REPO"],
         );
+        let state_dir = resolve_controller_state_dir(lookup);
 
         Self {
             controller_url,
@@ -132,6 +134,7 @@ impl ControllerEnvConfig {
             client_key_path,
             muobserve_addr,
             repo,
+            state_dir,
         }
     }
 }
@@ -240,7 +243,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DeploymentOrchestrator::new(coordinator.clone(), poller, agent_client, regist_client)
             .with_idle_backoff(IdleBackoffConfig::from_env())
             .with_cd_state(cd_state.clone())
-            .with_telemetry_sink(cd_sink);
+            .with_telemetry_sink(cd_sink)
+            .with_state_dir(env_cfg.state_dir.clone());
     if let Some(ref repo) = policy_repo {
         orchestrator = orchestrator.with_policy_repo(repo.clone());
     }
@@ -295,6 +299,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(orchestrator.clone()),
     )
     .await?;
+
+    // Resume any fresh (<10 min) interrupted controller self-upgrade after the HTTP API is live.
+    {
+        let resume_orchestrator = orchestrator.clone();
+        tokio::spawn(async move {
+            match resume_orchestrator
+                .resume_pending_self_upgrade_if_present()
+                .await
+            {
+                Ok(Some(outcome)) => {
+                    info!(?outcome, "Completed resumed controller self-upgrade gate");
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    error!(
+                        error = %err,
+                        "Failed resuming pending controller self-upgrade handoff"
+                    );
+                }
+            }
+        });
+    }
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "deploy" {
