@@ -170,6 +170,35 @@ fn resolve_registry_token(lookup: &dyn Fn(&str) -> Option<String>) -> Option<Str
     None
 }
 
+fn spawn_policy_refresh_and_self_upgrade_resume(
+    policy_repo: Option<Arc<PolicyRepository>>,
+    orchestrator: Arc<DeploymentOrchestrator>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Some(repo) = policy_repo {
+            if let Err(err) = repo.refresh_and_verify().await {
+                error!(
+                    error = %err,
+                    "Initial deployment policy repository verification failed closed; incoming deployments will return 503 until verified"
+                );
+            }
+            let _bg_refresh = repo.spawn_background_refresh();
+        }
+        match orchestrator.resume_pending_self_upgrade_if_present().await {
+            Ok(Some(outcome)) => {
+                info!(?outcome, "Completed resumed controller self-upgrade gate");
+            }
+            Ok(None) => {}
+            Err(err) => {
+                error!(
+                    error = %err,
+                    "Failed resuming pending controller self-upgrade handoff"
+                );
+            }
+        }
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -214,22 +243,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cd_sink: Arc<dyn CdTelemetrySink> = Arc::new(cd_sink_concrete);
 
     let policy_repo_cfg = PolicyRepoConfig::from_env();
-    let policy_repo = if policy_repo_cfg.is_enabled() {
-        let repo = Arc::new(
+    let policy_repo = policy_repo_cfg.is_enabled().then(|| {
+        Arc::new(
             PolicyRepository::new(policy_repo_cfg)
                 .with_telemetry_sink(cd_sink.clone(), controller_node_id),
-        );
-        if let Err(err) = repo.refresh_and_verify().await {
-            error!(
-                error = %err,
-                "Initial deployment policy repository verification failed closed; incoming deployments will return 503 until verified"
-            );
-        }
-        let _bg_refresh = repo.clone().spawn_background_refresh();
-        Some(repo)
-    } else {
-        None
-    };
+        )
+    });
 
     let mut agent_client_builder = IpcAgentClient::new(env_cfg.agent_port)
         .with_progress_sink(cd_state.clone())
@@ -292,6 +311,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Optional CD status & deploy API on a separate listener (disabled unless
     // MU_CD_CONTROLLER_API_ADDR / MUCONDE_CD_API_ADDR is set; bearer token from
     // MU_CD_CONTROLLER_API_TOKEN_FILE / MUCONDE_CD_API_TOKEN_FILE).
+    // Bind immediately before policy repository git fetch so `/health` serves 200 OK
+    // within milliseconds after restarts while premature `/api/cd/deploy` fails closed 503
+    // until policy verification completes.
     let cd_api_config = CdApiConfig::from_env();
     let _cd_api = spawn_cd_api_with_orchestrator(
         &cd_api_config,
@@ -300,27 +322,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    // Resume any fresh (<10 min) interrupted controller self-upgrade after the HTTP API is live.
-    {
-        let resume_orchestrator = orchestrator.clone();
-        tokio::spawn(async move {
-            match resume_orchestrator
-                .resume_pending_self_upgrade_if_present()
-                .await
-            {
-                Ok(Some(outcome)) => {
-                    info!(?outcome, "Completed resumed controller self-upgrade gate");
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    error!(
-                        error = %err,
-                        "Failed resuming pending controller self-upgrade handoff"
-                    );
-                }
-            }
-        });
-    }
+    // Verify policy repository, launch periodic background refresh, and resume any fresh
+    // (<10 min) interrupted controller self-upgrade after the HTTP API listener is live.
+    let _startup_handle =
+        spawn_policy_refresh_and_self_upgrade_resume(policy_repo.clone(), orchestrator.clone());
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "deploy" {

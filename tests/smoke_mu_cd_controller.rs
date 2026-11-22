@@ -19,6 +19,68 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 const DEFAULT_SMOKE_TIMEOUT_SECS: u64 = 10;
+const HEALTH_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+
+fn is_transient_health_status(status: u16) -> bool {
+    matches!(status, 502..=504)
+}
+
+async fn probe_health_with_retry(
+    base_url: &str,
+    client: &reqwest::Client,
+    timeout: Duration,
+    retry_backoff: Duration,
+) -> Result<serde_json::Value, String> {
+    let url = format!("{base_url}/health");
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_transient_err: Option<String> = None;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "GET {url} timed out after {:?}: {}",
+                timeout,
+                last_transient_err.unwrap_or_else(|| "deadline exceeded".to_string())
+            ));
+        }
+
+        match client.get(&url).timeout(remaining).send().await {
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                if code == 200 {
+                    let json: serde_json::Value = resp
+                        .json()
+                        .await
+                        .map_err(|e| format!("GET {url} must return valid JSON: {e}"))?;
+                    if json["status"] != "ok" {
+                        return Err(format!("GET {url} expected status='ok', got {json}"));
+                    }
+                    return Ok(json);
+                }
+                if is_transient_health_status(code) {
+                    last_transient_err = Some(format!("transient HTTP {code}"));
+                } else {
+                    return Err(format!("GET {url} returned non-transient HTTP {code}"));
+                }
+            }
+            Err(err) => {
+                last_transient_err = Some(format!("transport error: {err}"));
+            }
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "GET {url} failed after {:?}: {}",
+                timeout,
+                last_transient_err.unwrap_or_else(|| "deadline exceeded".to_string())
+            ));
+        }
+        let sleep_for = retry_backoff.min(deadline.saturating_duration_since(now));
+        tokio::time::sleep(sleep_for).await;
+    }
+}
 
 #[derive(Debug, Clone)]
 struct SmokeConfig {
@@ -312,22 +374,10 @@ async fn run_http_cd_smoke(
     bearer_token: Option<&str>,
     timeout: Duration,
 ) {
-    // 1. Read-only /health check
-    let health_resp = client
-        .get(format!("{base_url}/health"))
-        .timeout(timeout)
-        .send()
+    // 1. Read-only /health check with bounded retry on transient startup/proxy errors
+    let health_json = probe_health_with_retry(base_url, client, timeout, HEALTH_RETRY_BACKOFF)
         .await
-        .expect("GET /health must succeed");
-    assert_eq!(
-        health_resp.status().as_u16(),
-        200,
-        "GET /health must return 200 OK"
-    );
-    let health_json: serde_json::Value = health_resp
-        .json()
-        .await
-        .expect("GET /health must return valid JSON");
+        .expect("GET /health must succeed within timeout");
     assert_eq!(health_json["status"], "ok");
 
     // 2. Unauthenticated requests to protected CD endpoints MUST fail closed (401/403)
@@ -533,6 +583,14 @@ async fn smoke_cd_controller_health_deployments_and_sse() {
             .build_client(true)
             .expect("build live probe HTTP/mTLS client");
 
+        run_http_cd_smoke(
+            target_url,
+            &auth_client,
+            cfg.bearer_token.as_deref(),
+            cfg.timeout,
+        )
+        .await;
+
         // If client mTLS credentials were supplied, verify missing client cert fails closed
         if cfg.tls_cert_file.is_some() && target_url.starts_with("https://") {
             let no_cert_client = cfg
@@ -551,14 +609,6 @@ async fn smoke_cd_controller_health_deployments_and_sse() {
                 );
             }
         }
-
-        run_http_cd_smoke(
-            target_url,
-            &auth_client,
-            cfg.bearer_token.as_deref(),
-            cfg.timeout,
-        )
-        .await;
         return;
     }
 
@@ -677,4 +727,126 @@ async fn smoke_cd_controller_health_deployments_and_sse() {
 
     mtls_handle.abort();
     server_handle.abort();
+}
+
+async fn spawn_scripted_health_server(
+    statuses: Vec<(u16, &'static str)>,
+) -> (
+    std::net::SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncReadExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_srv = attempts.clone();
+
+    let handle = tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = listener.accept().await {
+            let idx = attempts_srv.fetch_add(1, Ordering::SeqCst);
+            let (code, body) = statuses
+                .get(idx)
+                .copied()
+                .unwrap_or_else(|| *statuses.last().unwrap());
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = tcp.read(&mut buf).await;
+                let reason = match code {
+                    200 => "OK",
+                    500 => "Internal Server Error",
+                    502 => "Bad Gateway",
+                    503 => "Service Unavailable",
+                    504 => "Gateway Timeout",
+                    _ => "Error",
+                };
+                let resp = format!(
+                    "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tcp.write_all(resp.as_bytes()).await;
+                let _ = tcp.shutdown().await;
+            });
+        }
+    });
+
+    (addr, attempts, handle)
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn smoke_health_probe_retries_transient_502_until_200_and_fails_closed() {
+    use std::sync::atomic::Ordering;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // 1. Transient proxy startup sequence `502 -> 502 -> 200` recovers within budget
+    let (ok_addr, ok_attempts, ok_srv) = spawn_scripted_health_server(vec![
+        (502, r#"{"error":"bad_gateway"}"#),
+        (502, r#"{"error":"bad_gateway"}"#),
+        (200, r#"{"status":"ok"}"#),
+    ])
+    .await;
+    let health = probe_health_with_retry(
+        &format!("http://{ok_addr}"),
+        &client,
+        Duration::from_secs(2),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("502 -> 502 -> 200 must recover within budget");
+    assert_eq!(health["status"], "ok");
+    assert_eq!(ok_attempts.load(Ordering::SeqCst), 3);
+    ok_srv.abort();
+
+    // 2. Non-transient HTTP 500 fails immediately without retrying
+    let (err_addr, err_attempts, err_srv) =
+        spawn_scripted_health_server(vec![(500, r#"{"error":"internal"}"#)]).await;
+    let started = std::time::Instant::now();
+    let err = probe_health_with_retry(
+        &format!("http://{err_addr}"),
+        &client,
+        Duration::from_secs(3),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect_err("non-transient HTTP 500 must fail immediately");
+    assert!(
+        err.contains("non-transient HTTP 500"),
+        "unexpected error message: {err}"
+    );
+    assert_eq!(err_attempts.load(Ordering::SeqCst), 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "non-transient error must fail immediately, took {:?}",
+        started.elapsed()
+    );
+    err_srv.abort();
+
+    // 3. Persistent HTTP 502 fails closed once timeout expires
+    let (fail_addr, fail_attempts, fail_srv) =
+        spawn_scripted_health_server(vec![(502, r#"{"error":"bad_gateway"}"#)]).await;
+    let err_timeout = probe_health_with_retry(
+        &format!("http://{fail_addr}"),
+        &client,
+        Duration::from_millis(350),
+        Duration::from_millis(80),
+    )
+    .await
+    .expect_err("persistent 502 must fail closed after timeout");
+    assert!(
+        err_timeout.contains("transient HTTP 502"),
+        "expected transient HTTP 502 detail, got: {err_timeout}"
+    );
+    assert!(
+        fail_attempts.load(Ordering::SeqCst) >= 2,
+        "expected multiple retry attempts before timeout, got {}",
+        fail_attempts.load(Ordering::SeqCst)
+    );
+    fail_srv.abort();
 }
