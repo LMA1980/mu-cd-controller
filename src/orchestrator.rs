@@ -22,8 +22,9 @@ use tokio_rustls::client::TlsStream;
 use mu_cd_ipc::{
     create_fory_runtime, read_frame, write_frame, ArtifactTaintNotification, DeploymentLeaseGrant,
     DeploymentLeaseRequest, DeploymentSlot, IntegrationTestProgress, IntegrationTestReport,
-    IpcHeader, RollbackCommand, SlotSwapCommand, StageDeploymentRequest, StageDeploymentResponse,
-    MSG_TYPE_IT_PROGRESS, MSG_TYPE_IT_REPORT, MSG_TYPE_ROLLBACK, MSG_TYPE_SLOT_SWAP,
+    IpcHeader, RollbackCommand, ScenarioExecutionPlan, ScenarioPlanAck, SlotSwapCommand,
+    StageDeploymentRequest, StageDeploymentResponse, MSG_TYPE_IT_PROGRESS, MSG_TYPE_IT_REPORT,
+    MSG_TYPE_ROLLBACK, MSG_TYPE_SCENARIO_PLAN, MSG_TYPE_SCENARIO_PLAN_ACK, MSG_TYPE_SLOT_SWAP,
     MSG_TYPE_STAGE_DEPLOY_REQ, MSG_TYPE_STAGE_DEPLOY_RESP,
 };
 use mu_observable_ipc::CanarySloAssertionRequest;
@@ -34,6 +35,10 @@ use crate::cd_state::{
 use crate::contract::MuConDeConfig;
 use crate::error::{ContractError, LeaseError, OrchestratorError};
 use crate::lease::{ClusterIdlePoller, ClusterNodeStatus, IdleBackoffConfig, LeaseCoordinator};
+use crate::policy_repo::{
+    PinnedDeploymentSnapshot, PolicyRepository, DEFAULT_POLICY_SANDBOX_MEMLOCK_KB,
+    MAX_POLICY_SANDBOX_PIDS,
+};
 use crate::slo::CanarySloClient;
 use crate::telemetry::{build_cd_log, build_cd_span, now_unix_nano, CdTelemetrySink};
 use crate::tls::TlsConfig;
@@ -90,6 +95,17 @@ pub trait AgentIpcClient: Send + Sync {
         node_id: &str,
         cmd: &SlotSwapCommand,
     ) -> Result<(), OrchestratorError>;
+
+    /// Transmit an optional [`ScenarioExecutionPlan`] (`0x0D`) immediately followed by
+    /// [`SlotSwapCommand`] (`0x06`) on the same stream without blocking for `0x0E`.
+    async fn slot_swap_with_plan(
+        &self,
+        node_id: &str,
+        cmd: &SlotSwapCommand,
+        _plan: Option<&ScenarioExecutionPlan>,
+    ) -> Result<(), OrchestratorError> {
+        self.slot_swap(node_id, cmd).await
+    }
 
     /// Await or trigger integration test execution on the candidate slot.
     async fn execute_integration_tests(
@@ -283,6 +299,8 @@ pub enum AgentFrame {
     Report(IntegrationTestReport),
     /// A per-test progress update (already forwarded to the sink, if any).
     Progress(IntegrationTestProgress),
+    /// Advisory acknowledgement for a transmitted [`ScenarioExecutionPlan`] (`0x0E`).
+    ScenarioAck(ScenarioPlanAck),
     /// Any other or unknown message type; skipped without decoding the payload.
     Ignored(u16),
 }
@@ -290,8 +308,8 @@ pub enum AgentFrame {
 /// Dispatches one frame read from an agent while the integration gate runs.
 ///
 /// Dispatch happens on `msg_type` before decoding, so unknown message IDs are skipped
-/// safely. A progress payload that fails to decode is logged and ignored (progress is
-/// advisory); a report that fails to decode is an error.
+/// safely. Progress (`0x0C`) and scenario plan acknowledgement (`0x0E`) frames are advisory;
+/// a report (`0x08`) that fails to decode is an error.
 pub fn dispatch_agent_frame(
     fory: &fory::Fory,
     msg_type: u16,
@@ -314,6 +332,29 @@ pub fn dispatch_agent_frame(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Ignoring undecodable IntegrationTestProgress frame");
+                Ok(AgentFrame::Ignored(msg_type))
+            }
+        },
+        MSG_TYPE_SCENARIO_PLAN_ACK => match fory.deserialize::<ScenarioPlanAck>(payload) {
+            Ok(ack) => {
+                if ack.accepted {
+                    tracing::info!(
+                        deployment_id = %ack.deployment_id,
+                        lease_id = %ack.lease_id,
+                        "Agent acknowledged ScenarioExecutionPlan"
+                    );
+                } else {
+                    tracing::warn!(
+                        deployment_id = %ack.deployment_id,
+                        lease_id = %ack.lease_id,
+                        reason = ?ack.rejection_reason,
+                        "Agent rejected ScenarioExecutionPlan"
+                    );
+                }
+                Ok(AgentFrame::ScenarioAck(ack))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Ignoring undecodable ScenarioPlanAck frame");
                 Ok(AgentFrame::Ignored(msg_type))
             }
         },
@@ -450,6 +491,7 @@ pub struct IpcAgentClient {
     port: u16,
     progress_sink: Option<Arc<dyn ItProgressSink>>,
     tls_config: Option<TlsConfig>,
+    policy_repo: Option<Arc<PolicyRepository>>,
     active_streams: Arc<tokio::sync::Mutex<std::collections::HashMap<String, AgentStream>>>,
 }
 
@@ -458,6 +500,7 @@ impl std::fmt::Debug for IpcAgentClient {
         f.debug_struct("IpcAgentClient")
             .field("port", &self.port)
             .field("progress_sink", &self.progress_sink.is_some())
+            .field("policy_repo", &self.policy_repo.is_some())
             .field(
                 "tls_configured",
                 &self
@@ -476,6 +519,7 @@ impl IpcAgentClient {
             port,
             progress_sink: None,
             tls_config: None,
+            policy_repo: None,
             active_streams: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
@@ -492,6 +536,30 @@ impl IpcAgentClient {
     pub fn with_tls_config(mut self, tls_config: TlsConfig) -> Self {
         self.tls_config = Some(tls_config);
         self
+    }
+
+    /// Attach a verified [`PolicyRepository`] for authoritative node-ID-to-host resolution
+    /// when `MU_CD_CONTROLLER_NODE_MAP` / `MUCONDE_NODE_MAP` does not override the target node.
+    #[must_use]
+    pub fn with_policy_repo(mut self, policy_repo: Arc<PolicyRepository>) -> Self {
+        self.policy_repo = Some(policy_repo);
+        self
+    }
+
+    fn resolve_agent_host(&self, node_id: &str) -> String {
+        let map_str = resolve_node_map(&|key| std::env::var(key).ok());
+        if !map_str.is_empty() {
+            let mapped = resolve_target_node_from_map(node_id, &map_str);
+            if mapped != node_id.trim() {
+                return mapped;
+            }
+        }
+        if let Some(ref repo) = self.policy_repo {
+            if let Some(host) = repo.resolve_node_host(node_id) {
+                return host;
+            }
+        }
+        node_id.trim().to_string()
     }
 
     async fn connect_stream(&self, host: &str) -> Result<AgentStream, OrchestratorError> {
@@ -544,7 +612,7 @@ impl AgentIpcClient for IpcAgentClient {
         req: &StageDeploymentRequest,
     ) -> Result<StageDeploymentResponse, OrchestratorError> {
         let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
-        let host = resolve_target_node(node_id);
+        let host = self.resolve_agent_host(node_id);
         let mut stream = self.connect_stream(&host).await?;
 
         let payload = fory
@@ -579,14 +647,40 @@ impl AgentIpcClient for IpcAgentClient {
         node_id: &str,
         cmd: &SlotSwapCommand,
     ) -> Result<(), OrchestratorError> {
+        self.slot_swap_with_plan(node_id, cmd, None).await
+    }
+
+    async fn slot_swap_with_plan(
+        &self,
+        node_id: &str,
+        cmd: &SlotSwapCommand,
+        plan: Option<&ScenarioExecutionPlan>,
+    ) -> Result<(), OrchestratorError> {
         let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
-        let host = resolve_target_node(node_id);
+        let host = self.resolve_agent_host(node_id);
         let mut stream = self.connect_stream(&host).await?;
+
+        let mut next_seq = 1u64;
+        if let Some(scenario_plan) = plan {
+            let plan_payload = fory
+                .serialize(scenario_plan)
+                .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+            let plan_header = IpcHeader::new(
+                MSG_TYPE_SCENARIO_PLAN,
+                plan_payload.len() as u32,
+                0,
+                next_seq,
+            );
+            write_frame(&mut stream, &plan_header, &plan_payload)
+                .await
+                .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+            next_seq += 1;
+        }
 
         let payload = fory
             .serialize(cmd)
             .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
-        let header = IpcHeader::new(MSG_TYPE_SLOT_SWAP, payload.len() as u32, 0, 1);
+        let header = IpcHeader::new(MSG_TYPE_SLOT_SWAP, payload.len() as u32, 0, next_seq);
 
         write_frame(&mut stream, &header, &payload)
             .await
@@ -610,7 +704,7 @@ impl AgentIpcClient for IpcAgentClient {
         timeout: Duration,
     ) -> Result<IntegrationTestReport, OrchestratorError> {
         let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
-        let host = resolve_target_node(node_id);
+        let host = self.resolve_agent_host(node_id);
         let mut stream = if let Some(s) = self.active_streams.lock().await.remove(deployment_id) {
             s
         } else {
@@ -699,7 +793,7 @@ impl AgentIpcClient for IpcAgentClient {
                             });
                         }
                     }
-                    AgentFrame::Ignored(_) => {}
+                    AgentFrame::ScenarioAck(_) | AgentFrame::Ignored(_) => {}
                 }
             }
         };
@@ -725,7 +819,7 @@ impl AgentIpcClient for IpcAgentClient {
         cmd: &RollbackCommand,
     ) -> Result<(), OrchestratorError> {
         let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
-        let host = resolve_target_node(node_id);
+        let host = self.resolve_agent_host(node_id);
         let mut stream = self.connect_stream(&host).await?;
 
         let payload = fory
@@ -752,6 +846,7 @@ pub struct DeploymentOrchestrator {
     tainted_digests: Arc<RwLock<HashSet<String>>>,
     cd_state: Option<Arc<CdStateStore>>,
     telemetry_sink: Option<Arc<dyn CdTelemetrySink>>,
+    policy_repo: Option<Arc<PolicyRepository>>,
 }
 
 #[derive(Debug, Clone)]
@@ -789,6 +884,7 @@ impl DeploymentOrchestrator {
             tainted_digests: Arc::new(RwLock::new(HashSet::new())),
             cd_state: None,
             telemetry_sink: None,
+            policy_repo: None,
         }
     }
 
@@ -803,6 +899,25 @@ impl DeploymentOrchestrator {
     pub fn with_telemetry_sink(mut self, sink: Arc<dyn CdTelemetrySink>) -> Self {
         self.telemetry_sink = Some(sink);
         self
+    }
+
+    /// Returns the attached [`CdTelemetrySink`], if configured.
+    #[must_use]
+    pub fn telemetry_sink(&self) -> Option<&Arc<dyn CdTelemetrySink>> {
+        self.telemetry_sink.as_ref()
+    }
+
+    /// Attach a verified [`PolicyRepository`] for immutable per-deployment policy snapshots.
+    #[must_use]
+    pub fn with_policy_repo(mut self, policy_repo: Arc<PolicyRepository>) -> Self {
+        self.policy_repo = Some(policy_repo);
+        self
+    }
+
+    /// Returns the attached [`PolicyRepository`], if configured.
+    #[must_use]
+    pub fn policy_repo(&self) -> Option<&Arc<PolicyRepository>> {
+        self.policy_repo.as_ref()
     }
 
     /// Publish deployment, gate, lease and outcome changes to the read-only CD API state.
@@ -959,6 +1074,27 @@ impl DeploymentOrchestrator {
             .await
     }
 
+    /// Orchestrates sequential A/B rollout across every distinct target node defined by an
+    /// immutable verified [`PinnedDeploymentSnapshot`], propagating per-node
+    /// [`ScenarioExecutionPlan`] frames (`0x0D`) over additive `mu-cd-ipc` `v0.3.0`.
+    pub async fn orchestrate_rollout_with_snapshot(
+        &self,
+        snapshot: Arc<PinnedDeploymentSnapshot>,
+        artifact_sha256: &str,
+        repo: Option<&str>,
+        parent_trace: Option<TraceContext>,
+    ) -> Result<Vec<DeploymentOutcome>, OrchestratorError> {
+        let config = snapshot.to_muconde_config();
+        self.orchestrate_rollout_internal(
+            &config,
+            artifact_sha256,
+            repo,
+            parent_trace,
+            Some(snapshot),
+        )
+        .await
+    }
+
     /// Same as [`Self::orchestrate_rollout_for_repo`], propagating parent W3C [`TraceContext`].
     pub async fn orchestrate_rollout_for_repo_with_trace(
         &self,
@@ -967,8 +1103,31 @@ impl DeploymentOrchestrator {
         repo: Option<&str>,
         parent_trace: Option<TraceContext>,
     ) -> Result<Vec<DeploymentOutcome>, OrchestratorError> {
+        self.orchestrate_rollout_internal(config, artifact_sha256, repo, parent_trace, None)
+            .await
+    }
+
+    async fn orchestrate_rollout_internal(
+        &self,
+        config: &MuConDeConfig,
+        artifact_sha256: &str,
+        repo: Option<&str>,
+        parent_trace: Option<TraceContext>,
+        snapshot: Option<Arc<PinnedDeploymentSnapshot>>,
+    ) -> Result<Vec<DeploymentOutcome>, OrchestratorError> {
         config.validate()?;
-        let targets = resolve_target_nodes(config.effective_target_nodes());
+        let targets = if snapshot.is_some() {
+            let mut dedup = Vec::new();
+            for node in config.effective_target_nodes() {
+                let trimmed = node.trim().to_string();
+                if !trimmed.is_empty() && !dedup.contains(&trimmed) {
+                    dedup.push(trimmed);
+                }
+            }
+            dedup
+        } else {
+            resolve_target_nodes(config.effective_target_nodes())
+        };
         if targets.is_empty() {
             return Err(OrchestratorError::Contract(ContractError::EmptyTargetNodes));
         }
@@ -984,14 +1143,19 @@ impl DeploymentOrchestrator {
             let mut single_cfg = config.clone();
             single_cfg.target_nodes = vec![node.clone()];
             single_cfg.deployment.target_nodes = vec![node.clone()];
+            let node_dep_id = format!("dep-{}", uuid::Uuid::new_v4());
+            if let (Some(ref policy_repo), Some(ref snap)) = (&self.policy_repo, &snapshot) {
+                policy_repo.register_snapshot_alias(node_dep_id.clone(), snap.clone());
+            }
 
             match self
-                .orchestrate_deployment_for_repo_with_trace(
+                .orchestrate_deployment_internal(
                     &single_cfg,
                     artifact_sha256,
-                    None,
+                    Some(node_dep_id),
                     repo,
                     parent_trace,
+                    snapshot.as_deref(),
                 )
                 .await
             {
@@ -1127,6 +1291,48 @@ impl DeploymentOrchestrator {
         custom_deployment_id: Option<String>,
         repo: Option<&str>,
         parent_trace: Option<TraceContext>,
+    ) -> Result<DeploymentOutcome, OrchestratorError> {
+        self.orchestrate_deployment_internal(
+            config,
+            artifact_sha256,
+            custom_deployment_id,
+            repo,
+            parent_trace,
+            None,
+        )
+        .await
+    }
+
+    /// Orchestrates a single-node deployment using an immutable [`PinnedDeploymentSnapshot`],
+    /// transmitting the resolved [`ScenarioExecutionPlan`] (`0x0D`) ahead of `SlotSwapCommand` (`0x06`).
+    pub async fn orchestrate_deployment_with_snapshot(
+        &self,
+        snapshot: &PinnedDeploymentSnapshot,
+        artifact_sha256: &str,
+        custom_deployment_id: Option<String>,
+        repo: Option<&str>,
+        parent_trace: Option<TraceContext>,
+    ) -> Result<DeploymentOutcome, OrchestratorError> {
+        let config = snapshot.to_muconde_config();
+        self.orchestrate_deployment_internal(
+            &config,
+            artifact_sha256,
+            custom_deployment_id,
+            repo,
+            parent_trace,
+            Some(snapshot),
+        )
+        .await
+    }
+
+    async fn orchestrate_deployment_internal(
+        &self,
+        config: &MuConDeConfig,
+        artifact_sha256: &str,
+        custom_deployment_id: Option<String>,
+        repo: Option<&str>,
+        parent_trace: Option<TraceContext>,
+        snapshot: Option<&PinnedDeploymentSnapshot>,
     ) -> Result<DeploymentOutcome, OrchestratorError> {
         let dep_start_ns = now_unix_nano();
         let root_trace = parent_trace.unwrap_or_else(|| {
@@ -1351,7 +1557,42 @@ impl DeploymentOrchestrator {
             }),
         ));
 
-        // Step 5: Instruct agent to perform atomic slot swap to Slot B
+        // Step 5: Transmit resolved ScenarioExecutionPlan (0x0D) and perform atomic slot swap (0x06)
+        let scenario_plan: Option<ScenarioExecutionPlan> = if let Some(snap) = snapshot {
+            snap.plan_for_node(&target_node, &deployment_id, &grant.lease_id)
+                .or_else(|| {
+                    config
+                        .effective_target_nodes()
+                        .first()
+                        .and_then(|raw| snap.plan_for_node(raw, &deployment_id, &grant.lease_id))
+                })
+        } else {
+            config
+                .it_archive_digest
+                .as_ref()
+                .map(|digest| ScenarioExecutionPlan {
+                    deployment_id: deployment_id.clone(),
+                    lease_id: grant.lease_id.clone(),
+                    service_name: config.service.clone(),
+                    node_id: target_node.clone(),
+                    policy_commit_sha: String::new(),
+                    it_archive_digest: Some(digest.clone()),
+                    bundle_id: None,
+                    selected_tests: config
+                        .selected_tests()
+                        .map(|tests| tests.to_vec())
+                        .unwrap_or_default(),
+                    scenarios: Vec::new(),
+                    env: Vec::new(),
+                    args: Vec::new(),
+                    cidrs: Vec::new(),
+                    ro_mounts: Vec::new(),
+                    max_pids: MAX_POLICY_SANDBOX_PIDS,
+                    max_memlock_kb: DEFAULT_POLICY_SANDBOX_MEMLOCK_KB,
+                    auto_rollback_on_critical: config.ab_rules.auto_rollback_on_critical,
+                })
+        };
+
         let swap_cmd = SlotSwapCommand {
             deployment_id: deployment_id.clone(),
             lease_id: grant.lease_id.clone(),
@@ -1362,7 +1603,11 @@ impl DeploymentOrchestrator {
             warmup_timeout_secs: config.warmup_timeout_seconds,
         };
 
-        if let Err(e) = self.agent_client.slot_swap(&target_node, &swap_cmd).await {
+        if let Err(e) = self
+            .agent_client
+            .slot_swap_with_plan(&target_node, &swap_cmd, scenario_plan.as_ref())
+            .await
+        {
             let err_msg = format!("Atomic slot swap failed: {e}");
             spans_to_emit.push(build_cd_span(
                 dep_span_ctx.trace_id,

@@ -19,6 +19,7 @@ use mu_cd_controller::orchestrator::{
     DeploymentOrchestrator, DeploymentOutcome, HttpMuRegistClient, IpcAgentClient,
     DEFAULT_REGISTRY_URL,
 };
+use mu_cd_controller::policy_repo::{PolicyRepoConfig, PolicyRepository};
 use mu_cd_controller::slo::MuObserveSloClient;
 use mu_cd_controller::telemetry::{CdTelemetrySink, MuObserveCdSink};
 use mu_cd_controller::tls::TlsConfig;
@@ -205,19 +206,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read-only CD state shared by the orchestrator, lease watcher, agent IPC reader and the
     // optional `/api/cd/*` listener.
     let cd_state = Arc::new(CdStateStore::default());
+    let cd_sink_concrete = MuObserveCdSink::from_env();
+    let controller_node_id = cd_sink_concrete.node_id().to_string();
+    let cd_sink: Arc<dyn CdTelemetrySink> = Arc::new(cd_sink_concrete);
 
-    let agent_client = Arc::new(
-        IpcAgentClient::new(env_cfg.agent_port)
-            .with_progress_sink(cd_state.clone())
-            .with_tls_config(tls_config.clone()),
-    );
+    let policy_repo_cfg = PolicyRepoConfig::from_env();
+    let policy_repo = if policy_repo_cfg.is_enabled() {
+        let repo = Arc::new(
+            PolicyRepository::new(policy_repo_cfg)
+                .with_telemetry_sink(cd_sink.clone(), controller_node_id),
+        );
+        if let Err(err) = repo.refresh_and_verify().await {
+            error!(
+                error = %err,
+                "Initial deployment policy repository verification failed closed; incoming deployments will return 503 until verified"
+            );
+        }
+        let _bg_refresh = repo.clone().spawn_background_refresh();
+        Some(repo)
+    } else {
+        None
+    };
 
-    let cd_sink: Arc<dyn CdTelemetrySink> = Arc::new(MuObserveCdSink::from_env());
+    let mut agent_client_builder = IpcAgentClient::new(env_cfg.agent_port)
+        .with_progress_sink(cd_state.clone())
+        .with_tls_config(tls_config.clone());
+    if let Some(ref repo) = policy_repo {
+        agent_client_builder = agent_client_builder.with_policy_repo(repo.clone());
+    }
+    let agent_client = Arc::new(agent_client_builder);
+
     let mut orchestrator =
         DeploymentOrchestrator::new(coordinator.clone(), poller, agent_client, regist_client)
             .with_idle_backoff(IdleBackoffConfig::from_env())
             .with_cd_state(cd_state.clone())
             .with_telemetry_sink(cd_sink);
+    if let Some(ref repo) = policy_repo {
+        orchestrator = orchestrator.with_policy_repo(repo.clone());
+    }
 
     if let Some(muobserve_addr) = env_cfg.muobserve_addr {
         let slo_client = Arc::new(MuObserveSloClient::new(muobserve_addr, tls_config.clone()));
