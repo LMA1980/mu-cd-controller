@@ -266,8 +266,9 @@ impl TestPolicyFixture {
 
 #[derive(Default)]
 struct RecordingAgent {
+    staged: Mutex<Vec<(String, String)>>,
     plans: Mutex<Vec<(String, Option<ScenarioExecutionPlan>)>>,
-    rollbacks: Mutex<Vec<(String, DeploymentSlot)>>,
+    rollbacks: Mutex<Vec<(String, DeploymentSlot, String)>>,
     fail_node: Option<String>,
 }
 
@@ -275,9 +276,13 @@ struct RecordingAgent {
 impl AgentIpcClient for RecordingAgent {
     async fn stage_deployment(
         &self,
-        _node_id: &str,
+        node_id: &str,
         req: &StageDeploymentRequest,
     ) -> Result<StageDeploymentResponse, OrchestratorError> {
+        self.staged
+            .lock()
+            .await
+            .push((node_id.to_string(), req.artifact_sha256.clone()));
         Ok(StageDeploymentResponse {
             deployment_id: req.deployment_id.clone(),
             target_slot: req.target_slot,
@@ -342,10 +347,11 @@ impl AgentIpcClient for RecordingAgent {
         node_id: &str,
         cmd: &RollbackCommand,
     ) -> Result<(), OrchestratorError> {
-        self.rollbacks
-            .lock()
-            .await
-            .push((node_id.to_string(), cmd.restore_slot));
+        self.rollbacks.lock().await.push((
+            node_id.to_string(),
+            cmd.restore_slot,
+            cmd.failed_artifact_sha256.clone(),
+        ));
         Ok(())
     }
 }
@@ -1331,4 +1337,514 @@ fn test_privacy_fixture_helper_clean_path_check() {
     assert!(!Path::new("/etc/mu-cd-canary/tls/ca.crt")
         .as_os_str()
         .is_empty());
+}
+
+fn create_three_arch_policy_fixture() -> TestPolicyFixture {
+    let fixture =
+        TestPolicyFixture::create("node-x86.cluster.internal", "node-rv.cluster.internal");
+    let nodes_yaml = r#"nodes:
+  - node_id: "node-x86"
+    arch: "x86_64"
+    host: "node-x86.cluster.internal"
+    max_memlock_kb: 2097152
+    max_slots: 1
+  - node_id: "node-arm"
+    arch: "aarch64"
+    host: "node-arm.cluster.internal"
+    max_memlock_kb: 2097152
+    max_slots: 1
+  - node_id: "node-rv"
+    arch: "riscv64gc"
+    host: "node-rv.cluster.internal"
+    max_memlock_kb: 2097152
+    max_slots: 1
+"#;
+    let multi_arch_service_yaml = r#"version: "2"
+service: "example-service"
+target_nodes:
+  - "node-x86"
+  - "node-arm"
+  - "node-rv"
+lease_ttl_seconds: 180
+warmup_timeout_seconds: 15
+bake_window_seconds: 60
+max_error_logs: 0
+max_p99_latency_ms: 250.0
+ab_rules:
+  auto_rollback_on_critical: true
+  snapshot_retention: 3
+deployment:
+  binary: "example-service"
+  install_path: "/usr/local/bin/example-service"
+  systemd_unit: "example-service.service"
+sandbox_ceiling:
+  max_pids: 256
+  max_memlock_kb: 65536
+integration_tests:
+  - "systemd_unit_active"
+  - "health_endpoint_ready"
+  - "smoke_example_service"
+scenarios:
+  - name: "smoke_example_service"
+    test_binary: "smoke_example_service"
+    target_url: "https://127.0.0.1:8446/health"
+    restricted_cidrs:
+      - "127.0.0.1/32"
+    read_only: true
+    timeout_secs: 15
+"#;
+    let controller_service_yaml = r#"version: "2"
+service: "mu-cd-controller"
+target_nodes:
+  - "node-x86"
+lease_ttl_seconds: 180
+warmup_timeout_seconds: 15
+bake_window_seconds: 60
+max_error_logs: 0
+max_p99_latency_ms: 250.0
+ab_rules:
+  auto_rollback_on_critical: true
+  snapshot_retention: 3
+deployment:
+  binary: "mu-cd-controller"
+  install_path: "/usr/local/bin/mu-cd-controller"
+  systemd_unit: "muconde-controller.service"
+  self_upgrade_guard: true
+sandbox_ceiling:
+  max_pids: 256
+  max_memlock_kb: 65536
+integration_tests:
+  - "systemd_unit_active"
+  - "health_endpoint_ready"
+  - "smoke_mu_cd_controller"
+scenarios:
+  - name: "smoke_mu_cd_controller"
+    test_binary: "smoke_mu_cd_controller"
+    target_url: "https://127.0.0.1:8445/health"
+    restricted_cidrs:
+      - "127.0.0.1/32"
+    read_only: true
+    timeout_secs: 15
+"#;
+    std::fs::write(
+        fixture
+            .repo_dir
+            .join("contracts/services/mu-cd-controller.yml"),
+        controller_service_yaml,
+    )
+    .unwrap();
+    fixture.commit_files(
+        nodes_yaml,
+        multi_arch_service_yaml,
+        true,
+        "add 3-arch cluster inventory and mu-cd-controller contract",
+    );
+    fixture
+}
+
+#[tokio::test]
+async fn test_multi_arch_rollout_3_arch_success_and_per_node_digests_and_fail_closed_checks() {
+    let fixture = create_three_arch_policy_fixture();
+    let policy_repo = fixture.policy_repo(Arc::new(RecordingCdTelemetrySink::new()));
+
+    let bin_x86 = "a".repeat(64);
+    let bin_arm = "b".repeat(64);
+    let bin_rv = "c".repeat(64);
+    let it_x86 = "1".repeat(64);
+    let it_arm = "2".repeat(64);
+    let it_rv = "3".repeat(64);
+
+    // 1. 3-arch rollout success using aliases (`arm64` -> `aarch64`, `riscv64` -> `riscv64gc`)
+    let store = Arc::new(CdStateStore::default());
+    let agent = Arc::new(RecordingAgent::default());
+    let regist = Arc::new(RecordingRegist::default());
+    let orch = Arc::new(
+        DeploymentOrchestrator::new(
+            Arc::new(LeaseCoordinator::new()),
+            None,
+            agent.clone(),
+            regist.clone(),
+        )
+        .with_cd_state(store.clone())
+        .with_policy_repo(policy_repo.clone()),
+    );
+    let app = router(
+        CdApiState::new(store, Some(API_TOKEN.into()))
+            .with_orchestrator(orch.clone())
+            .with_policy_repo(policy_repo.clone()),
+    );
+
+    let (status, json) = post_api(
+        app.clone(),
+        "/api/cd/deploy",
+        &serde_json::json!({
+            "repo": "LMA1980/example-service",
+            "service": "example-service",
+            "git_commit": "0123456789abcdef0123456789abcdef01234567",
+            "binary_digests_by_arch": {
+                "x86_64": bin_x86,
+                "arm64": bin_arm,
+                "riscv64": bin_rv
+            },
+            "it_archive_digests_by_arch": {
+                "x86_64": it_x86,
+                "aarch64": it_arm,
+                "riscv64gc": it_rv
+            },
+            "wait": true
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "response: {json}");
+    assert_eq!(json["accepted"], true);
+    assert_eq!(
+        json["promoted_nodes"],
+        serde_json::json!(["node-x86", "node-arm", "node-rv"])
+    );
+
+    assert_eq!(
+        agent.staged.lock().await.as_slice(),
+        &[
+            ("node-x86".to_string(), bin_x86.clone()),
+            ("node-arm".to_string(), bin_arm.clone()),
+            ("node-rv".to_string(), bin_rv.clone()),
+        ]
+    );
+    let plans = agent.plans.lock().await;
+    assert_eq!(plans.len(), 3);
+    assert_eq!(
+        plans[0].1.as_ref().unwrap().it_archive_digest.as_deref(),
+        Some(it_x86.as_str())
+    );
+    assert_eq!(
+        plans[1].1.as_ref().unwrap().it_archive_digest.as_deref(),
+        Some(it_arm.as_str())
+    );
+    assert_eq!(
+        plans[2].1.as_ref().unwrap().it_archive_digest.as_deref(),
+        Some(it_rv.as_str())
+    );
+    drop(plans);
+    assert_eq!(
+        regist.promoted.lock().await.as_slice(),
+        &[bin_x86.clone(), bin_arm.clone(), bin_rv.clone()]
+    );
+
+    // 2. Missing target node arch fails closed (400) before touching node 1
+    let agent_missing = Arc::new(RecordingAgent::default());
+    let orch_missing = Arc::new(
+        DeploymentOrchestrator::new(
+            Arc::new(LeaseCoordinator::new()),
+            None,
+            agent_missing.clone(),
+            Arc::new(RecordingRegist::default()),
+        )
+        .with_policy_repo(policy_repo.clone()),
+    );
+    let app_missing = router(
+        CdApiState::new(Arc::new(CdStateStore::default()), Some(API_TOKEN.into()))
+            .with_orchestrator(orch_missing)
+            .with_policy_repo(policy_repo.clone()),
+    );
+    let (status_m, json_m) = post_api(
+        app_missing.clone(),
+        "/api/cd/deploy",
+        &serde_json::json!({
+            "service": "example-service",
+            "git_commit": "0123456789abcdef0123456789abcdef01234567",
+            "binary_digests_by_arch": {
+                "x86_64": bin_x86,
+                "aarch64": bin_arm
+            },
+            "it_archive_digests_by_arch": {
+                "x86_64": it_x86,
+                "aarch64": it_arm,
+                "riscv64gc": it_rv
+            },
+            "wait": true
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status_m, StatusCode::BAD_REQUEST);
+    assert_eq!(json_m["error"], "missing_arch_binary_digest");
+    assert_eq!(json_m["arch"], "riscv64gc");
+    assert!(agent_missing.staged.lock().await.is_empty());
+
+    // Malformed non-64-hex digest in map -> 400
+    let (status_bad, json_bad) = post_api(
+        app_missing,
+        "/api/cd/deploy",
+        &serde_json::json!({
+            "service": "example-service",
+            "git_commit": "0123456789abcdef0123456789abcdef01234567",
+            "binary_digests_by_arch": {
+                "x86_64": "short",
+                "aarch64": bin_arm,
+                "riscv64": bin_rv
+            },
+            "it_archive_digest": it_x86,
+            "wait": true
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status_bad, StatusCode::BAD_REQUEST);
+    assert_eq!(json_bad["error"], "invalid_binary_digests_by_arch");
+
+    // 3. Pre-tainted arch digest refuses rollout (409 Conflict) before touching node 1
+    let agent_taint = Arc::new(RecordingAgent::default());
+    let regist_taint = Arc::new(RecordingRegist::default());
+    regist_taint.taints.lock().await.push(bin_rv.clone());
+    let orch_taint = Arc::new(
+        DeploymentOrchestrator::new(
+            Arc::new(LeaseCoordinator::new()),
+            None,
+            agent_taint.clone(),
+            regist_taint,
+        )
+        .with_policy_repo(policy_repo.clone()),
+    );
+    let app_taint = router(
+        CdApiState::new(Arc::new(CdStateStore::default()), Some(API_TOKEN.into()))
+            .with_orchestrator(orch_taint)
+            .with_policy_repo(policy_repo.clone()),
+    );
+    let (status_t, json_t) = post_api(
+        app_taint,
+        "/api/cd/deploy",
+        &serde_json::json!({
+            "service": "example-service",
+            "git_commit": "0123456789abcdef0123456789abcdef01234567",
+            "binary_digests_by_arch": {
+                "x86_64": bin_x86,
+                "aarch64": bin_arm,
+                "riscv64": bin_rv
+            },
+            "it_archive_digests_by_arch": {
+                "x86_64": it_x86,
+                "aarch64": it_arm,
+                "riscv64gc": it_rv
+            },
+            "wait": true
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status_t, StatusCode::CONFLICT);
+    assert_eq!(json_t["error"], "artifact_tainted");
+    assert_eq!(json_t["digest"], bin_rv);
+    assert!(
+        agent_taint.staged.lock().await.is_empty(),
+        "pre-tainted riscv64gc digest must abort rollout before touching node-x86"
+    );
+
+    // 4. Mid-rollout failure on node-rv compensates node-arm & node-x86 AND taints ALL 3 digests
+    let fail_bin_x86 = "d".repeat(64);
+    let fail_bin_arm = "e".repeat(64);
+    let fail_bin_rv = "f".repeat(64);
+    let agent_mid = Arc::new(RecordingAgent {
+        fail_node: Some("node-rv".to_string()),
+        ..Default::default()
+    });
+    let regist_mid = Arc::new(RecordingRegist::default());
+    let orch_mid = Arc::new(
+        DeploymentOrchestrator::new(
+            Arc::new(LeaseCoordinator::new()),
+            None,
+            agent_mid.clone(),
+            regist_mid.clone(),
+        )
+        .with_policy_repo(policy_repo.clone()),
+    );
+    let app_mid = router(
+        CdApiState::new(Arc::new(CdStateStore::default()), Some(API_TOKEN.into()))
+            .with_orchestrator(orch_mid.clone())
+            .with_policy_repo(policy_repo),
+    );
+    let (status_mid, json_mid) = post_api(
+        app_mid,
+        "/api/cd/deploy",
+        &serde_json::json!({
+            "service": "example-service",
+            "git_commit": "0123456789abcdef0123456789abcdef01234567",
+            "binary_digests_by_arch": {
+                "x86_64": fail_bin_x86,
+                "arm64": fail_bin_arm,
+                "riscv64": fail_bin_rv
+            },
+            "it_archive_digests_by_arch": {
+                "x86_64": it_x86,
+                "aarch64": it_arm,
+                "riscv64gc": it_rv
+            },
+            "wait": true
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status_mid, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(json_mid["accepted"], false);
+    assert_eq!(
+        json_mid["rolled_back_nodes"],
+        serde_json::json!(["node-x86", "node-arm", "node-rv"])
+    );
+    let rbs = agent_mid.rollbacks.lock().await;
+    assert_eq!(
+        rbs.as_slice(),
+        &[
+            (
+                "node-rv".to_string(),
+                DeploymentSlot::SlotA,
+                fail_bin_rv.clone()
+            ),
+            (
+                "node-arm".to_string(),
+                DeploymentSlot::SlotA,
+                fail_bin_arm.clone()
+            ),
+            (
+                "node-x86".to_string(),
+                DeploymentSlot::SlotA,
+                fail_bin_x86.clone()
+            ),
+        ]
+    );
+    drop(rbs);
+    let tainted = regist_mid.taints.lock().await;
+    for d in [&fail_bin_x86, &fail_bin_arm, &fail_bin_rv] {
+        assert!(
+            tainted.contains(d),
+            "expected multi-arch digest {d} to be tainted in registry, got {tainted:?}"
+        );
+        assert!(orch_mid.is_digest_tainted(d).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn test_controller_self_upgrade_async_202_persists_handoff_before_swap() {
+    use mu_cd_controller::orchestrator::{pending_self_upgrade_path, PendingControllerSelfUpgrade};
+
+    struct SlowSwapAgent {
+        state_dir: std::path::PathBuf,
+        captured: Mutex<Option<PendingControllerSelfUpgrade>>,
+        swapped_notify: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl AgentIpcClient for SlowSwapAgent {
+        async fn stage_deployment(
+            &self,
+            _node_id: &str,
+            req: &StageDeploymentRequest,
+        ) -> Result<StageDeploymentResponse, OrchestratorError> {
+            Ok(StageDeploymentResponse {
+                deployment_id: req.deployment_id.clone(),
+                target_slot: req.target_slot,
+                btrfs_subvolume_path: "/srv/mucd/mu-cd-controller/@b".into(),
+                staged_ok: true,
+                error_message: None,
+            })
+        }
+        async fn slot_swap(
+            &self,
+            _node_id: &str,
+            _cmd: &SlotSwapCommand,
+        ) -> Result<(), OrchestratorError> {
+            let bytes = std::fs::read(pending_self_upgrade_path(&self.state_dir)).unwrap();
+            let parsed: PendingControllerSelfUpgrade = serde_json::from_slice(&bytes).unwrap();
+            *self.captured.lock().await = Some(parsed);
+            self.swapped_notify.notify_one();
+            Ok(())
+        }
+        async fn execute_integration_tests(
+            &self,
+            _node_id: &str,
+            deployment_id: &str,
+            service: &str,
+            artifact_sha256: &str,
+            _selected_tests: Option<&[String]>,
+            _timeout: Duration,
+        ) -> Result<IntegrationTestReport, OrchestratorError> {
+            Ok(IntegrationTestReport {
+                deployment_id: deployment_id.into(),
+                service_name: service.into(),
+                artifact_sha256: artifact_sha256.into(),
+                executed_tests: vec!["smoke_mu_cd_controller".into()],
+                passed: true,
+                failed_tests: Vec::new(),
+                duration_ms: 10,
+                log_excerpt: None,
+            })
+        }
+        async fn rollback(
+            &self,
+            _node_id: &str,
+            _cmd: &RollbackCommand,
+        ) -> Result<(), OrchestratorError> {
+            Ok(())
+        }
+    }
+
+    let fixture = create_three_arch_policy_fixture();
+    let policy_repo = fixture.policy_repo(Arc::new(RecordingCdTelemetrySink::new()));
+    let state_tmp = tempfile::tempdir().unwrap();
+    let swapped_notify = Arc::new(tokio::sync::Notify::new());
+    let agent = Arc::new(SlowSwapAgent {
+        state_dir: state_tmp.path().to_path_buf(),
+        captured: Mutex::new(None),
+        swapped_notify: swapped_notify.clone(),
+    });
+    let orch = Arc::new(
+        DeploymentOrchestrator::new(
+            Arc::new(LeaseCoordinator::new()),
+            None,
+            agent.clone(),
+            Arc::new(RecordingRegist::default()),
+        )
+        .with_policy_repo(policy_repo.clone())
+        .with_state_dir(state_tmp.path()),
+    );
+    let app = router(
+        CdApiState::new(Arc::new(CdStateStore::default()), Some(API_TOKEN.into()))
+            .with_orchestrator(orch)
+            .with_policy_repo(policy_repo),
+    );
+
+    let bin_sha = "7".repeat(64);
+    let it_sha = "8".repeat(64);
+    let (status, json) = post_api(
+        app,
+        "/api/cd/deploy",
+        &serde_json::json!({
+            "service": "mu-cd-controller",
+            "git_commit": "0123456789abcdef0123456789abcdef01234567",
+            "binary_digest": bin_sha,
+            "it_archive_digest": it_sha,
+            "wait": false
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(json["accepted"], true);
+    let dep_id = json["deployment_id"]
+        .as_str()
+        .expect("202 Accepted must return deployment_id")
+        .to_string();
+    assert!(dep_id.starts_with("dep-"));
+
+    tokio::time::timeout(Duration::from_secs(5), swapped_notify.notified())
+        .await
+        .expect("background controller self-upgrade reached slot_swap");
+    let captured = agent
+        .captured
+        .lock()
+        .await
+        .clone()
+        .expect("pending_self_upgrade.json captured before slot_swap");
+    assert_eq!(captured.deployment_id, dep_id);
+    assert_eq!(captured.service, "mu-cd-controller");
+    assert_eq!(captured.target_node, "node-x86");
+    assert_eq!(captured.artifact_sha256, bin_sha);
 }

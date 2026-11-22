@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::io::IoSlice;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -36,7 +37,7 @@ use crate::contract::MuConDeConfig;
 use crate::error::{ContractError, LeaseError, OrchestratorError};
 use crate::lease::{ClusterIdlePoller, ClusterNodeStatus, IdleBackoffConfig, LeaseCoordinator};
 use crate::policy_repo::{
-    PinnedDeploymentSnapshot, PolicyRepository, DEFAULT_POLICY_SANDBOX_MEMLOCK_KB,
+    ArchDigestMaps, PinnedDeploymentSnapshot, PolicyRepository, DEFAULT_POLICY_SANDBOX_MEMLOCK_KB,
     MAX_POLICY_SANDBOX_PIDS,
 };
 use crate::slo::CanarySloClient;
@@ -46,6 +47,192 @@ use mu_observable_ipc::{OtelLogEntry, TraceContext};
 
 /// Default MuRegist server URL used across continuous delivery fabric.
 pub const DEFAULT_REGISTRY_URL: &str = "https://registry.ci.ci.internal:8444";
+/// Default writable state directory for controller self-upgrade handoff state.
+pub const DEFAULT_CONTROLLER_STATE_DIR: &str = "/var/lib/muconde";
+/// Filename persisted atomically (`0600`) immediately before swapping `mu-cd-controller`.
+pub const PENDING_SELF_UPGRADE_FILENAME: &str = "pending_self_upgrade.json";
+/// Maximum age for resuming a persisted controller self-upgrade handoff (10 minutes).
+pub const PENDING_SELF_UPGRADE_MAX_AGE_MS: u64 = 10 * 60 * 1000;
+/// Default backoff interval when reconnecting to `mu-cd-agent` across transient disconnects.
+pub const DEFAULT_AGENT_RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Resolves the controller state directory from `MU_CD_CONTROLLER_STATE_DIR` ->
+/// `MUCONDE_STATE_DIR` -> `/var/lib/muconde`.
+#[must_use]
+pub fn resolve_controller_state_dir(lookup: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    crate::first_non_empty_var(lookup, &["MU_CD_CONTROLLER_STATE_DIR", "MUCONDE_STATE_DIR"])
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTROLLER_STATE_DIR))
+}
+
+/// Returns the canonical path to the durable controller self-upgrade handoff file.
+#[must_use]
+pub fn pending_self_upgrade_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(PENDING_SELF_UPGRADE_FILENAME)
+}
+
+/// Returns `true` when `service` refers to the controller daemon itself.
+#[must_use]
+pub fn is_controller_self_upgrade_service(service: &str) -> bool {
+    matches!(service.trim(), "mu-cd-controller" | "muconde-controller")
+}
+
+/// Durable on-disk handoff written atomically (`0600`) immediately before dispatching
+/// `SlotSwapCommand` for `mu-cd-controller` so the restarted controller resumes gate and
+/// `MuObserve` bake-window SLO finalization without losing deployment state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PendingControllerSelfUpgrade {
+    pub deployment_id: String,
+    pub lease_id: String,
+    pub service: String,
+    #[serde(default)]
+    pub repo: Option<String>,
+    pub target_node: String,
+    pub artifact_sha256: String,
+    pub active_slot: String,
+    pub candidate_slot: String,
+    pub systemd_unit: String,
+    pub policy_commit_sha: String,
+    pub trace_id: String,
+    #[serde(default)]
+    pub selected_tests: Vec<String>,
+    pub bake_window_seconds: u64,
+    pub max_error_logs: u32,
+    pub max_p99_latency_ms: f64,
+    pub warmup_timeout_seconds: u64,
+    pub started_at_epoch_ms: u64,
+}
+
+fn slot_to_handoff_str(slot: DeploymentSlot) -> &'static str {
+    match slot {
+        DeploymentSlot::SlotA => "@a",
+        DeploymentSlot::SlotB => "@b",
+    }
+}
+
+fn parse_handoff_slot(raw: &str) -> Option<DeploymentSlot> {
+    match raw.trim() {
+        "@a" | "a" | "slot_a" | "SlotA" => Some(DeploymentSlot::SlotA),
+        "@b" | "b" | "slot_b" | "SlotB" => Some(DeploymentSlot::SlotB),
+        _ => None,
+    }
+}
+
+/// Atomically writes `handoff` to `path` with owner-only `0600` permissions (write temp + rename).
+pub fn write_pending_self_upgrade_atomic(
+    path: &Path,
+    handoff: &PendingControllerSelfUpgrade,
+) -> Result<(), OrchestratorError> {
+    let parent = path.parent().ok_or_else(|| {
+        OrchestratorError::DeploymentFailed(format!(
+            "Self-upgrade handoff path '{}' has no parent directory",
+            path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        OrchestratorError::DeploymentFailed(format!(
+            "Failed to create state directory '{}': {e}",
+            parent.display()
+        ))
+    })?;
+    let json = serde_json::to_vec_pretty(handoff).map_err(|e| {
+        OrchestratorError::DeploymentFailed(format!(
+            "Failed to serialize pending_self_upgrade.json: {e}"
+        ))
+    })?;
+    let tmp_path = parent.join(format!(
+        ".{PENDING_SELF_UPGRADE_FILENAME}.tmp-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let write_res = (|| -> std::io::Result<()> {
+        std::fs::write(&tmp_path, &json)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(OrchestratorError::DeploymentFailed(format!(
+            "Failed to persist '{}': {err}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Atomically claims and removes `pending_self_upgrade.json` if present and fresher than 10 minutes.
+pub fn claim_pending_self_upgrade(
+    path: &Path,
+) -> Result<Option<PendingControllerSelfUpgrade>, OrchestratorError> {
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    let claim_path = parent.join(format!(
+        ".{PENDING_SELF_UPGRADE_FILENAME}.claiming-{}",
+        uuid::Uuid::new_v4()
+    ));
+    match std::fs::rename(path, &claim_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(OrchestratorError::DeploymentFailed(format!(
+                "Failed to claim '{}': {e}",
+                path.display()
+            )));
+        }
+    }
+    let bytes = std::fs::read(&claim_path);
+    let _ = std::fs::remove_file(&claim_path);
+    let bytes = bytes.map_err(|e| {
+        OrchestratorError::DeploymentFailed(format!(
+            "Failed to read claimed self-upgrade handoff '{}': {e}",
+            claim_path.display()
+        ))
+    })?;
+    let pending: PendingControllerSelfUpgrade = serde_json::from_slice(&bytes).map_err(|e| {
+        OrchestratorError::DeploymentFailed(format!(
+            "Failed to deserialize pending_self_upgrade.json: {e}"
+        ))
+    })?;
+    let now_ms = LeaseCoordinator::current_epoch_ms();
+    let age_ms = now_ms.saturating_sub(pending.started_at_epoch_ms);
+    if age_ms > PENDING_SELF_UPGRADE_MAX_AGE_MS {
+        tracing::warn!(
+            deployment_id = %pending.deployment_id,
+            service = %pending.service,
+            age_ms,
+            "Ignoring expired pending_self_upgrade.json (>10 minutes old)"
+        );
+        return Ok(None);
+    }
+    Ok(Some(pending))
+}
+
+fn clear_pending_self_upgrade_if_matching(state_dir: &Path, deployment_id: &str) {
+    let path = pending_self_upgrade_path(state_dir);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    if let Ok(parsed) = serde_json::from_slice::<PendingControllerSelfUpgrade>(&bytes) {
+        if parsed.deployment_id == deployment_id {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+fn is_retryable_ipc_io_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionRefused
+    )
+}
 
 /// Represents the terminal outcome of a continuous delivery deployment run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,6 +703,7 @@ pub struct IpcAgentClient {
     progress_sink: Option<Arc<dyn ItProgressSink>>,
     tls_config: Option<TlsConfig>,
     policy_repo: Option<Arc<PolicyRepository>>,
+    reconnect_backoff: Duration,
     active_streams: Arc<tokio::sync::Mutex<std::collections::HashMap<String, AgentStream>>>,
 }
 
@@ -525,6 +713,7 @@ impl std::fmt::Debug for IpcAgentClient {
             .field("port", &self.port)
             .field("progress_sink", &self.progress_sink.is_some())
             .field("policy_repo", &self.policy_repo.is_some())
+            .field("reconnect_backoff_ms", &self.reconnect_backoff.as_millis())
             .field(
                 "tls_configured",
                 &self
@@ -544,8 +733,16 @@ impl IpcAgentClient {
             progress_sink: None,
             tls_config: None,
             policy_repo: None,
+            reconnect_backoff: DEFAULT_AGENT_RECONNECT_BACKOFF,
             active_streams: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Overrides the reconnect retry interval used while waiting for an agent restart.
+    #[must_use]
+    pub fn with_reconnect_backoff(mut self, backoff: Duration) -> Self {
+        self.reconnect_backoff = backoff.max(Duration::from_millis(1));
+        self
     }
 
     /// Forward `IntegrationTestProgress` frames to `sink` (e.g. the CD API state store).
@@ -586,16 +783,24 @@ impl IpcAgentClient {
         node_id.trim().to_string()
     }
 
-    async fn connect_stream(&self, host: &str) -> Result<AgentStream, OrchestratorError> {
+    async fn connect_stream_classified(
+        &self,
+        host: &str,
+    ) -> Result<AgentStream, (Option<std::io::ErrorKind>, OrchestratorError)> {
         let connector = match self
             .tls_config
             .as_ref()
             .filter(|cfg| cfg.has_tls_material())
         {
             Some(tls_cfg) => Some((
-                tls_cfg.build_tls_connector()?,
+                tls_cfg
+                    .build_tls_connector()
+                    .map_err(|e| (None, OrchestratorError::from(e)))?,
                 ServerName::try_from(host.to_string()).map_err(|e| {
-                    OrchestratorError::Agent(format!("Invalid TLS server name '{host}': {e}"))
+                    (
+                        None,
+                        OrchestratorError::Agent(format!("Invalid TLS server name '{host}': {e}")),
+                    )
                 })?,
             )),
             None => None,
@@ -603,7 +808,10 @@ impl IpcAgentClient {
 
         let addr = format!("{}:{}", host, self.port);
         let tcp_stream = TcpStream::connect(&addr).await.map_err(|e| {
-            OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
+            (
+                Some(e.kind()),
+                OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}")),
+            )
         })?;
 
         if let Some((connector, server_name)) = connector {
@@ -611,13 +819,49 @@ impl IpcAgentClient {
                 .connect(server_name, tcp_stream)
                 .await
                 .map_err(|e| {
-                    OrchestratorError::Agent(format!(
-                        "mTLS handshake with agent {addr} failed: {e}"
-                    ))
+                    (
+                        Some(e.kind()),
+                        OrchestratorError::Agent(format!(
+                            "mTLS handshake with agent {addr} failed: {e}"
+                        )),
+                    )
                 })?;
             Ok(AgentStream::Tls(Box::new(tls_stream)))
         } else {
             Ok(AgentStream::Plain(tcp_stream))
+        }
+    }
+
+    async fn connect_stream(&self, host: &str) -> Result<AgentStream, OrchestratorError> {
+        self.connect_stream_classified(host)
+            .await
+            .map_err(|(_, err)| err)
+    }
+
+    async fn connect_stream_with_retry(
+        &self,
+        host: &str,
+        immediate_first_attempt: bool,
+    ) -> Result<AgentStream, OrchestratorError> {
+        let mut first = immediate_first_attempt;
+        loop {
+            if !first {
+                tokio::time::sleep(self.reconnect_backoff).await;
+            }
+            first = false;
+            match self.connect_stream_classified(host).await {
+                Ok(stream) => return Ok(stream),
+                Err((Some(kind), err)) if is_retryable_ipc_io_kind(kind) => {
+                    tracing::debug!(
+                        host = %host,
+                        port = self.port,
+                        error = %err,
+                        backoff_ms = self.reconnect_backoff.as_millis() as u64,
+                        "Retrying agent IPC connection after transient error"
+                    );
+                }
+                Err((_, err)) => return Err(err),
+            }
         }
     }
 }
@@ -729,36 +973,41 @@ impl AgentIpcClient for IpcAgentClient {
     ) -> Result<IntegrationTestReport, OrchestratorError> {
         let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
         let host = self.resolve_agent_host(node_id);
-        let mut stream = if let Some(s) = self.active_streams.lock().await.remove(deployment_id) {
-            s
-        } else {
-            self.connect_stream(&host).await?
-        };
+        let initial_stream = self.active_streams.lock().await.remove(deployment_id);
 
         let executed = match selected_tests {
             Some(tests) => tests.to_vec(),
             None => vec!["all".to_string()],
         };
 
-        // Await IntegrationTestReport frame or terminal IntegrationTestProgress frames within timeout
+        // Await IntegrationTestReport frame or terminal IntegrationTestProgress frames within timeout,
+        // retrying transient disconnects (`UnexpectedEof | ConnectionReset | BrokenPipe | ConnectionRefused`)
+        // across agent or controller self-upgrades until the timeout deadline.
         let read_future = async {
+            let mut stream = match initial_stream {
+                Some(s) => s,
+                None => self.connect_stream_with_retry(&host, true).await?,
+            };
             let mut seen_states: std::collections::HashMap<String, mu_cd_ipc::TestState> =
                 std::collections::HashMap::new();
             let mut seen_order: Vec<String> = Vec::new();
             let mut max_duration_ms: u64 = 0;
-            let mut reconnected_after_swap_eof = false;
+            let mut reconnected_once = false;
 
             loop {
                 let frame_res = read_frame(&mut stream).await;
                 let (header, payload) = match frame_res {
                     Ok(f) => f,
-                    Err(mu_cd_ipc::IpcError::Io(ref e))
-                        if e.kind() == std::io::ErrorKind::UnexpectedEof
-                            && seen_states.is_empty()
-                            && !reconnected_after_swap_eof =>
-                    {
-                        reconnected_after_swap_eof = true;
-                        stream = self.connect_stream(&host).await?;
+                    Err(mu_cd_ipc::IpcError::Io(ref e)) if is_retryable_ipc_io_kind(e.kind()) => {
+                        tracing::info!(
+                            deployment_id = %deployment_id,
+                            host = %host,
+                            error_kind = ?e.kind(),
+                            "Agent IPC stream disconnected while awaiting integration report; reconnecting"
+                        );
+                        let immediate = !reconnected_once;
+                        reconnected_once = true;
+                        stream = self.connect_stream_with_retry(&host, immediate).await?;
                         continue;
                     }
                     Err(e) => return Err(OrchestratorError::Agent(e.to_string())),
@@ -871,6 +1120,7 @@ pub struct DeploymentOrchestrator {
     cd_state: Option<Arc<CdStateStore>>,
     telemetry_sink: Option<Arc<dyn CdTelemetrySink>>,
     policy_repo: Option<Arc<PolicyRepository>>,
+    state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -878,7 +1128,15 @@ struct PromotedNodeRecord {
     outcome_index: usize,
     deployment_id: String,
     node: String,
+    binary_digest: String,
     restore_slot: DeploymentSlot,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedNodeTarget {
+    node: String,
+    binary_digest: String,
+    it_archive_digest: Option<String>,
 }
 
 struct CompensationRequest<'a> {
@@ -909,7 +1167,22 @@ impl DeploymentOrchestrator {
             cd_state: None,
             telemetry_sink: None,
             policy_repo: None,
+            state_dir: None,
         }
+    }
+
+    /// Configures the writable state directory used for durable controller self-upgrade handoffs
+    /// (`<state_dir>/pending_self_upgrade.json`).
+    #[must_use]
+    pub fn with_state_dir(mut self, state_dir: impl Into<PathBuf>) -> Self {
+        self.state_dir = Some(state_dir.into());
+        self
+    }
+
+    /// Returns the configured writable state directory, if set.
+    #[must_use]
+    pub fn state_dir(&self) -> Option<&Path> {
+        self.state_dir.as_deref()
     }
 
     /// Configures bounded contention-tolerant exponential backoff parameters for idle node discovery.
@@ -1108,13 +1381,35 @@ impl DeploymentOrchestrator {
         repo: Option<&str>,
         parent_trace: Option<TraceContext>,
     ) -> Result<Vec<DeploymentOutcome>, OrchestratorError> {
+        self.orchestrate_rollout_with_snapshot_and_arch_digests(
+            snapshot,
+            artifact_sha256,
+            None,
+            repo,
+            parent_trace,
+        )
+        .await
+    }
+
+    /// Orchestrates sequential A/B rollout across every distinct target node defined by an
+    /// immutable verified [`PinnedDeploymentSnapshot`], resolving optional per-architecture
+    /// binary and IT archive digests against `snapshot.nodes_inventory` before touching node 1.
+    pub async fn orchestrate_rollout_with_snapshot_and_arch_digests(
+        &self,
+        snapshot: Arc<PinnedDeploymentSnapshot>,
+        default_artifact_sha256: &str,
+        arch_digests: Option<&ArchDigestMaps>,
+        repo: Option<&str>,
+        parent_trace: Option<TraceContext>,
+    ) -> Result<Vec<DeploymentOutcome>, OrchestratorError> {
         let config = snapshot.to_muconde_config();
         self.orchestrate_rollout_internal(
             &config,
-            artifact_sha256,
+            default_artifact_sha256,
             repo,
             parent_trace,
             Some(snapshot),
+            arch_digests,
         )
         .await
     }
@@ -1127,8 +1422,106 @@ impl DeploymentOrchestrator {
         repo: Option<&str>,
         parent_trace: Option<TraceContext>,
     ) -> Result<Vec<DeploymentOutcome>, OrchestratorError> {
-        self.orchestrate_rollout_internal(config, artifact_sha256, repo, parent_trace, None)
+        self.orchestrate_rollout_internal(config, artifact_sha256, repo, parent_trace, None, None)
             .await
+    }
+
+    fn resolve_rollout_node_targets(
+        targets: &[String],
+        default_artifact_sha256: &str,
+        default_it_archive_digest: Option<&str>,
+        snapshot: Option<&PinnedDeploymentSnapshot>,
+        arch_digests: Option<&ArchDigestMaps>,
+    ) -> Result<Vec<ResolvedNodeTarget>, OrchestratorError> {
+        let has_arch_bin = arch_digests.is_some_and(|m| !m.binary_digests.is_empty());
+        let has_arch_it = arch_digests.is_some_and(|m| !m.it_archive_digests.is_empty());
+
+        let mut plan = Vec::with_capacity(targets.len());
+        for node in targets {
+            let node_arch = snapshot.and_then(|s| s.node_arch(node));
+            let binary_digest = if has_arch_bin {
+                let arch = node_arch.ok_or_else(|| {
+                    OrchestratorError::DeploymentFailed(format!(
+                        "Multi-arch rollout cannot resolve architecture for target node '{node}' from verified nodes inventory"
+                    ))
+                })?;
+                arch_digests
+                    .and_then(|m| m.binary_digests.get(&arch))
+                    .cloned()
+                    .ok_or_else(|| {
+                        OrchestratorError::DeploymentFailed(format!(
+                            "Missing binary_digests_by_arch entry for target node '{node}' architecture '{}'",
+                            arch.as_canonical_str()
+                        ))
+                    })?
+            } else {
+                default_artifact_sha256.to_string()
+            };
+
+            let it_archive_digest = if has_arch_it {
+                let arch = node_arch.ok_or_else(|| {
+                    OrchestratorError::DeploymentFailed(format!(
+                        "Multi-arch rollout cannot resolve architecture for target node '{node}' from verified nodes inventory"
+                    ))
+                })?;
+                let digest = arch_digests
+                    .and_then(|m| m.it_archive_digests.get(&arch))
+                    .cloned()
+                    .ok_or_else(|| {
+                        OrchestratorError::DeploymentFailed(format!(
+                            "Missing it_archive_digests_by_arch entry for target node '{node}' architecture '{}'",
+                            arch.as_canonical_str()
+                        ))
+                    })?;
+                Some(digest)
+            } else {
+                default_it_archive_digest.map(str::to_string)
+            };
+
+            plan.push(ResolvedNodeTarget {
+                node: node.clone(),
+                binary_digest,
+                it_archive_digest,
+            });
+        }
+        Ok(plan)
+    }
+
+    async fn taint_participating_digests(
+        &self,
+        service: &str,
+        deployment_id: &str,
+        failed_node: &str,
+        already_tainted_digest: Option<&str>,
+        participating_digests: &[String],
+        reason: &str,
+    ) {
+        for digest in participating_digests {
+            if already_tainted_digest == Some(digest.as_str()) {
+                continue;
+            }
+            self.mark_local_tainted(digest.clone()).await;
+            let notif = ArtifactTaintNotification {
+                deployment_id: deployment_id.to_string(),
+                service_name: service.to_string(),
+                artifact_sha256: digest.clone(),
+                tainted_at_epoch_ms: LeaseCoordinator::current_epoch_ms(),
+                reason: reason.to_string(),
+                rollback_completed: true,
+            };
+            if let Err(e) = self
+                .regist_client
+                .taint_canary_for_node(digest, Some(failed_node), &notif)
+                .await
+            {
+                tracing::error!(
+                    digest = %digest,
+                    node = %failed_node,
+                    error = %e,
+                    "Failed to taint participating multi-arch digest in MuRegist"
+                );
+            }
+        }
     }
 
     async fn orchestrate_rollout_internal(
@@ -1138,6 +1531,7 @@ impl DeploymentOrchestrator {
         repo: Option<&str>,
         parent_trace: Option<TraceContext>,
         snapshot: Option<Arc<PinnedDeploymentSnapshot>>,
+        arch_digests: Option<&ArchDigestMaps>,
     ) -> Result<Vec<DeploymentOutcome>, OrchestratorError> {
         config.validate()?;
         let targets = if snapshot.is_some() {
@@ -1156,14 +1550,54 @@ impl DeploymentOrchestrator {
             return Err(OrchestratorError::Contract(ContractError::EmptyTargetNodes));
         }
 
+        // Pre-node-1 multi-arch resolution (fail closed on missing arch before touching node 1)
+        let resolved_targets = Self::resolve_rollout_node_targets(
+            &targets,
+            artifact_sha256,
+            config.it_archive_digest.as_deref(),
+            snapshot.as_deref(),
+            arch_digests,
+        )?;
+
+        // Pre-node-1 taint check across ALL distinct participating binary digests
+        let mut distinct_binary_digests = Vec::new();
+        for target in &resolved_targets {
+            if !distinct_binary_digests.contains(&target.binary_digest) {
+                distinct_binary_digests.push(target.binary_digest.clone());
+            }
+        }
+        for digest in &distinct_binary_digests {
+            if self.is_digest_tainted(digest).await? {
+                return Err(OrchestratorError::ArtifactTainted(digest.clone()));
+            }
+        }
+
+        let reuse_snapshot_dep_id = resolved_targets.len() == 1
+            && is_controller_self_upgrade_service(&config.service)
+            && snapshot
+                .as_ref()
+                .is_some_and(|s| !s.deployment_id.trim().is_empty());
+
         let mut outcomes = Vec::new();
         let mut promoted: Vec<PromotedNodeRecord> = Vec::new();
 
-        for node in targets {
+        for target in resolved_targets {
+            let node = target.node;
+            let node_digest = target.binary_digest;
             let mut single_cfg = config.clone();
             single_cfg.target_nodes = vec![node.clone()];
             single_cfg.deployment.target_nodes = vec![node.clone()];
-            let node_dep_id = format!("dep-{}", uuid::Uuid::new_v4());
+            if let Some(ref it_digest) = target.it_archive_digest {
+                single_cfg.it_archive_digest = Some(it_digest.clone());
+            }
+            let node_dep_id = if reuse_snapshot_dep_id {
+                snapshot
+                    .as_ref()
+                    .map(|s| s.deployment_id.clone())
+                    .unwrap_or_else(|| format!("dep-{}", uuid::Uuid::new_v4()))
+            } else {
+                format!("dep-{}", uuid::Uuid::new_v4())
+            };
             if let (Some(ref policy_repo), Some(ref snap)) = (&self.policy_repo, &snapshot) {
                 policy_repo.register_snapshot_alias(node_dep_id.clone(), snap.clone());
             }
@@ -1171,11 +1605,12 @@ impl DeploymentOrchestrator {
             match self
                 .orchestrate_deployment_internal(
                     &single_cfg,
-                    artifact_sha256,
-                    Some(node_dep_id),
+                    &node_digest,
+                    Some(node_dep_id.clone()),
                     repo,
                     parent_trace,
                     snapshot.as_deref(),
+                    target.it_archive_digest.as_deref(),
                 )
                 .await
             {
@@ -1195,15 +1630,18 @@ impl DeploymentOrchestrator {
                             outcome_index: idx,
                             deployment_id: deployment_id.clone(),
                             node: target_node.clone(),
+                            binary_digest: node_digest.clone(),
                             restore_slot,
                         });
                         outcomes.push(outcome);
                     }
                     DeploymentOutcome::RolledBack {
+                        deployment_id: failed_dep_id,
                         target_node: failed_node,
                         reason,
                         ..
                     } => {
+                        let failed_dep_id = failed_dep_id.clone();
                         let failed_node = failed_node.clone();
                         let reason = reason.clone();
                         outcomes.push(outcome);
@@ -1211,7 +1649,7 @@ impl DeploymentOrchestrator {
                             self.compensate_promoted_nodes(
                                 CompensationRequest {
                                     config,
-                                    artifact_sha256,
+                                    artifact_sha256: &node_digest,
                                     failed_node: &failed_node,
                                     failure_reason: &reason,
                                     taint_in_state: true,
@@ -1222,6 +1660,15 @@ impl DeploymentOrchestrator {
                             )
                             .await?;
                         }
+                        self.taint_participating_digests(
+                            &config.service,
+                            &failed_dep_id,
+                            &failed_node,
+                            Some(&node_digest),
+                            &distinct_binary_digests,
+                            &reason,
+                        )
+                        .await;
                         break;
                     }
                 },
@@ -1229,14 +1676,14 @@ impl DeploymentOrchestrator {
                     let should_compensate = !promoted.is_empty()
                         && (!matches!(err, OrchestratorError::IntegrationTestFailed { .. })
                             || config.ab_rules.auto_rollback_on_critical);
+                    let taint_digest =
+                        matches!(err, OrchestratorError::IntegrationTestFailed { .. });
+                    let err_msg = err.to_string();
                     if should_compensate {
-                        let taint_digest =
-                            matches!(err, OrchestratorError::IntegrationTestFailed { .. });
-                        let err_msg = err.to_string();
                         self.compensate_promoted_nodes(
                             CompensationRequest {
                                 config,
-                                artifact_sha256,
+                                artifact_sha256: &node_digest,
                                 failed_node: &node,
                                 failure_reason: &err_msg,
                                 taint_in_state: taint_digest,
@@ -1250,7 +1697,7 @@ impl DeploymentOrchestrator {
                         self.emit_partial_rollout_audit(
                             parent_trace,
                             config,
-                            artifact_sha256,
+                            &node_digest,
                             &node,
                             "WARN",
                             13,
@@ -1259,6 +1706,17 @@ impl DeploymentOrchestrator {
                                 promoted.len()
                             ),
                             Vec::new(),
+                        )
+                        .await;
+                    }
+                    if taint_digest {
+                        self.taint_participating_digests(
+                            &config.service,
+                            &node_dep_id,
+                            &node,
+                            None,
+                            &distinct_binary_digests,
+                            &err_msg,
                         )
                         .await;
                     }
@@ -1328,6 +1786,7 @@ impl DeploymentOrchestrator {
             repo,
             parent_trace,
             None,
+            None,
         )
         .await
     }
@@ -1350,10 +1809,12 @@ impl DeploymentOrchestrator {
             repo,
             parent_trace,
             Some(snapshot),
+            None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn orchestrate_deployment_internal(
         &self,
         config: &MuConDeConfig,
@@ -1362,6 +1823,7 @@ impl DeploymentOrchestrator {
         repo: Option<&str>,
         parent_trace: Option<TraceContext>,
         snapshot: Option<&PinnedDeploymentSnapshot>,
+        it_archive_digest_override: Option<&str>,
     ) -> Result<DeploymentOutcome, OrchestratorError> {
         let dep_start_ns = now_unix_nano();
         let root_trace = parent_trace.unwrap_or_else(|| {
@@ -1604,24 +2066,33 @@ impl DeploymentOrchestrator {
 
         // Step 5: Transmit resolved ScenarioExecutionPlan (0x0D) and perform atomic slot swap (0x06)
         let scenario_plan: Option<ScenarioExecutionPlan> = if let Some(snap) = snapshot {
-            snap.plan_for_node(&target_node, &deployment_id, &grant.lease_id)
-                .or_else(|| {
-                    config
-                        .effective_target_nodes()
-                        .first()
-                        .and_then(|raw| snap.plan_for_node(raw, &deployment_id, &grant.lease_id))
+            snap.plan_for_node_with_it_digest(
+                &target_node,
+                &deployment_id,
+                &grant.lease_id,
+                it_archive_digest_override,
+            )
+            .or_else(|| {
+                config.effective_target_nodes().first().and_then(|raw| {
+                    snap.plan_for_node_with_it_digest(
+                        raw,
+                        &deployment_id,
+                        &grant.lease_id,
+                        it_archive_digest_override,
+                    )
                 })
+            })
         } else {
-            config
-                .it_archive_digest
-                .as_ref()
+            it_archive_digest_override
+                .map(str::to_string)
+                .or_else(|| config.it_archive_digest.clone())
                 .map(|digest| ScenarioExecutionPlan {
                     deployment_id: deployment_id.clone(),
                     lease_id: grant.lease_id.clone(),
                     service_name: config.service.clone(),
                     node_id: target_node.clone(),
                     policy_commit_sha: String::new(),
-                    it_archive_digest: Some(digest.clone()),
+                    it_archive_digest: Some(digest),
                     bundle_id: None,
                     selected_tests: config
                         .selected_tests()
@@ -1647,6 +2118,44 @@ impl DeploymentOrchestrator {
             systemd_unit: config.effective_systemd_unit(),
             warmup_timeout_secs: config.warmup_timeout_seconds,
         };
+
+        // Persist durable 0600 self-upgrade handoff BEFORE triggering controller restart via SlotSwapCommand
+        if is_controller_self_upgrade_service(&config.service) {
+            if let Some(ref state_dir) = self.state_dir {
+                let handoff = PendingControllerSelfUpgrade {
+                    deployment_id: deployment_id.clone(),
+                    lease_id: grant.lease_id.clone(),
+                    service: config.service.clone(),
+                    repo: repo.map(str::to_string),
+                    target_node: target_node.clone(),
+                    artifact_sha256: artifact_sha256.to_string(),
+                    active_slot: slot_to_handoff_str(grant.active_slot).to_string(),
+                    candidate_slot: slot_to_handoff_str(grant.candidate_slot).to_string(),
+                    systemd_unit: swap_cmd.systemd_unit.clone(),
+                    policy_commit_sha: snapshot
+                        .map(|s| s.policy_commit_sha.clone())
+                        .unwrap_or_default(),
+                    trace_id: dep_span_ctx.trace_id_hex(),
+                    selected_tests: config
+                        .selected_tests()
+                        .map(|t| t.to_vec())
+                        .unwrap_or_default(),
+                    bake_window_seconds: config.bake_window_seconds,
+                    max_error_logs: config.max_error_logs,
+                    max_p99_latency_ms: config.max_p99_latency_ms,
+                    warmup_timeout_seconds: config.warmup_timeout_seconds,
+                    started_at_epoch_ms: LeaseCoordinator::current_epoch_ms(),
+                };
+                write_pending_self_upgrade_atomic(&pending_self_upgrade_path(state_dir), &handoff)?;
+                tracing::info!(
+                    deployment_id = %deployment_id,
+                    service = %config.service,
+                    target_node = %target_node,
+                    state_dir = %state_dir.display(),
+                    "Persisted atomic 0600 pending_self_upgrade.json prior to controller SlotSwapCommand"
+                );
+            }
+        }
 
         if let Err(e) = self
             .agent_client
@@ -2090,12 +2599,293 @@ impl DeploymentOrchestrator {
         ));
         self.emit_telemetry_spans(spans_to_emit).await;
 
+        if is_controller_self_upgrade_service(&config.service) {
+            if let Some(ref state_dir) = self.state_dir {
+                clear_pending_self_upgrade_if_matching(state_dir, &deployment_id);
+            }
+        }
+
         Ok(DeploymentOutcome::Promoted {
             deployment_id,
             service: config.service.clone(),
             target_node,
             artifact_sha256: artifact_sha256.to_string(),
         })
+    }
+
+    /// Resumes an interrupted controller self-upgrade from `<state_dir>/pending_self_upgrade.json`
+    /// (written atomically prior to `SlotSwapCommand`) when fresh (`<= 10 minutes`).
+    ///
+    /// Atomically claims and removes the handoff file, hydrates [`CdStateStore`] under the original
+    /// `deployment_id`, reconnects to `mu-cd-agent` via [`AgentIpcClient::execute_integration_tests`]
+    /// to collect the cached [`IntegrationTestReport`], runs the configured `MuObserve` bake-window
+    /// SLO assertion, and finalizes either promotion (`Promoted` + `mu-registry /promote`) or
+    /// rollback (`RolledBack` + agent rollback + `mu-registry /taint` with actual `target_node`).
+    pub async fn resume_pending_self_upgrade_if_present(
+        &self,
+    ) -> Result<Option<DeploymentOutcome>, OrchestratorError> {
+        let Some(ref state_dir) = self.state_dir else {
+            return Ok(None);
+        };
+        let path = pending_self_upgrade_path(state_dir);
+        let Some(pending) = claim_pending_self_upgrade(&path)? else {
+            return Ok(None);
+        };
+
+        let active_slot = parse_handoff_slot(&pending.active_slot).ok_or_else(|| {
+            OrchestratorError::DeploymentFailed(format!(
+                "Invalid active_slot '{}' in pending_self_upgrade.json",
+                pending.active_slot
+            ))
+        })?;
+        let candidate_slot = parse_handoff_slot(&pending.candidate_slot).ok_or_else(|| {
+            OrchestratorError::DeploymentFailed(format!(
+                "Invalid candidate_slot '{}' in pending_self_upgrade.json",
+                pending.candidate_slot
+            ))
+        })?;
+
+        tracing::info!(
+            deployment_id = %pending.deployment_id,
+            service = %pending.service,
+            target_node = %pending.target_node,
+            active_slot = ?active_slot,
+            candidate_slot = ?candidate_slot,
+            "Resuming pending controller self-upgrade gate after daemon restart"
+        );
+
+        let resume_start_ns = now_unix_nano();
+        let warmup_secs = pending.warmup_timeout_seconds.max(1);
+        let lease_expires_ms = pending
+            .started_at_epoch_ms
+            .saturating_add(warmup_secs.max(60).saturating_mul(1000));
+
+        if let Some(ref store) = self.cd_state {
+            let tests = pending
+                .selected_tests
+                .iter()
+                .map(|t| (t.clone(), true))
+                .collect();
+            store.deployment_started(DeploymentStart {
+                deployment_id: pending.deployment_id.clone(),
+                repo: pending.repo.clone(),
+                service: pending.service.clone(),
+                artifact_digest: pending.artifact_sha256.clone(),
+                target_node: pending.target_node.clone(),
+                active_slot: Slot::from(active_slot),
+                staged_slot: Slot::from(candidate_slot),
+                restore_slot: Slot::from(active_slot),
+                lease_id: pending.lease_id.clone(),
+                lease_expires_epoch_ms: lease_expires_ms,
+                tests,
+            });
+        }
+
+        let selected_tests = if pending.selected_tests.is_empty() {
+            None
+        } else {
+            Some(pending.selected_tests.as_slice())
+        };
+        let it_result = self
+            .agent_client
+            .execute_integration_tests(
+                &pending.target_node,
+                &pending.deployment_id,
+                &pending.service,
+                &pending.artifact_sha256,
+                selected_tests,
+                Duration::from_secs(warmup_secs),
+            )
+            .await;
+
+        let mut failure_reason: Option<String> = match it_result {
+            Ok(report) => {
+                if let Some(ref store) = self.cd_state {
+                    store.apply_it_report(&report);
+                }
+                if !report.passed || !report.failed_tests.is_empty() {
+                    Some(format!(
+                        "Integration tests failed: {:?}",
+                        report.failed_tests
+                    ))
+                } else {
+                    None
+                }
+            }
+            Err(e) => Some(format!(
+                "Integration test communication failure after controller restart: {e}"
+            )),
+        };
+
+        if failure_reason.is_none() {
+            if let Some(ref slo_client) = self.slo_client {
+                let slo_req = CanarySloAssertionRequest {
+                    request_id: format!("slo-{}", pending.deployment_id),
+                    service_name: pending.service.clone(),
+                    candidate_digest: pending.artifact_sha256.clone(),
+                    node_id: pending.target_node.clone(),
+                    bake_window_secs: pending.bake_window_seconds,
+                    max_error_logs: pending.max_error_logs,
+                    max_p99_latency_ms: pending.max_p99_latency_ms,
+                };
+                match slo_client.verify_canary_slo(&slo_req).await {
+                    Ok(slo_resp) => {
+                        if !slo_resp.healthy || slo_resp.taint_recommended {
+                            failure_reason = Some(format!(
+                                "MuObserve canary SLO breach (healthy={}, taint_recommended={}, error_logs={}, p99_latency_ms={:.2}): {}",
+                                slo_resp.healthy,
+                                slo_resp.taint_recommended,
+                                slo_resp.error_log_count,
+                                slo_resp.p99_latency_ms,
+                                slo_resp.reason
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        failure_reason =
+                            Some(format!("MuObserve canary SLO verification error: {e}"));
+                    }
+                }
+            }
+        }
+
+        let trace = Self::resolve_audit_trace(None, resume_start_ns);
+        let span_ctx = trace.next_deterministic_child(1);
+
+        if let Some(reason) = failure_reason {
+            let rollback_cmd = RollbackCommand {
+                deployment_id: pending.deployment_id.clone(),
+                lease_id: pending.lease_id.clone(),
+                service_name: pending.service.clone(),
+                restore_slot: active_slot,
+                failed_artifact_sha256: pending.artifact_sha256.clone(),
+                reason: reason.clone(),
+            };
+            if let Err(e) = self
+                .agent_client
+                .rollback(&pending.target_node, &rollback_cmd)
+                .await
+            {
+                tracing::error!(
+                    deployment_id = %pending.deployment_id,
+                    node = %pending.target_node,
+                    error = %e,
+                    "Failed to dispatch rollback command during resumed controller self-upgrade"
+                );
+            }
+            self.mark_local_tainted(pending.artifact_sha256.clone())
+                .await;
+            let taint_notif = ArtifactTaintNotification {
+                deployment_id: pending.deployment_id.clone(),
+                service_name: pending.service.clone(),
+                artifact_sha256: pending.artifact_sha256.clone(),
+                tainted_at_epoch_ms: LeaseCoordinator::current_epoch_ms(),
+                reason: reason.clone(),
+                rollback_completed: true,
+            };
+            if let Err(e) = self
+                .regist_client
+                .taint_canary_for_node(
+                    &pending.artifact_sha256,
+                    Some(&pending.target_node),
+                    &taint_notif,
+                )
+                .await
+            {
+                tracing::error!(
+                    digest = %pending.artifact_sha256,
+                    node = %pending.target_node,
+                    error = %e,
+                    "Failed to taint digest during resumed controller self-upgrade rollback"
+                );
+            }
+            self.lease_coordinator
+                .set_active_slot(&pending.target_node, &pending.service, active_slot)
+                .await;
+            if let Some(ref store) = self.cd_state {
+                store.deployment_rolled_back(
+                    &pending.deployment_id,
+                    Slot::from(active_slot),
+                    classify_rollback_reason(&reason),
+                    &reason,
+                );
+                store.deployment_tainted(&pending.deployment_id, &pending.artifact_sha256, &reason);
+            }
+            self.sync_leases().await;
+            self.emit_telemetry_spans(vec![build_cd_span(
+                trace.trace_id,
+                span_ctx.span_id,
+                None,
+                &pending.target_node,
+                "cd.deployment.self_upgrade_resume",
+                "SERVER",
+                resume_start_ns,
+                now_unix_nano(),
+                "ERROR",
+                Some(reason.clone()),
+                serde_json::json!({
+                    "deployment_id": &pending.deployment_id,
+                    "service": &pending.service,
+                    "target_node": &pending.target_node,
+                    "artifact_sha256": &pending.artifact_sha256,
+                    "original_trace_id": &pending.trace_id,
+                }),
+            )])
+            .await;
+            return Ok(Some(DeploymentOutcome::RolledBack {
+                deployment_id: pending.deployment_id,
+                service: pending.service,
+                target_node: pending.target_node,
+                artifact_sha256: pending.artifact_sha256,
+                reason,
+            }));
+        }
+
+        if let Err(e) = self
+            .regist_client
+            .promote_canary(&pending.artifact_sha256)
+            .await
+        {
+            tracing::error!(
+                digest = %pending.artifact_sha256,
+                error = %e,
+                "MuRegist promotion failed during resumed controller self-upgrade"
+            );
+        }
+        self.lease_coordinator
+            .set_active_slot(&pending.target_node, &pending.service, candidate_slot)
+            .await;
+        if let Some(ref store) = self.cd_state {
+            store.deployment_promoted(&pending.deployment_id, Slot::from(candidate_slot));
+        }
+        self.sync_leases().await;
+        self.emit_telemetry_spans(vec![build_cd_span(
+            trace.trace_id,
+            span_ctx.span_id,
+            None,
+            &pending.target_node,
+            "cd.deployment.self_upgrade_resume",
+            "SERVER",
+            resume_start_ns,
+            now_unix_nano(),
+            "OK",
+            None,
+            serde_json::json!({
+                "deployment_id": &pending.deployment_id,
+                "service": &pending.service,
+                "target_node": &pending.target_node,
+                "artifact_sha256": &pending.artifact_sha256,
+                "original_trace_id": &pending.trace_id,
+            }),
+        )])
+        .await;
+
+        Ok(Some(DeploymentOutcome::Promoted {
+            deployment_id: pending.deployment_id,
+            service: pending.service,
+            target_node: pending.target_node,
+            artifact_sha256: pending.artifact_sha256,
+        }))
     }
 
     /// Canonical stage span name reflecting the candidate A/B slot.
@@ -2191,7 +2981,7 @@ impl DeploymentOrchestrator {
                 lease_id: format!("compensate-{}", track.deployment_id),
                 service_name: req.config.service.clone(),
                 restore_slot: track.restore_slot,
-                failed_artifact_sha256: req.artifact_sha256.to_string(),
+                failed_artifact_sha256: track.binary_digest.clone(),
                 reason: comp_reason.clone(),
             };
             let span_start = now_unix_nano();
@@ -2207,7 +2997,7 @@ impl DeploymentOrchestrator {
                         if req.taint_in_state {
                             store.deployment_tainted(
                                 &track.deployment_id,
-                                req.artifact_sha256,
+                                &track.binary_digest,
                                 &comp_reason,
                             );
                         }
@@ -2245,7 +3035,7 @@ impl DeploymentOrchestrator {
                                 deployment_id: track.deployment_id.clone(),
                                 service: req.config.service.clone(),
                                 target_node: track.node.clone(),
-                                artifact_sha256: req.artifact_sha256.to_string(),
+                                artifact_sha256: track.binary_digest.clone(),
                                 reason: comp_reason,
                             };
                         }
@@ -2427,6 +3217,12 @@ impl DeploymentOrchestrator {
             }),
         )])
         .await;
+
+        if is_controller_self_upgrade_service(&config.service) {
+            if let Some(ref state_dir) = self.state_dir {
+                clear_pending_self_upgrade_if_matching(state_dir, &grant.deployment_id);
+            }
+        }
 
         Ok(DeploymentOutcome::RolledBack {
             deployment_id: grant.deployment_id.clone(),
@@ -4234,5 +5030,416 @@ mod tests {
             coordinator.active_slot_for("node-2", "action-runner").await,
             DeploymentSlot::SlotA
         );
+    }
+
+    #[test]
+    fn test_resolve_controller_state_dir_env_precedence() {
+        assert_eq!(
+            resolve_controller_state_dir(&|_| None),
+            PathBuf::from(DEFAULT_CONTROLLER_STATE_DIR)
+        );
+        assert_eq!(
+            resolve_controller_state_dir(
+                &|k| (k == "MUCONDE_STATE_DIR").then(|| "/var/lib/legacy-state".to_string())
+            ),
+            PathBuf::from("/var/lib/legacy-state")
+        );
+        assert_eq!(
+            resolve_controller_state_dir(&|k| match k {
+                "MU_CD_CONTROLLER_STATE_DIR" => Some("/var/lib/preferred-state".to_string()),
+                "MUCONDE_STATE_DIR" => Some("/var/lib/legacy-state".to_string()),
+                _ => None,
+            }),
+            PathBuf::from("/var/lib/preferred-state")
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_ipc_agent_client_retries_connection_refused_and_eof_until_report() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addr = listener.local_addr().unwrap();
+
+        // Phase 1: Accept slot_swap stream, drop immediately (simulating agent restart)
+        // AND drop the listener so subsequent connects hit ECONNREFUSED for ~180ms.
+        let server_task = tokio::spawn(async move {
+            let (mut s1, _) = listener.accept().await.unwrap();
+            let (hdr, _payload) = read_frame(&mut s1).await.unwrap();
+            assert_eq!(hdr.msg_type, MSG_TYPE_SLOT_SWAP);
+            drop(s1);
+            drop(listener);
+
+            // Agent is offline for 180ms (controller retries with 40ms backoff)
+            tokio::time::sleep(Duration::from_millis(180)).await;
+
+            // Agent restarts on the same port and delivers cached IntegrationTestReport
+            let listener2 = TcpListener::bind(addr).await.unwrap();
+            let (mut s2, _) = listener2.accept().await.unwrap();
+            let fory = create_fory_runtime().unwrap();
+            let report = IntegrationTestReport {
+                deployment_id: "dep-reconn-retry".into(),
+                service_name: "mu-cd-agent".into(),
+                artifact_sha256: "a".repeat(64),
+                executed_tests: vec!["smoke_mu_cd_agent".into()],
+                passed: true,
+                failed_tests: Vec::new(),
+                duration_ms: 35,
+                log_excerpt: Some("reconnected after restart".into()),
+            };
+            let bytes = fory.serialize(&report).unwrap();
+            write_frame(
+                &mut s2,
+                &IpcHeader::new(MSG_TYPE_IT_REPORT, bytes.len() as u32, 0, 1),
+                &bytes,
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = IpcAgentClient::new(port).with_reconnect_backoff(Duration::from_millis(40));
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: "dep-reconn-retry".into(),
+            lease_id: "lease-reconn-retry".into(),
+            service_name: "mu-cd-agent".into(),
+            from_slot: DeploymentSlot::SlotA,
+            to_slot: DeploymentSlot::SlotB,
+            systemd_unit: "muconde-agent.service".into(),
+            warmup_timeout_secs: 5,
+        };
+        client.slot_swap("127.0.0.1", &swap_cmd).await.unwrap();
+
+        let report = client
+            .execute_integration_tests(
+                "127.0.0.1",
+                "dep-reconn-retry",
+                "mu-cd-agent",
+                &"a".repeat(64),
+                None,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("client must retry ConnectionRefused and receive report");
+        assert!(report.passed);
+        assert_eq!(report.deployment_id, "dep-reconn-retry");
+        assert_eq!(report.executed_tests, vec!["smoke_mu_cd_agent"]);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_controller_self_upgrade_persists_0600_and_resumes_promote_with_slo() {
+        use crate::cd_state::{CdStateStore, GateOutcome};
+        use mu_observable_ipc::{CanarySloAssertionRequest, CanarySloAssertionResponse};
+
+        struct RecordingSloClient {
+            healthy: bool,
+            requests: Mutex<Vec<CanarySloAssertionRequest>>,
+        }
+        #[async_trait]
+        impl CanarySloClient for RecordingSloClient {
+            async fn verify_canary_slo(
+                &self,
+                request: &CanarySloAssertionRequest,
+            ) -> Result<CanarySloAssertionResponse, OrchestratorError> {
+                self.requests.lock().await.push(request.clone());
+                Ok(CanarySloAssertionResponse {
+                    request_id: request.request_id.clone(),
+                    healthy: self.healthy,
+                    error_log_count: if self.healthy { 0 } else { 5 },
+                    p99_latency_ms: if self.healthy { 12.5 } else { 999.0 },
+                    taint_recommended: !self.healthy,
+                    reason: if self.healthy {
+                        "SLO healthy".into()
+                    } else {
+                        "Error budget exceeded".into()
+                    },
+                })
+            }
+        }
+
+        // Agent that verifies pending_self_upgrade.json exists (0600) at slot_swap time and
+        // simulates the old controller dying mid-gate before returning.
+        struct HandoffCheckingAgent {
+            state_dir: PathBuf,
+            saw_0600_file_before_swap: AtomicBool,
+            hold_notify: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl AgentIpcClient for HandoffCheckingAgent {
+            async fn stage_deployment(
+                &self,
+                _node_id: &str,
+                req: &StageDeploymentRequest,
+            ) -> Result<StageDeploymentResponse, OrchestratorError> {
+                Ok(StageDeploymentResponse {
+                    deployment_id: req.deployment_id.clone(),
+                    target_slot: req.target_slot,
+                    btrfs_subvolume_path: "/srv/mucd/mu-cd-controller/@b".into(),
+                    staged_ok: true,
+                    error_message: None,
+                })
+            }
+            async fn slot_swap(
+                &self,
+                _node_id: &str,
+                _cmd: &SlotSwapCommand,
+            ) -> Result<(), OrchestratorError> {
+                let path = pending_self_upgrade_path(&self.state_dir);
+                if path.is_file() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                        assert_eq!(mode, 0o600, "pending_self_upgrade.json must be 0600");
+                    }
+                    self.saw_0600_file_before_swap.store(true, Ordering::SeqCst);
+                }
+                self.hold_notify.notify_one();
+                // Simulate daemon SIGTERM killing the old controller while swap is in-flight.
+                futures_util::future::pending::<()>().await;
+                Ok(())
+            }
+            async fn execute_integration_tests(
+                &self,
+                _node_id: &str,
+                _deployment_id: &str,
+                _service: &str,
+                _artifact_sha256: &str,
+                _selected_tests: Option<&[String]>,
+                _timeout: Duration,
+            ) -> Result<IntegrationTestReport, OrchestratorError> {
+                unreachable!("old controller died on restart")
+            }
+            async fn rollback(
+                &self,
+                _node_id: &str,
+                _cmd: &RollbackCommand,
+            ) -> Result<(), OrchestratorError> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        let hold_notify = Arc::new(tokio::sync::Notify::new());
+        let old_agent = Arc::new(HandoffCheckingAgent {
+            state_dir: state_dir.clone(),
+            saw_0600_file_before_swap: AtomicBool::new(false),
+            hold_notify: hold_notify.clone(),
+        });
+
+        let old_orch = Arc::new(
+            DeploymentOrchestrator::new(
+                Arc::new(LeaseCoordinator::new()),
+                None,
+                old_agent.clone(),
+                Arc::new(MockMuRegistClient::default()),
+            )
+            .with_state_dir(&state_dir),
+        );
+
+        let mut cfg = sample_config();
+        cfg.service = "mu-cd-controller".into();
+        cfg.target_nodes = vec!["node-a".into()];
+        cfg.bake_window_seconds = 30;
+        cfg.max_error_logs = 2;
+        cfg.max_p99_latency_ms = 250.0;
+        let digest = "1".repeat(64);
+
+        let old_orch_clone = old_orch.clone();
+        let digest_clone = digest.clone();
+        let old_task = tokio::spawn(async move {
+            let _ = old_orch_clone
+                .orchestrate_deployment(&cfg, &digest_clone, Some("dep-ctrl-self-ok".into()))
+                .await;
+        });
+
+        hold_notify.notified().await;
+        assert!(old_agent.saw_0600_file_before_swap.load(Ordering::SeqCst));
+        // Terminate old controller task to simulate systemd restart SIGTERM
+        old_task.abort();
+        let _ = old_task.await;
+        assert!(pending_self_upgrade_path(&state_dir).is_file());
+
+        // Phase 2: Restarted controller boots with fresh CdStateStore & LeaseCoordinator
+        let new_coordinator = Arc::new(LeaseCoordinator::new());
+        let new_store = Arc::new(CdStateStore::default());
+        let new_regist = Arc::new(MockMuRegistClient::default());
+        let new_slo = Arc::new(RecordingSloClient {
+            healthy: true,
+            requests: Mutex::new(Vec::new()),
+        });
+        let new_agent = Arc::new(MockAgentClient {
+            stage_ok: AtomicBool::new(true),
+            swap_ok: AtomicBool::new(true),
+            it_passed: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let new_orch = DeploymentOrchestrator::new(
+            new_coordinator.clone(),
+            None,
+            new_agent,
+            new_regist.clone(),
+        )
+        .with_cd_state(new_store.clone())
+        .with_slo_client(new_slo.clone())
+        .with_state_dir(&state_dir);
+
+        let resumed = new_orch
+            .resume_pending_self_upgrade_if_present()
+            .await
+            .expect("resume succeeds")
+            .expect("pending handoff was claimed");
+        assert!(matches!(
+            resumed,
+            DeploymentOutcome::Promoted {
+                ref deployment_id,
+                ref service,
+                ref target_node,
+                ref artifact_sha256,
+            } if deployment_id == "dep-ctrl-self-ok"
+                && service == "mu-cd-controller"
+                && target_node == "node-a"
+                && artifact_sha256 == &digest
+        ));
+        assert!(!pending_self_upgrade_path(&state_dir).exists());
+
+        // Verify MuObserve SLO assertion was invoked with persisted contract bounds
+        let slo_reqs = new_slo.requests.lock().await;
+        assert_eq!(slo_reqs.len(), 1);
+        assert_eq!(slo_reqs[0].bake_window_secs, 30);
+        assert_eq!(slo_reqs[0].max_error_logs, 2);
+        assert_eq!(slo_reqs[0].service_name, "mu-cd-controller");
+        drop(slo_reqs);
+
+        // Verify CdStateStore hydrated and finalized as Promoted + LeaseCoordinator updated
+        let rec = new_store
+            .snapshot()
+            .deployment("dep-ctrl-self-ok")
+            .expect("hydrated deployment record present")
+            .clone();
+        assert_eq!(rec.outcome, GateOutcome::Promoted);
+        assert_eq!(rec.active_slot, Slot::B);
+        assert_eq!(new_regist.promote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            new_coordinator
+                .active_slot_for("node-a", "mu-cd-controller")
+                .await,
+            DeploymentSlot::SlotB
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_controller_self_upgrade_resume_rollback_on_slo_breach_and_stale_expiry() {
+        use crate::cd_state::{CdStateStore, GateOutcome};
+        use mu_observable_ipc::{CanarySloAssertionRequest, CanarySloAssertionResponse};
+
+        struct BreachingSloClient;
+        #[async_trait]
+        impl CanarySloClient for BreachingSloClient {
+            async fn verify_canary_slo(
+                &self,
+                request: &CanarySloAssertionRequest,
+            ) -> Result<CanarySloAssertionResponse, OrchestratorError> {
+                Ok(CanarySloAssertionResponse {
+                    request_id: request.request_id.clone(),
+                    healthy: false,
+                    error_log_count: 12,
+                    p99_latency_ms: 850.0,
+                    taint_recommended: true,
+                    reason: "p99 latency SLO breach".into(),
+                })
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        let bad_digest = "2".repeat(64);
+        let handoff = PendingControllerSelfUpgrade {
+            deployment_id: "dep-ctrl-self-slo-fail".into(),
+            lease_id: "lease-ctrl-self-slo-fail".into(),
+            service: "mu-cd-controller".into(),
+            repo: Some("LMA1980/mu-cd-controller".into()),
+            target_node: "node-a".into(),
+            artifact_sha256: bad_digest.clone(),
+            active_slot: "@a".into(),
+            candidate_slot: "@b".into(),
+            systemd_unit: "muconde-controller.service".into(),
+            policy_commit_sha: "a".repeat(40),
+            trace_id: "0123456789abcdef0123456789abcdef".into(),
+            selected_tests: vec!["smoke_mu_cd_controller".into()],
+            bake_window_seconds: 30,
+            max_error_logs: 0,
+            max_p99_latency_ms: 200.0,
+            warmup_timeout_seconds: 15,
+            started_at_epoch_ms: LeaseCoordinator::current_epoch_ms(),
+        };
+        write_pending_self_upgrade_atomic(&pending_self_upgrade_path(&state_dir), &handoff)
+            .unwrap();
+
+        let coordinator = Arc::new(LeaseCoordinator::new());
+        let store = Arc::new(CdStateStore::default());
+        let regist = Arc::new(MockMuRegistClient::default());
+        let agent = Arc::new(MockAgentClient {
+            stage_ok: AtomicBool::new(true),
+            swap_ok: AtomicBool::new(true),
+            it_passed: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let orch =
+            DeploymentOrchestrator::new(coordinator.clone(), None, agent.clone(), regist.clone())
+                .with_cd_state(store.clone())
+                .with_slo_client(Arc::new(BreachingSloClient))
+                .with_state_dir(&state_dir);
+
+        let outcome = orch
+            .resume_pending_self_upgrade_if_present()
+            .await
+            .expect("resume executes rollback cleanly")
+            .expect("handoff claimed");
+        assert!(
+            matches!(
+                outcome,
+                DeploymentOutcome::RolledBack { ref reason, .. }
+                    if reason.contains("MuObserve canary SLO breach")
+            ),
+            "expected SLO-breach rollback, got: {outcome:?}"
+        );
+        assert_eq!(agent.rollback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            agent.rollback_nodes.lock().await.as_slice(),
+            &[("node-a".to_string(), DeploymentSlot::SlotA)]
+        );
+        assert_eq!(regist.taint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            regist.last_taint_node.lock().await.as_deref(),
+            Some("node-a")
+        );
+        assert!(orch.is_digest_tainted(&bad_digest).await.unwrap());
+        let rec = store
+            .snapshot()
+            .deployment("dep-ctrl-self-slo-fail")
+            .unwrap()
+            .clone();
+        assert_eq!(rec.outcome, GateOutcome::RolledBack);
+        assert!(rec.tainted);
+        assert_eq!(rec.active_slot, Slot::A);
+
+        // Stale handoff (>10 minutes old) must be ignored cleanly and deleted
+        let mut stale = handoff;
+        stale.deployment_id = "dep-ctrl-self-stale".into();
+        stale.started_at_epoch_ms = LeaseCoordinator::current_epoch_ms()
+            .saturating_sub(PENDING_SELF_UPGRADE_MAX_AGE_MS + 60_000);
+        write_pending_self_upgrade_atomic(&pending_self_upgrade_path(&state_dir), &stale).unwrap();
+        assert!(orch
+            .resume_pending_self_upgrade_if_present()
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!pending_self_upgrade_path(&state_dir).exists());
     }
 }

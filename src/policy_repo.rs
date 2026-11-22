@@ -371,12 +371,77 @@ impl CommitVerificationPolicy {
 }
 
 /// Canonical CPU architecture supported in a cluster node inventory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeArch {
     X86_64,
     Riscv64gc,
     Aarch64,
+}
+
+impl NodeArch {
+    /// Returns the canonical lowercase architecture string (`x86_64`, `aarch64`, or `riscv64gc`).
+    #[must_use]
+    pub const fn as_canonical_str(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Riscv64gc => "riscv64gc",
+            Self::Aarch64 => "aarch64",
+        }
+    }
+}
+
+/// Canonicalizes an incoming architecture key (`x86_64`, `aarch64`/`arm64` -> `aarch64`,
+/// `riscv64`/`riscv64gc` -> `riscv64gc`), rejecting unrecognized or blank architecture strings.
+pub fn canonicalize_arch_key(raw: &str) -> Result<NodeArch, PolicyRepoError> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "x86_64" => Ok(NodeArch::X86_64),
+        "aarch64" | "arm64" => Ok(NodeArch::Aarch64),
+        "riscv64" | "riscv64gc" => Ok(NodeArch::Riscv64gc),
+        _ => Err(PolicyRepoError::Schema(format!(
+            "unsupported architecture key '{raw}': expected x86_64, aarch64/arm64, or riscv64/riscv64gc"
+        ))),
+    }
+}
+
+/// Canonicalized per-architecture artifact digest overrides (`x86_64`, `aarch64`, `riscv64gc`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArchDigestMaps {
+    pub binary_digests: BTreeMap<NodeArch, String>,
+    pub it_archive_digests: BTreeMap<NodeArch, String>,
+}
+
+/// Validates and canonicalizes a caller-supplied architecture-to-SHA-256 digest map,
+/// rejecting empty maps, unrecognized architectures, malformed non-64-hex digests, and
+/// conflicting aliases mapping to different digests (e.g. `arm64` vs `aarch64`).
+pub fn normalize_arch_digest_map(
+    field: &'static str,
+    raw: &HashMap<String, String>,
+) -> Result<BTreeMap<NodeArch, String>, PolicyRepoError> {
+    if raw.is_empty() {
+        return Err(PolicyRepoError::Schema(format!(
+            "field '{field}' cannot be an empty map"
+        )));
+    }
+    let mut normalized = BTreeMap::new();
+    for (raw_arch, raw_digest) in raw {
+        let arch = canonicalize_arch_key(raw_arch)?;
+        let digest = validate_sha256_hex(raw_digest).map_err(|_| {
+            PolicyRepoError::Schema(format!(
+                "field '{field}[{raw_arch}]' must be a 64-character ASCII hex SHA-256 digest"
+            ))
+        })?;
+        if let Some(existing) = normalized.insert(arch, digest.clone()) {
+            if existing != digest {
+                return Err(PolicyRepoError::Schema(format!(
+                    "field '{field}' has conflicting digests for canonical architecture '{}'",
+                    arch.as_canonical_str()
+                )));
+            }
+        }
+    }
+    Ok(normalized)
 }
 
 /// Hardware and resource ceiling entry for one cluster node in `contracts/nodes.yml`.
@@ -791,17 +856,29 @@ impl ScenarioBinding {
 
 fn validate_target_url(scenario: &str, raw: &str) -> Result<(), PolicyRepoError> {
     let trimmed = raw.trim();
-    if trimmed != raw || trimmed.chars().any(char::is_whitespace) {
+    if trimmed != raw || trimmed.chars().any(char::is_whitespace) || trimmed.contains('\0') {
         return Err(PolicyRepoError::Schema(format!(
-            "scenario '{scenario}' target_url must not contain whitespace"
+            "scenario '{scenario}' target_url must not contain whitespace or NUL bytes"
         )));
+    }
+    if let Some(socket_path) = trimmed.strip_prefix("unix://") {
+        validate_clean_absolute_path("scenarios[].target_url", socket_path)?;
+        let under_run = socket_path.starts_with("/run/") && socket_path.len() > "/run/".len();
+        let under_var_run =
+            socket_path.starts_with("/var/run/") && socket_path.len() > "/var/run/".len();
+        if !under_run && !under_var_run {
+            return Err(PolicyRepoError::Schema(format!(
+                "scenario '{scenario}' unix:// target_url must point to a socket beneath /run/ or /var/run/"
+            )));
+        }
+        return Ok(());
     }
     let rest = trimmed
         .strip_prefix("https://")
         .or_else(|| trimmed.strip_prefix("http://"))
         .ok_or_else(|| {
             PolicyRepoError::Schema(format!(
-                "scenario '{scenario}' target_url must use http:// or https://"
+                "scenario '{scenario}' target_url must use http://, https://, or unix://"
             ))
         })?;
     let host_port = rest.split('/').next().unwrap_or("");
@@ -1269,6 +1346,22 @@ pub struct PinnedDeploymentSnapshot {
 }
 
 impl PinnedDeploymentSnapshot {
+    /// Resolves the canonical [`NodeArch`] for `node_id` (or its resolved hostname) from the
+    /// verified node inventory pinned in this snapshot.
+    #[must_use]
+    pub fn node_arch(&self, node_id: &str) -> Option<NodeArch> {
+        self.nodes_inventory
+            .find_node(node_id)
+            .or_else(|| {
+                let needle = node_id.trim();
+                self.nodes_inventory
+                    .nodes
+                    .iter()
+                    .find(|n| n.host.trim() == needle)
+            })
+            .map(|n| n.arch)
+    }
+
     /// Returns a cloned [`ScenarioExecutionPlan`] for `node_id` stamped with the node-level
     /// `deployment_id` and active `lease_id`.
     #[must_use]
@@ -1277,6 +1370,19 @@ impl PinnedDeploymentSnapshot {
         node_id: &str,
         deployment_id: &str,
         lease_id: &str,
+    ) -> Option<ScenarioExecutionPlan> {
+        self.plan_for_node_with_it_digest(node_id, deployment_id, lease_id, None)
+    }
+
+    /// Returns a cloned [`ScenarioExecutionPlan`] for `node_id` stamped with `deployment_id`,
+    /// `lease_id`, and an optional per-node `it_archive_digest_override` (used by multi-arch rollouts).
+    #[must_use]
+    pub fn plan_for_node_with_it_digest(
+        &self,
+        node_id: &str,
+        deployment_id: &str,
+        lease_id: &str,
+        it_archive_digest_override: Option<&str>,
     ) -> Option<ScenarioExecutionPlan> {
         let mut plan = self
             .resolved_node_plans
@@ -1294,6 +1400,9 @@ impl PinnedDeploymentSnapshot {
             .clone();
         plan.deployment_id = deployment_id.to_string();
         plan.lease_id = lease_id.to_string();
+        if let Some(digest) = it_archive_digest_override {
+            plan.it_archive_digest = Some(digest.to_string());
+        }
         Some(plan)
     }
 
@@ -1594,6 +1703,28 @@ impl PolicyRepository {
         it_archive_digest: Option<&str>,
         bundle_id: Option<&str>,
     ) -> Result<Arc<PinnedDeploymentSnapshot>, PolicyRepoError> {
+        self.pin_deployment_snapshot_from_verified_with_arch_it(
+            verified,
+            deployment_id,
+            service_name,
+            it_archive_digest,
+            None,
+            bundle_id,
+        )
+    }
+
+    /// Pins an immutable [`PinnedDeploymentSnapshot`] from an already-verified policy bundle
+    /// with optional per-architecture `it_archive_digests_by_arch` bindings so every resolved
+    /// node plan carries its architecture-specific verified IT bundle digest.
+    pub fn pin_deployment_snapshot_from_verified_with_arch_it(
+        &self,
+        verified: &VerifiedPolicyBundle,
+        deployment_id: &str,
+        service_name: &str,
+        it_archive_digest: Option<&str>,
+        it_archive_digests_by_arch: Option<&BTreeMap<NodeArch, String>>,
+        bundle_id: Option<&str>,
+    ) -> Result<Arc<PinnedDeploymentSnapshot>, PolicyRepoError> {
         let canonical_service = validate_service_identifier(service_name)?;
         let contract = verified
             .service_contracts
@@ -1603,6 +1734,30 @@ impl PolicyRepository {
 
         let mut resolved_node_plans = BTreeMap::new();
         for node_id in contract.effective_target_nodes() {
+            let node_it_digest = if let Some(arch_map) = it_archive_digests_by_arch {
+                if !arch_map.is_empty() {
+                    let node_spec =
+                        verified.nodes_inventory.find_node(node_id).ok_or_else(|| {
+                            PolicyRepoError::UnresolvedScenario {
+                                service: contract.service.clone(),
+                                node: node_id.to_string(),
+                                reason: "target node missing from verified nodes inventory"
+                                    .to_string(),
+                            }
+                        })?;
+                    let arch_digest = arch_map.get(&node_spec.arch).ok_or_else(|| {
+                        PolicyRepoError::Schema(format!(
+                            "missing it_archive_digest for target node '{node_id}' architecture '{}'",
+                            node_spec.arch.as_canonical_str()
+                        ))
+                    })?;
+                    Some(arch_digest.as_str())
+                } else {
+                    it_archive_digest
+                }
+            } else {
+                it_archive_digest
+            };
             let plan = build_scenario_execution_plan(
                 deployment_id,
                 "",
@@ -1610,7 +1765,7 @@ impl PolicyRepository {
                 &contract,
                 &verified.nodes_inventory,
                 node_id,
-                it_archive_digest,
+                node_it_digest,
                 bundle_id,
             )?;
             resolved_node_plans.insert(node_id.clone(), plan);
@@ -2824,5 +2979,73 @@ scenarios:
         );
         let unsigned_err = repo.refresh_and_verify().await.unwrap_err();
         assert!(matches!(unsigned_err, PolicyRepoError::Unverified(_)));
+    }
+
+    #[test]
+    fn test_validate_target_url_accepts_unix_run_and_rejects_unsafe_paths() {
+        assert!(validate_target_url("uds_run", "unix:///run/k3/worker.sock").is_ok());
+        assert!(validate_target_url("uds_var_run", "unix:///var/run/demo/app.sock").is_ok());
+        assert!(validate_target_url("http", "http://127.0.0.1:8080/health").is_ok());
+        assert!(validate_target_url("https", "https://node-a.example:8443").is_ok());
+
+        for bad in [
+            "unix:///run",
+            "unix:///run/",
+            "unix:///var/run",
+            "unix:///var/run/",
+            "unix:///tmp/worker.sock",
+            "unix:///etc/passwd",
+            "unix:///run/../etc/passwd",
+            "unix:///run/k3//worker.sock",
+            "unix:///run/k3/worker.sock ",
+            "unix:///run/k3/worker.sock\0",
+            "unix://relative/worker.sock",
+            "ftp://node-a.example:21",
+        ] {
+            assert!(
+                validate_target_url("bad_uds", bad).is_err(),
+                "expected validate_target_url to reject '{bad}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_canonicalize_arch_key_and_normalize_arch_digest_map() {
+        assert_eq!(canonicalize_arch_key("x86_64").unwrap(), NodeArch::X86_64);
+        assert_eq!(canonicalize_arch_key("aarch64").unwrap(), NodeArch::Aarch64);
+        assert_eq!(canonicalize_arch_key("arm64").unwrap(), NodeArch::Aarch64);
+        assert_eq!(
+            canonicalize_arch_key("riscv64").unwrap(),
+            NodeArch::Riscv64gc
+        );
+        assert_eq!(
+            canonicalize_arch_key("RISCV64GC").unwrap(),
+            NodeArch::Riscv64gc
+        );
+        assert!(canonicalize_arch_key("mips64").is_err());
+        assert!(canonicalize_arch_key("").is_err());
+
+        let mut raw = HashMap::new();
+        raw.insert("x86_64".to_string(), "A".repeat(64));
+        raw.insert("arm64".to_string(), "b".repeat(64));
+        raw.insert("riscv64".to_string(), "c".repeat(64));
+        let normalized = normalize_arch_digest_map("binary_digests_by_arch", &raw).unwrap();
+        assert_eq!(normalized.get(&NodeArch::X86_64), Some(&"a".repeat(64)));
+        assert_eq!(normalized.get(&NodeArch::Aarch64), Some(&"b".repeat(64)));
+        assert_eq!(normalized.get(&NodeArch::Riscv64gc), Some(&"c".repeat(64)));
+
+        // Conflicting aliases fail closed
+        let mut conflicting = HashMap::new();
+        conflicting.insert("arm64".to_string(), "b".repeat(64));
+        conflicting.insert("aarch64".to_string(), "d".repeat(64));
+        assert!(normalize_arch_digest_map("binary_digests_by_arch", &conflicting).is_err());
+
+        // Non-64-hex digest fails closed
+        let mut bad_hex = HashMap::new();
+        bad_hex.insert("x86_64".to_string(), "not-a-sha256".to_string());
+        assert!(normalize_arch_digest_map("binary_digests_by_arch", &bad_hex).is_err());
+
+        // Empty map fails closed
+        assert!(normalize_arch_digest_map("binary_digests_by_arch", &HashMap::new()).is_err());
     }
 }
