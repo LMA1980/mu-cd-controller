@@ -84,11 +84,14 @@ async fn start_mock_controller_server() -> (SocketAddr, tokio::task::JoinHandle<
 // Mock MuRegist Server
 // ============================================================================
 
+type TaintNodeLog = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
 #[derive(Default, Clone)]
 struct MockRegistryState {
     pub promote_invocations: Arc<AtomicU32>,
     pub taint_invocations: Arc<AtomicU32>,
     pub tainted_digests: Arc<Mutex<HashSet<String>>>,
+    pub taint_node_ids: TaintNodeLog,
     pub promoted_digests: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -134,9 +137,14 @@ async fn handle_promote(
 async fn handle_taint(
     State(state): State<MockRegistryState>,
     Path(digest): Path<String>,
-    Json(_payload): Json<MockTaintRequest>,
+    Json(payload): Json<MockTaintRequest>,
 ) -> impl IntoResponse {
     state.taint_invocations.fetch_add(1, Ordering::SeqCst);
+    state
+        .taint_node_ids
+        .lock()
+        .await
+        .push((digest.clone(), payload.node_id));
     let mut taints = state.tainted_digests.lock().await;
     taints.insert(digest.clone());
 
@@ -423,11 +431,16 @@ async fn test_end_to_end_it_failure_triggers_rollback_and_taints_mock_muregist()
     assert_eq!(rb.restore_slot, DeploymentSlot::SlotA);
     assert_eq!(rb.failed_artifact_sha256, digest);
 
-    // 2. Verify MuRegist POST /api/v1/canary/{digest}/taint was called
+    // 2. Verify MuRegist POST /api/v1/canary/{digest}/taint was called with actual target_node
     assert_eq!(reg_state.promote_invocations.load(Ordering::SeqCst), 0);
     assert_eq!(reg_state.taint_invocations.load(Ordering::SeqCst), 1);
     let taints = reg_state.tainted_digests.lock().await;
     assert!(taints.contains(digest));
+    let taint_nodes = reg_state.taint_node_ids.lock().await;
+    assert_eq!(
+        taint_nodes.as_slice(),
+        &[(digest.to_string(), Some("worker-riscv64".to_string()))]
+    );
 
     // 3. Verify subsequent deployment attempt of the tainted digest is rejected BEFORE lease/staging
     let retry_res = orchestrator

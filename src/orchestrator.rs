@@ -138,6 +138,18 @@ pub trait MuRegistClient: Send + Sync {
         digest: &str,
         notification: &ArtifactTaintNotification,
     ) -> Result<(), OrchestratorError>;
+
+    /// Record tainted digest, target node, and rollback reason in MuRegist
+    /// (`POST /api/v1/canary/{digest}/taint`). Defaults to [`Self::taint_canary`] for
+    /// backward-compatible mock implementations.
+    async fn taint_canary_for_node(
+        &self,
+        digest: &str,
+        _node_id: Option<&str>,
+        notification: &ArtifactTaintNotification,
+    ) -> Result<(), OrchestratorError> {
+        self.taint_canary(digest, notification).await
+    }
 }
 
 /// HTTP/mTLS client for MuRegist canary and bundle API.
@@ -261,10 +273,22 @@ impl MuRegistClient for HttpMuRegistClient {
         digest: &str,
         notification: &ArtifactTaintNotification,
     ) -> Result<(), OrchestratorError> {
+        self.taint_canary_for_node(digest, None, notification).await
+    }
+
+    async fn taint_canary_for_node(
+        &self,
+        digest: &str,
+        node_id: Option<&str>,
+        notification: &ArtifactTaintNotification,
+    ) -> Result<(), OrchestratorError> {
         let url = format!("{}/api/v1/canary/{digest}/taint", self.base_url);
         let payload = TaintPayload {
             service_name: Some(notification.service_name.clone()),
-            node_id: None,
+            node_id: node_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned),
             reason: Some(notification.reason.clone()),
         };
 
@@ -1136,10 +1160,6 @@ impl DeploymentOrchestrator {
         let mut promoted: Vec<PromotedNodeRecord> = Vec::new();
 
         for node in targets {
-            let restore_slot = self
-                .lease_coordinator
-                .active_slot_for(&node, &config.service)
-                .await;
             let mut single_cfg = config.clone();
             single_cfg.target_nodes = vec![node.clone()];
             single_cfg.deployment.target_nodes = vec![node.clone()];
@@ -1160,12 +1180,21 @@ impl DeploymentOrchestrator {
                 .await
             {
                 Ok(outcome) => match &outcome {
-                    DeploymentOutcome::Promoted { deployment_id, .. } => {
+                    DeploymentOutcome::Promoted {
+                        deployment_id,
+                        target_node,
+                        ..
+                    } => {
+                        let promoted_slot = self
+                            .lease_coordinator
+                            .active_slot_for(target_node, &config.service)
+                            .await;
+                        let restore_slot = crate::lease::opposite_slot(promoted_slot);
                         let idx = outcomes.len();
                         promoted.push(PromotedNodeRecord {
                             outcome_index: idx,
                             deployment_id: deployment_id.clone(),
-                            node,
+                            node: target_node.clone(),
                             restore_slot,
                         });
                         outcomes.push(outcome);
@@ -1372,7 +1401,7 @@ impl DeploymentOrchestrator {
             requested_ttl_secs: config.lease_ttl_seconds,
         };
 
-        let grant = self.lease_coordinator.acquire_lease(&lease_req).await;
+        let mut grant = self.lease_coordinator.acquire_lease(&lease_req).await;
         if !grant.granted {
             let reason = grant
                 .denial_reason
@@ -1413,8 +1442,8 @@ impl DeploymentOrchestrator {
         let stage_end_ns = now_unix_nano();
         let stage_span_ctx = root_trace.next_deterministic_child(2);
 
-        let stage_ok = match stage_result {
-            Ok(ref resp) if resp.staged_ok => true,
+        let staged_slot = match stage_result {
+            Ok(ref resp) if resp.staged_ok => resp.target_slot,
             Ok(ref resp) => {
                 let err_msg = resp
                     .error_message
@@ -1526,16 +1555,32 @@ impl DeploymentOrchestrator {
             }
         };
 
-        if !stage_ok {
-            return self
-                .handle_failure_and_rollback(
-                    &grant,
-                    config,
-                    &target_node,
-                    artifact_sha256,
-                    "Staging verification failed",
-                )
+        let baseline_slot = crate::lease::opposite_slot(staged_slot);
+        if staged_slot != grant.candidate_slot || baseline_slot != grant.active_slot {
+            tracing::warn!(
+                deployment_id = %deployment_id,
+                service = %config.service,
+                target_node = %target_node,
+                assumed_active = ?grant.active_slot,
+                assumed_candidate = ?grant.candidate_slot,
+                authoritative_active = ?baseline_slot,
+                authoritative_staged = ?staged_slot,
+                "Reconciling controller A/B slot state with authoritative StageDeploymentResponse target_slot"
+            );
+            grant.active_slot = baseline_slot;
+            grant.candidate_slot = staged_slot;
+            let _ = self
+                .lease_coordinator
+                .reconcile_lease_slots(&grant.lease_id, baseline_slot, staged_slot)
                 .await;
+            if let Some(ref store) = self.cd_state {
+                store.deployment_slots_reconciled(
+                    &deployment_id,
+                    Slot::from(baseline_slot),
+                    Slot::from(staged_slot),
+                );
+            }
+            self.sync_leases().await;
         }
 
         spans_to_emit.push(build_cd_span(
@@ -2330,18 +2375,22 @@ impl DeploymentOrchestrator {
 
         if let Err(e) = self
             .regist_client
-            .taint_canary(artifact_sha256, &taint_notification)
+            .taint_canary_for_node(artifact_sha256, Some(target_node), &taint_notification)
             .await
         {
             tracing::error!(
                 digest = %artifact_sha256,
+                node = %target_node,
                 error = %e,
                 "Failed to send taint notification to MuRegist"
             );
         }
 
-        // 4. Clean up lease in LeaseCoordinator
+        // 4. Clean up lease in LeaseCoordinator and pin tracked live slot to restored baseline
         let _ = self.lease_coordinator.release_lease(&grant.lease_id).await;
+        self.lease_coordinator
+            .set_active_slot(target_node, &config.service, grant.active_slot)
+            .await;
 
         if let Some(ref store) = self.cd_state {
             store.deployment_rolled_back(
@@ -2448,8 +2497,10 @@ impl DeploymentOrchestrator {
                 reason: reason.clone(),
                 rollback_completed: true,
             };
+            let taint_node =
+                (!record.target_node.trim().is_empty()).then_some(record.target_node.as_str());
             self.regist_client
-                .taint_canary(&record.artifact_digest, &taint_notification)
+                .taint_canary_for_node(&record.artifact_digest, taint_node, &taint_notification)
                 .await?;
             store.deployment_tainted(&record.deployment_id, &record.artifact_digest, &reason);
             Some(record.artifact_digest.clone())
@@ -2534,6 +2585,7 @@ mod tests {
     struct MockAgentClient {
         pub stage_ok: AtomicBool,
         pub stage_calls: AtomicU32,
+        pub stage_override_slots: Mutex<std::collections::HashMap<String, DeploymentSlot>>,
         pub swap_ok: AtomicBool,
         pub swap_calls: AtomicU32,
         pub swap_commands: Mutex<Vec<(String, SlotSwapCommand)>>,
@@ -2549,15 +2601,25 @@ mod tests {
     impl AgentIpcClient for MockAgentClient {
         async fn stage_deployment(
             &self,
-            _node_id: &str,
+            node_id: &str,
             req: &StageDeploymentRequest,
         ) -> Result<StageDeploymentResponse, OrchestratorError> {
             self.stage_calls.fetch_add(1, Ordering::SeqCst);
             let ok = self.stage_ok.load(Ordering::SeqCst);
+            let target_slot = self
+                .stage_override_slots
+                .lock()
+                .await
+                .get(node_id)
+                .copied()
+                .unwrap_or(req.target_slot);
             Ok(StageDeploymentResponse {
                 deployment_id: req.deployment_id.clone(),
-                target_slot: req.target_slot,
-                btrfs_subvolume_path: "/srv/muconde/slots/slot-b".into(),
+                target_slot,
+                btrfs_subvolume_path: match target_slot {
+                    DeploymentSlot::SlotA => "/srv/muconde/slots/slot-a".into(),
+                    DeploymentSlot::SlotB => "/srv/muconde/slots/slot-b".into(),
+                },
                 staged_ok: ok,
                 error_message: if ok {
                     None
@@ -2640,6 +2702,7 @@ mod tests {
         pub promote_calls: AtomicU32,
         pub taint_calls: AtomicU32,
         pub last_taint: Mutex<Option<(String, ArtifactTaintNotification)>>,
+        pub last_taint_node: Mutex<Option<String>>,
     }
 
     #[async_trait]
@@ -2663,11 +2726,22 @@ mod tests {
             digest: &str,
             notification: &ArtifactTaintNotification,
         ) -> Result<(), OrchestratorError> {
+            self.taint_canary_for_node(digest, None, notification).await
+        }
+
+        async fn taint_canary_for_node(
+            &self,
+            digest: &str,
+            node_id: Option<&str>,
+            notification: &ArtifactTaintNotification,
+        ) -> Result<(), OrchestratorError> {
             self.taint_calls.fetch_add(1, Ordering::SeqCst);
             let mut taints = self.tainted_digests.lock().await;
             taints.insert(digest.to_string());
             let mut last = self.last_taint.lock().await;
             *last = Some((digest.to_string(), notification.clone()));
+            let mut last_node = self.last_taint_node.lock().await;
+            *last_node = node_id.map(ToOwned::to_owned);
             Ok(())
         }
     }
@@ -3931,6 +4005,234 @@ mod tests {
         assert_eq!(
             resolve_target_node_from_map("node-a", &map_legacy),
             "legacy.cluster.internal"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_adopt_authoritative_staged_slot_symmetric_promotions_and_rollbacks() {
+        use crate::cd_state::{CdStateStore, Slot};
+        use std::collections::HashMap;
+
+        let coordinator = Arc::new(LeaseCoordinator::new());
+        let store = Arc::new(CdStateStore::default());
+        let regist = Arc::new(MockMuRegistClient::default());
+        let agent = Arc::new(MockAgentClient {
+            stage_ok: AtomicBool::new(true),
+            swap_ok: AtomicBool::new(true),
+            it_passed: AtomicBool::new(true),
+            stage_override_slots: Mutex::new(HashMap::from([(
+                "node-a".to_string(),
+                DeploymentSlot::SlotA,
+            )])),
+            ..Default::default()
+        });
+
+        let orchestrator =
+            DeploymentOrchestrator::new(coordinator.clone(), None, agent.clone(), regist.clone())
+                .with_cd_state(store.clone());
+
+        let mut cfg = sample_config();
+        cfg.target_nodes = vec!["node-a".to_string()];
+
+        // 1. Controller assumes SlotA -> SlotB, but node-a's live symlink is @b so agent stages SlotA.
+        let out1 = orchestrator
+            .orchestrate_deployment(&cfg, "sha256-slot-a-1", Some("dep-reconcile-a".into()))
+            .await
+            .expect("promotion to reconciled SlotA succeeds");
+        assert!(out1.is_promoted());
+        {
+            let swaps = agent.swap_commands.lock().await;
+            assert_eq!(swaps.len(), 1);
+            assert_eq!(swaps[0].1.from_slot, DeploymentSlot::SlotB);
+            assert_eq!(swaps[0].1.to_slot, DeploymentSlot::SlotA);
+        }
+        assert_eq!(
+            coordinator.active_slot_for("node-a", "action-runner").await,
+            DeploymentSlot::SlotA
+        );
+        let rec1 = store
+            .snapshot()
+            .deployment("dep-reconcile-a")
+            .unwrap()
+            .clone();
+        assert_eq!(rec1.active_slot, Slot::A);
+        assert_eq!(rec1.staged_slot, Slot::A);
+        assert_eq!(rec1.restore_slot, Slot::B);
+
+        // Emergency rollback restores authoritative SlotB and taints with actual target_node.
+        let em = orchestrator
+            .emergency_rollback("dep-reconcile-a", Some("operator check"))
+            .await
+            .expect("emergency rollback succeeds");
+        assert_eq!(em.restored_slot, Slot::B);
+        assert_eq!(
+            agent
+                .last_rollback_cmd
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .restore_slot,
+            DeploymentSlot::SlotB
+        );
+        assert_eq!(
+            regist.last_taint_node.lock().await.as_deref(),
+            Some("node-a")
+        );
+        assert_eq!(
+            coordinator.active_slot_for("node-a", "action-runner").await,
+            DeploymentSlot::SlotB
+        );
+
+        // 2. Reverse divergence: controller thinks active=SlotB (expects SlotA), agent stages SlotB.
+        agent
+            .stage_override_slots
+            .lock()
+            .await
+            .insert("node-a".to_string(), DeploymentSlot::SlotB);
+        let out2 = orchestrator
+            .orchestrate_deployment(&cfg, "sha256-slot-b-2", Some("dep-reconcile-b".into()))
+            .await
+            .expect("promotion to reconciled SlotB succeeds");
+        assert!(out2.is_promoted());
+        {
+            let swaps = agent.swap_commands.lock().await;
+            assert_eq!(swaps.len(), 2);
+            assert_eq!(swaps[1].1.from_slot, DeploymentSlot::SlotA);
+            assert_eq!(swaps[1].1.to_slot, DeploymentSlot::SlotB);
+        }
+        assert_eq!(
+            coordinator.active_slot_for("node-a", "action-runner").await,
+            DeploymentSlot::SlotB
+        );
+        let rec2 = store
+            .snapshot()
+            .deployment("dep-reconcile-b")
+            .unwrap()
+            .clone();
+        assert_eq!(rec2.active_slot, Slot::B);
+        assert_eq!(rec2.staged_slot, Slot::B);
+        assert_eq!(rec2.restore_slot, Slot::A);
+
+        // 3. Diverged rollback on IT failure: reset controller to assume SlotA -> SlotB,
+        //    agent stages SlotA (live was @b), IT fails -> must restore SlotB and taint with node-a.
+        coordinator
+            .set_active_slot("node-a", "action-runner", DeploymentSlot::SlotA)
+            .await;
+        agent
+            .stage_override_slots
+            .lock()
+            .await
+            .insert("node-a".to_string(), DeploymentSlot::SlotA);
+        agent.it_passed.store(false, Ordering::SeqCst);
+        *agent.it_failed_tests.lock().await = vec!["smoke_demo".to_string()];
+
+        let out3 = orchestrator
+            .orchestrate_deployment(&cfg, "sha256-it-fail-3", Some("dep-reconcile-fail".into()))
+            .await
+            .expect("IT failure returns RolledBack");
+        assert!(out3.is_rolled_back());
+        {
+            let swaps = agent.swap_commands.lock().await;
+            assert_eq!(swaps.len(), 3);
+            assert_eq!(swaps[2].1.from_slot, DeploymentSlot::SlotB);
+            assert_eq!(swaps[2].1.to_slot, DeploymentSlot::SlotA);
+        }
+        assert_eq!(
+            agent
+                .last_rollback_cmd
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .restore_slot,
+            DeploymentSlot::SlotB
+        );
+        assert_eq!(
+            coordinator.active_slot_for("node-a", "action-runner").await,
+            DeploymentSlot::SlotB
+        );
+        let rec3 = store
+            .snapshot()
+            .deployment("dep-reconcile-fail")
+            .unwrap()
+            .clone();
+        assert_eq!(rec3.active_slot, Slot::B);
+        assert_eq!(rec3.restore_slot, Slot::B);
+        assert_eq!(
+            regist.last_taint_node.lock().await.as_deref(),
+            Some("node-a")
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_multi_node_compensation_uses_reconciled_restore_slot_and_actual_taint_node() {
+        use crate::cd_state::CdStateStore;
+        use std::collections::HashMap;
+
+        let coordinator = Arc::new(LeaseCoordinator::new());
+        let store = Arc::new(CdStateStore::default());
+        let regist = Arc::new(MockMuRegistClient::default());
+        let agent = Arc::new(MockAgentClient {
+            stage_ok: AtomicBool::new(true),
+            swap_ok: AtomicBool::new(true),
+            it_passed: AtomicBool::new(true),
+            fail_it_node: Mutex::new(Some("node-2".to_string())),
+            // Controller assumes both nodes are on SlotA, but node-1 is live on SlotB (stages SlotA).
+            stage_override_slots: Mutex::new(HashMap::from([
+                ("node-1".to_string(), DeploymentSlot::SlotA),
+                ("node-2".to_string(), DeploymentSlot::SlotB),
+            ])),
+            ..Default::default()
+        });
+
+        let orchestrator =
+            DeploymentOrchestrator::new(coordinator.clone(), None, agent.clone(), regist.clone())
+                .with_cd_state(store);
+
+        let mut cfg = sample_config();
+        cfg.target_nodes = vec!["node-1".to_string(), "node-2".to_string()];
+
+        let outcomes = orchestrator
+            .orchestrate_rollout_for_repo(&cfg, "sha256-multi-slot-fix", Some("LMA1980/demo"))
+            .await
+            .expect("multi-node partial rollback returns outcomes");
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(DeploymentOutcome::is_rolled_back));
+
+        // Verify node-1 swapped SlotB -> SlotA, node-2 swapped SlotA -> SlotB.
+        let swaps = agent.swap_commands.lock().await;
+        assert_eq!(swaps.len(), 2);
+        assert_eq!(swaps[0].0, "node-1");
+        assert_eq!(swaps[0].1.from_slot, DeploymentSlot::SlotB);
+        assert_eq!(swaps[0].1.to_slot, DeploymentSlot::SlotA);
+        assert_eq!(swaps[1].0, "node-2");
+        assert_eq!(swaps[1].1.from_slot, DeploymentSlot::SlotA);
+        assert_eq!(swaps[1].1.to_slot, DeploymentSlot::SlotB);
+        drop(swaps);
+
+        // Verify node-2 rolled back to SlotA, tainted with node-2, and node-1 compensated back to SlotB!
+        let rollbacks = agent.rollback_nodes.lock().await;
+        assert_eq!(
+            rollbacks.as_slice(),
+            &[
+                ("node-2".to_string(), DeploymentSlot::SlotA),
+                ("node-1".to_string(), DeploymentSlot::SlotB),
+            ]
+        );
+        assert_eq!(
+            regist.last_taint_node.lock().await.as_deref(),
+            Some("node-2")
+        );
+        assert_eq!(
+            coordinator.active_slot_for("node-1", "action-runner").await,
+            DeploymentSlot::SlotB
+        );
+        assert_eq!(
+            coordinator.active_slot_for("node-2", "action-runner").await,
+            DeploymentSlot::SlotA
         );
     }
 }
