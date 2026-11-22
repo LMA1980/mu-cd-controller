@@ -12,6 +12,7 @@ pub mod contract;
 pub mod error;
 pub mod lease;
 pub mod orchestrator;
+pub mod policy_repo;
 pub mod slo;
 pub mod telemetry;
 pub mod tls;
@@ -34,7 +35,9 @@ pub use contract::{
     MuConDeConfig, DEFAULT_BAKE_WINDOW_SECONDS, DEFAULT_KEEP_SNAPSHOTS, DEFAULT_LEASE_TTL_SECONDS,
     DEFAULT_MAX_ERROR_LOGS, DEFAULT_MAX_P99_LATENCY_MS, DEFAULT_WARMUP_TIMEOUT_SECONDS,
 };
-pub use error::{ContractError, ControllerError, LeaseError, OrchestratorError, TlsError};
+pub use error::{
+    ContractError, ControllerError, LeaseError, OrchestratorError, PolicyRepoError, TlsError,
+};
 pub use lease::{
     ClusterIdlePoller, ClusterNodeStatus, IdleBackoffConfig, LeaseCoordinator,
     DEFAULT_CONTROLLER_URL, DEFAULT_IDLE_JITTER_PERCENT, DEFAULT_IDLE_POLL_INITIAL_MS,
@@ -45,6 +48,17 @@ pub use orchestrator::{
     resolve_target_nodes, resolve_target_nodes_from_map, AgentFrame, AgentIpcClient,
     DeploymentOrchestrator, DeploymentOutcome, HttpMuRegistClient, IpcAgentClient, MuRegistClient,
     DEFAULT_REGISTRY_URL,
+};
+pub use policy_repo::{
+    build_scenario_execution_plan, parse_cidr, resolve_scenarios_for_node,
+    validate_allowed_signers_file, validate_clean_absolute_path, validate_git_commit_sha,
+    validate_service_identifier, validate_sha256_hex, CommitVerificationPolicy, NodeArch,
+    NodeRolloutOverride, NodeSpec, NodesInventory, PinnedDeploymentSnapshot, PolicyDeploymentSpec,
+    PolicyRepoConfig, PolicyRepository, PolicyServiceContract, RolloutStrategy, SandboxCeiling,
+    ScenarioBinding, UnitMapping, VerifiedPolicyBundle, VerifiedPolicySummary,
+    DEFAULT_POLICY_SANDBOX_MEMLOCK_KB, DEFAULT_REFRESH_INTERVAL_SECS,
+    DEFAULT_SNAPSHOT_CACHE_CAPACITY, MAX_POLICY_MEMLOCK_KB, MAX_POLICY_SANDBOX_PIDS,
+    METRIC_POLICY_VERIFY_FAILED,
 };
 pub use slo::{
     CanarySloClient, MuObserveSloClient, DEFAULT_MUOBSERVE_ADDR, DEFAULT_MUOBSERVE_SERVER_NAME,

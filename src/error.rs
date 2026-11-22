@@ -158,4 +158,33 @@ pub enum OrchestratorError {
 
     #[error("Emergency rollback is unavailable without a configured orchestrator")]
     OrchestratorUnavailable,
+
+    #[error("Deployment policy repository error: {0}")]
+    PolicyRepo(#[from] PolicyRepoError),
+}
+
+/// Errors occurring while syncing, verifying signatures, validating schemas, or resolving
+/// scenarios from the authoritative deployment policy repository.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PolicyRepoError {
+    #[error("Deployment policy repository is unverified or unavailable: {0}")]
+    Unverified(String),
+
+    #[error("Service contract '{0}' not found in verified deployment policy repository")]
+    ServiceContractNotFound(String),
+
+    #[error("Invalid service identifier '{0}'")]
+    InvalidServiceName(String),
+
+    #[error(
+        "Unresolved scenario binding for service '{service}' on target node '{node}': {reason}"
+    )]
+    UnresolvedScenario {
+        service: String,
+        node: String,
+        reason: String,
+    },
+
+    #[error("Policy schema validation failed: {0}")]
+    Schema(String),
 }

@@ -551,7 +551,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1185,8 +1185,8 @@ dependencies = [
 
 [[package]]
 name = "mu-cd-ipc"
-version = "0.2.1"
-source = "git+https://github.com/LMA1980/mu-cd-ipc.git?branch=main#e9924172a6284b056196a93853826e9a4a78b9b6"
+version = "0.3.0"
+source = "git+https://github.com/LMA1980/mu-cd-ipc.git?branch=feat%2Fscenario-execution-plan-v03#e1300a101bf21abfba05bb51cb081ba0746ee934"
 dependencies = [
  "bytes",
  "fory",
@@ -1467,7 +1467,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1646,7 +1646,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1917,7 +1917,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

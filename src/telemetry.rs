@@ -13,8 +13,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use mu_observable_ipc::{
-    encode_hex, encode_log_batch, encode_span_batch, write_frame, DeterministicSecretRedactor,
-    IpcHeader, OtelLogEntry, OtelSpanEntry, MSG_TYPE_ARROW_OTEL_LOGS, MSG_TYPE_ARROW_OTEL_SPANS,
+    encode_hex, encode_log_batch, encode_metric_batch, encode_span_batch, write_frame,
+    DeterministicSecretRedactor, IpcHeader, OtelLogEntry, OtelMetricEntry, OtelSpanEntry,
+    SecretRedactor, MSG_TYPE_ARROW_OTEL_LOGS, MSG_TYPE_ARROW_OTEL_METRICS,
+    MSG_TYPE_ARROW_OTEL_SPANS,
 };
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -31,7 +33,7 @@ pub fn now_unix_nano() -> i64 {
         .unwrap_or(0)
 }
 
-/// Abstract sink receiving OpenTelemetry spans and audit log batches from `mu-cd-controller`.
+/// Abstract sink receiving OpenTelemetry spans, audit logs, and metrics from `mu-cd-controller`.
 #[async_trait]
 pub trait CdTelemetrySink: Send + Sync + fmt::Debug {
     /// Emits a batch of [`OtelSpanEntry`] records.
@@ -39,6 +41,9 @@ pub trait CdTelemetrySink: Send + Sync + fmt::Debug {
 
     /// Emits a batch of [`OtelLogEntry`] audit records.
     async fn emit_logs(&self, logs: Vec<OtelLogEntry>);
+
+    /// Emits a batch of [`OtelMetricEntry`] metric records.
+    async fn emit_metrics(&self, _metrics: Vec<OtelMetricEntry>) {}
 }
 
 /// Network sink streaming `MUOB`-framed Arrow batches (`MSG_TYPE_ARROW_OTEL_SPANS` and
@@ -140,6 +145,19 @@ impl CdTelemetrySink for MuObserveCdSink {
             self.send_frame(MSG_TYPE_ARROW_OTEL_LOGS, bytes).await;
         }
     }
+
+    async fn emit_metrics(&self, mut metrics: Vec<OtelMetricEntry>) {
+        if metrics.is_empty() || self.collector_addr.is_none() {
+            return;
+        }
+        let redactor = DeterministicSecretRedactor::new();
+        for metric in &mut metrics {
+            metric.attributes_json = redactor.redact(&metric.attributes_json);
+        }
+        if let Ok(bytes) = encode_metric_batch(&metrics) {
+            self.send_frame(MSG_TYPE_ARROW_OTEL_METRICS, bytes).await;
+        }
+    }
 }
 
 /// In-memory recording sink for deterministic unit and integration testing.
@@ -147,6 +165,7 @@ impl CdTelemetrySink for MuObserveCdSink {
 pub struct RecordingCdTelemetrySink {
     spans: Mutex<Vec<OtelSpanEntry>>,
     logs: Mutex<Vec<OtelLogEntry>>,
+    metrics: Mutex<Vec<OtelMetricEntry>>,
     forward_to: Option<Arc<dyn CdTelemetrySink>>,
 }
 
@@ -175,6 +194,10 @@ impl RecordingCdTelemetrySink {
     pub async fn recorded_logs(&self) -> Vec<OtelLogEntry> {
         self.logs.lock().await.clone()
     }
+
+    pub async fn recorded_metrics(&self) -> Vec<OtelMetricEntry> {
+        self.metrics.lock().await.clone()
+    }
 }
 
 #[async_trait]
@@ -198,6 +221,17 @@ impl CdTelemetrySink for RecordingCdTelemetrySink {
         self.logs.lock().await.extend(logs.clone());
         if let Some(ref fwd) = self.forward_to {
             fwd.emit_logs(logs).await;
+        }
+    }
+
+    async fn emit_metrics(&self, mut metrics: Vec<OtelMetricEntry>) {
+        let redactor = DeterministicSecretRedactor::new();
+        for metric in &mut metrics {
+            metric.attributes_json = redactor.redact(&metric.attributes_json);
+        }
+        self.metrics.lock().await.extend(metrics.clone());
+        if let Some(ref fwd) = self.forward_to {
+            fwd.emit_metrics(metrics).await;
         }
     }
 }
