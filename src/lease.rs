@@ -416,6 +416,29 @@ impl LeaseCoordinator {
         grant
     }
 
+    /// Reconciles an active lease's baseline (`active_slot`) and staged (`candidate_slot`)
+    /// slots with the authoritative `StageDeploymentResponse::target_slot` reported by the agent.
+    pub async fn reconcile_lease_slots(
+        &self,
+        lease_id: &str,
+        active_slot: DeploymentSlot,
+        candidate_slot: DeploymentSlot,
+    ) -> Result<(), LeaseError> {
+        let mut leases = self.leases.write().await;
+        if let Some(active) = leases.get_mut(lease_id) {
+            active.grant.active_slot = active_slot;
+            active.grant.candidate_slot = candidate_slot;
+            let mut active_slots = self.active_slots.write().await;
+            active_slots.insert(
+                (active.grant.node_id.clone(), active.service_name.clone()),
+                active_slot,
+            );
+            Ok(())
+        } else {
+            Err(LeaseError::LeaseNotFound(lease_id.to_string()))
+        }
+    }
+
     /// Mark a deployment as successfully promoted and advance the active `@a`/`@b` slot.
     ///
     /// Once marked promoted, the lease will not trigger rollback when its TTL passes,
@@ -907,5 +930,55 @@ mod tests {
         assert_eq!(cfg_legacy.initial_interval, Duration::from_millis(300));
         assert_eq!(cfg_legacy.max_interval, Duration::from_millis(2000));
         assert_eq!(cfg_legacy.jitter_percent, 10);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_reconcile_lease_slots_updates_grant_active_slot_and_rollback() {
+        let coordinator = LeaseCoordinator::new();
+        let req = DeploymentLeaseRequest {
+            deployment_id: "dep-reconcile-1".into(),
+            node_id: "node-a".into(),
+            service_name: "svc-demo".into(),
+            artifact_sha256: "sha256-1".into(),
+            requested_ttl_secs: 60,
+        };
+        let grant = coordinator.acquire_lease(&req).await;
+        assert_eq!(grant.active_slot, DeploymentSlot::SlotA);
+        assert_eq!(grant.candidate_slot, DeploymentSlot::SlotB);
+
+        // Agent reports live slot was actually SlotB and candidate was staged into SlotA.
+        coordinator
+            .reconcile_lease_slots(
+                &grant.lease_id,
+                DeploymentSlot::SlotB,
+                DeploymentSlot::SlotA,
+            )
+            .await
+            .expect("reconcile lease slots");
+
+        let updated = coordinator.get_lease(&grant.lease_id).await.unwrap();
+        assert_eq!(updated.active_slot, DeploymentSlot::SlotB);
+        assert_eq!(updated.candidate_slot, DeploymentSlot::SlotA);
+        assert_eq!(
+            coordinator.active_slot_for("node-a", "svc-demo").await,
+            DeploymentSlot::SlotB
+        );
+
+        let (_revoke, rb) = coordinator
+            .revoke_lease(&grant.lease_id, "test rollback")
+            .await
+            .expect("revoke reconciled lease");
+        assert_eq!(rb.restore_slot, DeploymentSlot::SlotB);
+
+        // Next lease starts from reconciled SlotB -> SlotA and promotes cleanly to SlotA.
+        let grant2 = coordinator.acquire_lease(&req).await;
+        assert_eq!(grant2.active_slot, DeploymentSlot::SlotB);
+        assert_eq!(grant2.candidate_slot, DeploymentSlot::SlotA);
+        coordinator.mark_promoted(&grant2.lease_id).await.unwrap();
+        assert_eq!(
+            coordinator.active_slot_for("node-a", "svc-demo").await,
+            DeploymentSlot::SlotA
+        );
     }
 }

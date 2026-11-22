@@ -789,6 +789,23 @@ impl CdStateStore {
         }
     }
 
+    /// Reconciles the recorded `active_slot`, `staged_slot`, and `restore_slot` for an in-flight
+    /// deployment after the agent reports its authoritative `StageDeploymentResponse::target_slot`.
+    pub fn deployment_slots_reconciled(
+        &self,
+        deployment_id: &str,
+        active_slot: Slot,
+        staged_slot: Slot,
+    ) {
+        self.mutate(|st| {
+            if let Some(d) = Self::find(st, deployment_id) {
+                d.active_slot = active_slot;
+                d.staged_slot = staged_slot;
+                d.restore_slot = active_slot;
+            }
+        });
+    }
+
     /// Records a promotion and broadcasts `promoted`.
     pub fn deployment_promoted(&self, deployment_id: &str, slot: Slot) {
         let now = now_epoch_ms();
