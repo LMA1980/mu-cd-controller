@@ -1548,3 +1548,333 @@ async fn test_operator_users_bootstrap_allows_combined_bearer_and_proxy_reads() 
     let sse_resp = app.oneshot(sse_req).await.unwrap();
     assert_eq!(sse_resp.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_readonly_service_token_allows_read_routes_and_forbids_mutations() {
+    const RO_TOKEN: &str = "ro-canary-token-9876543210";
+    const WRONG_TOKEN: &str = "invalid-probe-token-abcdef";
+
+    let dir = tempfile::tempdir().unwrap();
+    let ro_path = dir.path().join("cd-readonly.token");
+    std::fs::write(&ro_path, format!("\n  {RO_TOKEN} \n")).unwrap();
+    let loaded_ro = load_token_file(&ro_path).expect("valid readonly token file must load");
+
+    let store = seeded_store();
+    store.record_cd_run(CdRunDto {
+        run_id: "cd-ro-inspect-1".into(),
+        ecosystem: CdEcosystem::Cargo,
+        repo: CdRepoId::new("LMA1980", "mu-cd-controller"),
+        ref_name: "refs/heads/main".into(),
+        commit_sha: "abcdef1".into(),
+        state: CdRunState::Succeeded,
+        started_epoch_ms: 100,
+        finished_epoch_ms: Some(140),
+        steps: vec![CdStepDto {
+            step_id: "stage-slot".into(),
+            label: "Stage candidate slot".into(),
+            state: CdRunState::Succeeded,
+            duration_ms: 40,
+            ..Default::default()
+        }],
+        failure: None,
+        registry_package: Some("mu-cd-controller".into()),
+        registry_version: Some("0.1.1".into()),
+        ab_deployment_id: Some("dep-new".into()),
+        artifact_digest: Some("sha256:dep-new".into()),
+    });
+
+    let coordinator = Arc::new(LeaseCoordinator::new());
+    let agent = Arc::new(MockApiAgent::default());
+    let regist = Arc::new(RecordingRegist::default());
+    let orchestrator = Arc::new(
+        DeploymentOrchestrator::new(coordinator, None, agent.clone(), regist)
+            .with_cd_state(store.clone()),
+    );
+
+    let state = CdApiState::new(store, Some(TOKEN.into()))
+        .with_readonly_service_token(Some(loaded_ro))
+        .with_orchestrator(orchestrator)
+        .with_proxy_secret(Some("edge-secret".into()));
+    let now = mu_cd_controller::cd_state::now_epoch_ms();
+    state
+        .authorizer
+        .bind_operator(
+            "carol",
+            1,
+            &[ROLE_AB_EMERGENCY],
+            &[ROLE_AB_EMERGENCY],
+            true,
+            now,
+        )
+        .unwrap();
+    let app = router(state);
+
+    let ro_bearer = format!("Bearer {RO_TOKEN}");
+    let wrong_bearer = format!("Bearer {WRONG_TOKEN}");
+
+    // 1. Read-only inspection endpoints return 200 OK with RO token.
+    let (s, _, health_body) = get(app.clone(), "/health", Some(&ro_bearer)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&health_body).unwrap()["status"],
+        "ok"
+    );
+
+    let (s, _, runs_body) = get(app.clone(), "/api/cd/runs", Some(&ro_bearer)).await;
+    assert_eq!(s, StatusCode::OK);
+    let runs: Vec<CdRunDto> = serde_json::from_slice(&runs_body).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].steps.len(), 1, "RO token retains cd:steps.read");
+
+    let (s, _, deps_body) = get(app.clone(), "/api/cd/deployments", Some(&ro_bearer)).await;
+    assert_eq!(s, StatusCode::OK);
+    let deps: Vec<DeploymentSummary> = serde_json::from_slice(&deps_body).unwrap();
+    assert_eq!(deps.len(), 3);
+
+    // Gate inspection succeeds with 200 OK, and log_excerpt MUST remain redacted (None).
+    let (s, _, gate_body) = get(
+        app.clone(),
+        "/api/cd/deployments/dep-old/gate",
+        Some(&ro_bearer),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let gate: DeploymentGate = serde_json::from_slice(&gate_body).unwrap();
+    assert_eq!(gate.deployment_id, "dep-old");
+    assert!(
+        gate.tests.iter().all(|t| t.log_excerpt.is_none()),
+        "RO service token must never expose raw log_excerpt"
+    );
+    assert!(
+        !String::from_utf8_lossy(&gate_body).contains("assertion failed"),
+        "redacted gate payload must not contain failure log excerpt"
+    );
+
+    let (s, _, leases_body) = get(app.clone(), "/api/cd/leases", Some(&ro_bearer)).await;
+    assert_eq!(s, StatusCode::OK);
+    let leases: Vec<LeaseView> = serde_json::from_slice(&leases_body).unwrap();
+    assert_eq!(leases.len(), 1);
+
+    let sse_req = Request::builder()
+        .uri("/api/cd/events")
+        .header(header::AUTHORIZATION, &ro_bearer)
+        .body(Body::empty())
+        .unwrap();
+    let sse_resp = app.clone().oneshot(sse_req).await.unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+    assert!(sse_resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+
+    // 2. ALL mutating endpoints reject RO token with 403 Forbidden (NOT 401), with zero token leakage.
+    let deploy_payload = serde_json::json!({
+        "repo": "LMA1980/mu-cd-controller",
+        "artifact_sha256": "deadbeef1234",
+        "manifest_yaml": "version: \"1\"\nservice: \"mu-cd-controller\"\ntarget_nodes: [\"node-a\"]\nintegration_tests: \"all\"\n",
+        "wait": true
+    })
+    .to_string();
+
+    for (uri, body) in [
+        ("/api/cd/deploy", deploy_payload.as_str()),
+        ("/api/cd/deploy", ""),
+        (
+            "/api/cd/deployments/dep-new/rollback",
+            r#"{"note":"ro-denied"}"#,
+        ),
+        ("/api/cd/policy/refresh", "{}"),
+    ] {
+        let (s, h, resp_body) = post_json(app.clone(), uri, Some(&ro_bearer), &[], body).await;
+        assert_eq!(
+            s,
+            StatusCode::FORBIDDEN,
+            "RO token must receive 403 Forbidden on POST {uri}"
+        );
+        assert!(
+            h.get(header::WWW_AUTHENTICATE).is_none(),
+            "403 Forbidden must not send WWW-Authenticate on POST {uri}"
+        );
+        let text = String::from_utf8_lossy(&resp_body);
+        assert!(!text.contains(RO_TOKEN), "403 body leaked RO token: {text}");
+        assert!(!text.contains(TOKEN), "403 body leaked full token: {text}");
+    }
+
+    // Even a bare POST /api/cd/deploy without Content-Type or JSON body returns 403 for RO token.
+    let bare_deploy = Request::builder()
+        .method("POST")
+        .uri("/api/cd/deploy")
+        .header(header::AUTHORIZATION, &ro_bearer)
+        .body(Body::empty())
+        .unwrap();
+    let bare_resp = app.clone().oneshot(bare_deploy).await.unwrap();
+    assert_eq!(bare_resp.status(), StatusCode::FORBIDDEN);
+
+    // Combined RO bearer token + elevated proxied operator cannot escalate to rollback or raw logs.
+    let (s, _, _) = post_json(
+        app.clone(),
+        "/api/cd/deployments/dep-new/rollback",
+        Some(&ro_bearer),
+        &[
+            ("x-proxy-secret", "edge-secret"),
+            ("x-forwarded-user", "carol"),
+        ],
+        "{}",
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    let (s, _, attenuated_gate) = get_with_headers(
+        app.clone(),
+        "/api/cd/deployments/dep-old/gate",
+        Some(&ro_bearer),
+        &[
+            ("x-proxy-secret", "edge-secret"),
+            ("x-forwarded-user", "carol"),
+        ],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let attenuated_gate: DeploymentGate = serde_json::from_slice(&attenuated_gate).unwrap();
+    assert!(attenuated_gate
+        .tests
+        .iter()
+        .all(|t| t.log_excerpt.is_none()));
+
+    // Confirm zero mutations were dispatched during rejected RO calls.
+    assert!(agent.swap_units.lock().await.is_empty());
+    assert!(agent.rollback_slots.lock().await.is_empty());
+
+    // 3. Invalid token still returns 401 Unauthorized (with WWW-Authenticate and zero token leakage).
+    for uri in [
+        "/api/cd/runs",
+        "/api/cd/deployments",
+        "/api/cd/deployments/dep-old/gate",
+        "/api/cd/leases",
+        "/api/cd/events",
+    ] {
+        let (s, h, resp_body) = get(app.clone(), uri, Some(&wrong_bearer)).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "wrong token on GET {uri}");
+        assert!(h.get(header::WWW_AUTHENTICATE).is_some());
+        let text = String::from_utf8_lossy(&resp_body);
+        assert!(!text.contains(WRONG_TOKEN));
+        assert!(!text.contains(RO_TOKEN));
+        assert!(!text.contains(TOKEN));
+    }
+    for uri in [
+        "/api/cd/deploy",
+        "/api/cd/deployments/dep-new/rollback",
+        "/api/cd/policy/refresh",
+    ] {
+        let (s, h, resp_body) = post_json(app.clone(), uri, Some(&wrong_bearer), &[], "{}").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "wrong token on POST {uri}");
+        assert!(h.get(header::WWW_AUTHENTICATE).is_some());
+        let text = String::from_utf8_lossy(&resp_body);
+        assert!(!text.contains(WRONG_TOKEN));
+        assert!(!text.contains(RO_TOKEN));
+        assert!(!text.contains(TOKEN));
+    }
+
+    // 4. Full service bearer token continues to execute POST /api/cd/deploy cleanly.
+    let (s, _, _) = post_json(app, "/api/cd/deploy", Some(&bearer()), &[], &deploy_payload).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(agent.swap_units.lock().await.len(), 1);
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_readonly_token_file_fail_closed_and_spawn_integration() {
+    use mu_cd_controller::api::{spawn_cd_api, CdApiConfig};
+    use std::collections::HashMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let missing_path = dir.path().join("missing-ro.token");
+    let empty_path = dir.path().join("empty-ro.token");
+    std::fs::write(&empty_path, "  \n\t").unwrap();
+
+    // Missing or empty readonly token files fail closed; presenting the path string must return 401.
+    for path in [&missing_path, &empty_path] {
+        let env = HashMap::from([(
+            "MU_CD_CONTROLLER_READONLY_TOKEN_FILE",
+            path.to_str().unwrap().to_string(),
+        )]);
+        let cfg = CdApiConfig::from_env_lookup(&|k| env.get(k).cloned());
+        assert!(cfg.readonly_api_token.is_none());
+
+        let app = router(
+            CdApiState::new(seeded_store(), None)
+                .with_readonly_service_token(cfg.readonly_api_token),
+        );
+        let path_as_bearer = format!("Bearer {}", path.display());
+        let (s, _, _) = get(app, "/api/cd/deployments", Some(&path_as_bearer)).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+
+    // Valid MU_CD_CONTROLLER_READONLY_TOKEN_FILE wired through CdApiConfig + spawn_cd_api works over TCP.
+    let ro_path = dir.path().join("live-ro.token");
+    let ro_secret = "spawned-ro-canary-secret-4242";
+    std::fs::write(&ro_path, format!("  {ro_secret}\n")).unwrap();
+    let env = HashMap::from([
+        ("MU_CD_CONTROLLER_API_ADDR", "127.0.0.1:0".to_string()),
+        (
+            "MU_CD_CONTROLLER_READONLY_TOKEN_FILE",
+            ro_path.to_str().unwrap().to_string(),
+        ),
+    ]);
+    let cfg = CdApiConfig::from_env_lookup(&|k| env.get(k).cloned());
+    assert_eq!(cfg.readonly_api_token.as_deref(), Some(ro_secret));
+
+    let (addr, handle) = spawn_cd_api(&cfg, seeded_store())
+        .await
+        .unwrap()
+        .expect("bound CD API addr");
+    let client = reqwest::Client::new();
+
+    for path in [
+        "/health",
+        "/api/cd/runs",
+        "/api/cd/deployments",
+        "/api/cd/deployments/dep-old/gate",
+        "/api/cd/leases",
+        "/api/cd/events",
+    ] {
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .bearer_auth(ro_secret)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "GET {path} with RO token");
+    }
+
+    for path in [
+        "/api/cd/deploy",
+        "/api/cd/deployments/dep-new/rollback",
+        "/api/cd/policy/refresh",
+    ] {
+        let resp = client
+            .post(format!("http://{addr}{path}"))
+            .bearer_auth(ro_secret)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "POST {path} with RO token");
+        let text = resp.text().await.unwrap();
+        assert!(!text.contains(ro_secret));
+    }
+
+    let bad = client
+        .get(format!("http://{addr}/api/cd/deployments"))
+        .bearer_auth("wrong-tcp-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status().as_u16(), 401);
+
+    handle.abort();
+}

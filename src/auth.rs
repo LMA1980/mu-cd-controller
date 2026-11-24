@@ -69,7 +69,7 @@ pub fn constant_time_str_eq(lhs: &str, rhs: &str) -> bool {
         let bb = if i < b.len() { b[i] } else { 0 };
         diff |= ba ^ bb;
     }
-    diff == 0 && bool::from((a.len() as u64).ct_eq(&(b.len() as u64)))
+    bool::from(diff.ct_eq(&0u8) & (a.len() as u64).ct_eq(&(b.len() as u64)))
 }
 
 fn validate_github_login(raw: &str) -> Option<String> {
@@ -210,6 +210,8 @@ pub struct AuthorizedCaller {
     pub principal_login: Option<String>,
     /// `true` when authenticated exclusively by service-to-service bearer token.
     pub service_only: bool,
+    /// `true` when authenticated via the strictly read-only service bearer token.
+    pub readonly_service: bool,
     /// `true` when the caller holds `"cd:steps.read"`.
     pub can_read_steps: bool,
     /// `true` when the caller holds `"ab:gate.logs.read"`.
@@ -267,13 +269,53 @@ impl IntoResponse for AuthRejection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceTokenKind {
+    None,
+    FullService,
+    ReadOnlyService,
+}
+
+fn is_readonly_service_policy(policy: &str) -> bool {
+    matches!(
+        policy,
+        POLICY_CD_RUNS_READ | POLICY_CD_STEPS_READ | POLICY_AB_SLOTS_READ
+    )
+}
+
+fn is_full_service_policy(policy: &str) -> bool {
+    is_readonly_service_policy(policy) || policy == POLICY_CD_SERVICE_DEPLOY
+}
+
 /// Combined service-token + `mu-auth` policy-folio authorizer used by [`crate::api::CdApiState`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CdAuthorizer {
     service_bearer: Option<String>,
+    readonly_service_token: Option<String>,
     proxy_secret: Option<String>,
     authority: Arc<RwLock<AuthAuthority>>,
     operators: Arc<RwLock<HashMap<String, BoundOperatorSession>>>,
+}
+
+impl std::fmt::Debug for CdAuthorizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let operator_count = self.operators.read().map(|ops| ops.len()).unwrap_or(0);
+        f.debug_struct("CdAuthorizer")
+            .field(
+                "service_bearer",
+                &self.service_bearer.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "readonly_service_token",
+                &self.readonly_service_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "proxy_secret",
+                &self.proxy_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("operator_count", &operator_count)
+            .finish()
+    }
 }
 
 impl CdAuthorizer {
@@ -284,10 +326,31 @@ impl CdAuthorizer {
             service_bearer: service_bearer
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty()),
+            readonly_service_token: None,
             proxy_secret: None,
             authority: Arc::new(RwLock::new(default_authority())),
             operators: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Configures an optional dedicated strictly read-only service bearer token scoped exclusively
+    /// to read-only inspection policies (`cd:runs.read`, `cd:steps.read`, `ab:slots.read`).
+    #[must_use]
+    pub fn with_readonly_service_token(mut self, token: Option<String>) -> Self {
+        self.readonly_service_token = token
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        if let (Some(full), Some(ro)) = (
+            self.service_bearer.as_deref(),
+            self.readonly_service_token.as_deref(),
+        ) {
+            if constant_time_str_eq(full, ro) {
+                tracing::warn!(
+                    "Read-only service token matches primary service token; attenuating matching bearer requests to read-only scope (fail closed)"
+                );
+            }
+        }
+        self
     }
 
     /// Replaces the backing `mu-auth` [`AuthAuthority`] (folios, roles, and index).
@@ -307,10 +370,16 @@ impl CdAuthorizer {
         self
     }
 
-    /// Returns whether a service bearer token is configured.
+    /// Returns whether a full-access service bearer token is configured.
     #[must_use]
     pub fn has_service_bearer(&self) -> bool {
         self.service_bearer.is_some()
+    }
+
+    /// Returns whether a dedicated read-only service bearer token is configured.
+    #[must_use]
+    pub fn has_readonly_service_token(&self) -> bool {
+        self.readonly_service_token.is_some()
     }
 
     /// Suppresses all grants belonging to `subsystem` (maintenance mode / fail-closed).
@@ -488,6 +557,48 @@ impl CdAuthorizer {
         self
     }
 
+    fn verify_bearer_token(&self, headers: &HeaderMap) -> Result<ServiceTokenKind, AuthRejection> {
+        let raw_headers: Vec<_> = headers.get_all(header::AUTHORIZATION).iter().collect();
+        if raw_headers.len() > 1 {
+            return Err(AuthRejection::unauthorized(
+                "duplicate Authorization header",
+            ));
+        }
+        let Some(raw_value) = raw_headers.first() else {
+            return Ok(ServiceTokenKind::None);
+        };
+        let Ok(raw_auth) = raw_value.to_str() else {
+            return Err(AuthRejection::unauthorized("invalid Authorization header"));
+        };
+        let Some(presented) = raw_auth
+            .strip_prefix("Bearer ")
+            .or_else(|| raw_auth.strip_prefix("bearer "))
+        else {
+            return Err(AuthRejection::unauthorized("missing Bearer scheme"));
+        };
+        let trimmed = presented.trim();
+        if self.service_bearer.is_none() && self.readonly_service_token.is_none() {
+            return Err(AuthRejection::unauthorized("bearer token not accepted"));
+        }
+        // Evaluate both slots in constant time without short-circuiting so callers cannot
+        // distinguish which token slot matched via response timing.
+        let matches_full = self
+            .service_bearer
+            .as_deref()
+            .is_some_and(|expected| constant_time_str_eq(trimmed, expected));
+        let matches_readonly = self
+            .readonly_service_token
+            .as_deref()
+            .is_some_and(|expected| constant_time_str_eq(trimmed, expected));
+        if matches_readonly {
+            Ok(ServiceTokenKind::ReadOnlyService)
+        } else if matches_full {
+            Ok(ServiceTokenKind::FullService)
+        } else {
+            Err(AuthRejection::unauthorized("invalid bearer token"))
+        }
+    }
+
     /// Authenticates transport credentials (`Authorization: Bearer` / `X-Proxy-Secret` +
     /// `X-Forwarded-User`) and evaluates the required `mu-auth` policy at `now_ms`.
     pub fn authorize_at(
@@ -496,35 +607,7 @@ impl CdAuthorizer {
         required_policy: &str,
         now_ms: u64,
     ) -> Result<AuthorizedCaller, AuthRejection> {
-        let auth_values: Vec<&str> = headers
-            .get_all(header::AUTHORIZATION)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .collect();
-        if auth_values.len() > 1 {
-            return Err(AuthRejection::unauthorized(
-                "duplicate Authorization header",
-            ));
-        }
-
-        let service_verified = if let Some(raw_auth) = auth_values.first() {
-            let Some(presented) = raw_auth
-                .strip_prefix("Bearer ")
-                .or_else(|| raw_auth.strip_prefix("bearer "))
-            else {
-                return Err(AuthRejection::unauthorized("missing Bearer scheme"));
-            };
-            let trimmed = presented.trim();
-            let Some(expected) = self.service_bearer.as_deref() else {
-                return Err(AuthRejection::unauthorized("bearer token not accepted"));
-            };
-            if !constant_time_str_eq(trimmed, expected) {
-                return Err(AuthRejection::unauthorized("invalid bearer token"));
-            }
-            true
-        } else {
-            false
-        };
+        let service_token_kind = self.verify_bearer_token(headers)?;
 
         let proxy_secrets: Vec<&str> = headers
             .get_all(HEADER_PROXY_SECRET)
@@ -572,6 +655,14 @@ impl CdAuthorizer {
                 ));
             };
 
+            let readonly_attenuated = service_token_kind == ServiceTokenKind::ReadOnlyService;
+            if readonly_attenuated && !is_readonly_service_policy(required_policy) {
+                return Err(AuthRejection::forbidden(
+                    "insufficient_policy_folio",
+                    format!("read-only service token lacks permission for '{required_policy}'"),
+                ));
+            }
+
             let bound = self
                 .operators
                 .read()
@@ -610,23 +701,39 @@ impl CdAuthorizer {
             return Ok(AuthorizedCaller {
                 principal_login: eval.principal_login.clone(),
                 service_only: false,
+                readonly_service: readonly_attenuated,
                 can_read_steps: eval.has_policy_str(POLICY_CD_STEPS_READ),
-                can_read_gate_logs: eval.has_policy_str(POLICY_AB_GATE_LOGS_READ),
-                can_rollback: eval.has_policy_str(POLICY_AB_ROLLBACK),
+                can_read_gate_logs: !readonly_attenuated
+                    && eval.has_policy_str(POLICY_AB_GATE_LOGS_READ),
+                can_rollback: !readonly_attenuated && eval.has_policy_str(POLICY_AB_ROLLBACK),
+            });
+        }
+
+        // Pure read-only service caller (MU_CD_CONTROLLER_READONLY_TOKEN_FILE /
+        // MU_CD_READONLY_TOKEN_FILE): strictly limited to read-only CD/A|B inspection policies
+        // (`cd:runs.read`, `cd:steps.read`, `ab:slots.read`); never permits mutating routes or
+        // unredacted gate logs.
+        if service_token_kind == ServiceTokenKind::ReadOnlyService {
+            if !is_readonly_service_policy(required_policy) {
+                return Err(AuthRejection::forbidden(
+                    "insufficient_policy_folio",
+                    format!("read-only service token lacks permission for '{required_policy}'"),
+                ));
+            }
+            return Ok(AuthorizedCaller {
+                principal_login: None,
+                service_only: true,
+                readonly_service: true,
+                can_read_steps: true,
+                can_read_gate_logs: false,
+                can_rollback: false,
             });
         }
 
         // Pure service-to-service caller (MU_CD_CONTROLLER_API_TOKEN_FILE / MUCONDE_CD_API_TOKEN_FILE)
         // with no proxied user: permits read-only CD/A|B slots + automated CI->CD trigger, never gate logs or ab:rollback.
-        if service_verified {
-            let service_allowed = matches!(
-                required_policy,
-                POLICY_CD_RUNS_READ
-                    | POLICY_CD_STEPS_READ
-                    | POLICY_AB_SLOTS_READ
-                    | POLICY_CD_SERVICE_DEPLOY
-            );
-            if !service_allowed {
+        if service_token_kind == ServiceTokenKind::FullService {
+            if !is_full_service_policy(required_policy) {
                 return Err(AuthRejection::forbidden(
                     "insufficient_policy_folio",
                     format!("service token lacks user folio permission for '{required_policy}'"),
@@ -635,6 +742,7 @@ impl CdAuthorizer {
             return Ok(AuthorizedCaller {
                 principal_login: None,
                 service_only: true,
+                readonly_service: false,
                 can_read_steps: true,
                 can_read_gate_logs: false,
                 can_rollback: false,
@@ -653,6 +761,7 @@ impl CdAuthorizer {
                 return Ok(AuthorizedCaller {
                     principal_login: None,
                     service_only: false,
+                    readonly_service: false,
                     can_read_steps: eval.has_policy_str(POLICY_CD_STEPS_READ),
                     can_read_gate_logs: eval.has_policy_str(POLICY_AB_GATE_LOGS_READ),
                     can_rollback: eval.has_policy_str(POLICY_AB_ROLLBACK),
@@ -893,6 +1002,190 @@ mod tests {
                 .unwrap_err()
                 .status,
             StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn test_readonly_service_token_scoping_and_zero_leakage() {
+        let full_tok = "full-svc-secret-9999";
+        let ro_tok = "ro-canary-secret-1111";
+        let proxy_sec = "edge-proxy-secret-2222";
+        let wrong_tok = "wrong-presented-secret-3333";
+        let now = 1_700_000_000_000;
+
+        let auth = CdAuthorizer::new(Some(full_tok.into()))
+            .with_readonly_service_token(Some(format!("  {ro_tok}\n")))
+            .with_proxy_secret(Some(proxy_sec.into()));
+        assert!(auth.has_service_bearer());
+        assert!(auth.has_readonly_service_token());
+
+        // Debug representation must redact every configured secret.
+        let dbg = format!("{auth:?}");
+        assert!(!dbg.contains(full_tok), "Debug leaked full token: {dbg}");
+        assert!(!dbg.contains(ro_tok), "Debug leaked readonly token: {dbg}");
+        assert!(!dbg.contains(proxy_sec), "Debug leaked proxy secret: {dbg}");
+        assert!(dbg.contains("[REDACTED]"));
+
+        // Whitespace-only readonly token fails closed to unconfigured.
+        let empty_ro = CdAuthorizer::new(None).with_readonly_service_token(Some("  \n\t ".into()));
+        assert!(!empty_ro.has_readonly_service_token());
+        assert_eq!(
+            empty_ro
+                .authorize_at(
+                    &headers_with(&[("authorization", "Bearer ")]),
+                    POLICY_AB_SLOTS_READ,
+                    now,
+                )
+                .unwrap_err()
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let ro_hdrs = headers_with(&[("authorization", &format!("Bearer {ro_tok}"))]);
+        let full_hdrs = headers_with(&[("authorization", &format!("Bearer {full_tok}"))]);
+        let wrong_hdrs = headers_with(&[("authorization", &format!("Bearer {wrong_tok}"))]);
+
+        // Read-only service token permits ONLY strictly read-only inspection policies.
+        for policy in [
+            POLICY_CD_RUNS_READ,
+            POLICY_CD_STEPS_READ,
+            POLICY_AB_SLOTS_READ,
+        ] {
+            let caller = auth.authorize_at(&ro_hdrs, policy, now).unwrap();
+            assert!(caller.service_only);
+            assert!(caller.readonly_service);
+            assert!(caller.principal_login.is_none());
+            assert!(caller.can_read_steps);
+            assert!(!caller.can_read_gate_logs);
+            assert!(!caller.can_rollback);
+        }
+
+        // Read-only service token MUST fail with 403 Forbidden (not 401) on ALL mutating/privileged policies.
+        for policy in [
+            POLICY_CD_SERVICE_DEPLOY,
+            POLICY_AB_ROLLBACK,
+            POLICY_AB_GATE_LOGS_READ,
+            "ab:promote",
+            "cd:policy.refresh",
+        ] {
+            let err = auth.authorize_at(&ro_hdrs, policy, now).unwrap_err();
+            assert_eq!(
+                err.status,
+                StatusCode::FORBIDDEN,
+                "RO token must return 403 Forbidden for {policy}"
+            );
+            assert!(!err.www_authenticate);
+            assert!(!err.detail.contains(ro_tok));
+            assert!(!err.detail.contains(full_tok));
+        }
+
+        // Full service token retains deploy authority while still denying user-only rollback/gate-logs.
+        let full_deploy = auth
+            .authorize_at(&full_hdrs, POLICY_CD_SERVICE_DEPLOY, now)
+            .unwrap();
+        assert!(full_deploy.service_only);
+        assert!(!full_deploy.readonly_service);
+        assert_eq!(
+            auth.authorize_at(&full_hdrs, POLICY_AB_ROLLBACK, now)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        // Wrong token returns 401 Unauthorized without leaking any token value.
+        let bad_err = auth
+            .authorize_at(&wrong_hdrs, POLICY_AB_SLOTS_READ, now)
+            .unwrap_err();
+        assert_eq!(bad_err.status, StatusCode::UNAUTHORIZED);
+        assert!(bad_err.www_authenticate);
+        assert!(!bad_err.detail.contains(wrong_tok));
+        assert!(!bad_err.detail.contains(ro_tok));
+        assert!(!bad_err.detail.contains(full_tok));
+
+        // Standalone readonly slot (primary service token unset) still accepts RO reads & rejects mutations with 403.
+        let ro_only = CdAuthorizer::new(None).with_readonly_service_token(Some(ro_tok.into()));
+        assert!(!ro_only.has_service_bearer());
+        assert!(ro_only.has_readonly_service_token());
+        assert!(ro_only
+            .authorize_at(&ro_hdrs, POLICY_AB_SLOTS_READ, now)
+            .is_ok());
+        assert_eq!(
+            ro_only
+                .authorize_at(&ro_hdrs, POLICY_CD_SERVICE_DEPLOY, now)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            ro_only
+                .authorize_at(&full_hdrs, POLICY_AB_SLOTS_READ, now)
+                .unwrap_err()
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Misconfigured identical full + readonly tokens attenuate fail-closed to read-only scope.
+        let duplicate_tok =
+            CdAuthorizer::new(Some(ro_tok.into())).with_readonly_service_token(Some(ro_tok.into()));
+        assert!(
+            duplicate_tok
+                .authorize_at(&ro_hdrs, POLICY_AB_SLOTS_READ, now)
+                .unwrap()
+                .readonly_service
+        );
+        assert_eq!(
+            duplicate_tok
+                .authorize_at(&ro_hdrs, POLICY_CD_SERVICE_DEPLOY, now)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        // Monotonic attenuation: RO bearer token combined with elevated proxied operator headers
+        // cannot escalate to ab:rollback or unredacted gate logs.
+        auth.bind_operator(
+            "carol",
+            1,
+            &[ROLE_AB_EMERGENCY],
+            &[ROLE_AB_EMERGENCY],
+            true,
+            now,
+        )
+        .unwrap();
+        let ro_plus_op = headers_with(&[
+            ("authorization", &format!("Bearer {ro_tok}")),
+            ("x-proxy-secret", proxy_sec),
+            ("x-forwarded-user", "carol"),
+        ]);
+        let attenuated = auth
+            .authorize_at(&ro_plus_op, POLICY_AB_SLOTS_READ, now)
+            .unwrap();
+        assert!(attenuated.readonly_service);
+        assert!(!attenuated.can_read_gate_logs);
+        assert!(!attenuated.can_rollback);
+        assert_eq!(
+            auth.authorize_at(&ro_plus_op, POLICY_AB_ROLLBACK, now)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            auth.authorize_at(&ro_plus_op, POLICY_AB_GATE_LOGS_READ, now)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        // Spoofed X-Forwarded-User without X-Proxy-Secret still fails with 401 even with RO token.
+        let ro_spoof = headers_with(&[
+            ("authorization", &format!("Bearer {ro_tok}")),
+            ("x-forwarded-user", "carol"),
+        ]);
+        assert_eq!(
+            auth.authorize_at(&ro_spoof, POLICY_AB_SLOTS_READ, now)
+                .unwrap_err()
+                .status,
+            StatusCode::UNAUTHORIZED
         );
     }
 }
