@@ -6,7 +6,9 @@
 //! `X-Forwarded-User`) and are evaluated against `mu-auth` policy folios (`cd:runs.read`,
 //! `cd:steps.read`, `ab:slots.read`, `ab:gate.logs.read`, and `ab:rollback`, with zero manual
 //! `ab:promote` endpoint). Service-to-service callers use `MU_CD_CONTROLLER_API_TOKEN_FILE` (or
-//! `MUCONDE_CD_API_TOKEN_FILE`) strictly for service-scoped reads and CI-to-CD triggers, failing
+//! `MUCONDE_CD_API_TOKEN_FILE`) strictly for service-scoped reads and CI-to-CD triggers, or an
+//! optional dedicated read-only service bearer token (`MU_CD_CONTROLLER_READONLY_TOKEN_FILE` /
+//! `MU_CD_READONLY_TOKEN_FILE`) scoped exclusively to read-only inspection endpoints, failing
 //! closed (`401`/`403`) whenever credentials or required policy folios are missing.
 
 use std::collections::HashMap;
@@ -54,17 +56,36 @@ pub const MAX_DEPLOYMENTS_LIMIT: usize = 256;
 pub const DEFAULT_SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
 
 /// Listener configuration for the CD API.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct CdApiConfig {
     /// Bind address; `None` disables the API (the default).
     pub bind_addr: Option<String>,
     /// File containing the service-to-service bearer token.
     pub token_file: Option<PathBuf>,
+    /// Optional strictly read-only service bearer token resolved fail-closed via
+    /// [`load_token_file`] from `MU_CD_CONTROLLER_READONLY_TOKEN_FILE` /
+    /// `MU_CD_READONLY_TOKEN_FILE`.
+    pub readonly_api_token: Option<String>,
     /// File containing the shared edge proxy secret (`X-Proxy-Secret`).
     pub proxy_secret_file: Option<PathBuf>,
     /// GitHub logins bootstrapped with baseline CD/A|B read + gate-inspector folios
     /// (`MU_CD_CONTROLLER_OPERATOR_USERS` / `MUCONDE_OPERATOR_USERS`, comma-separated).
     pub operator_users: Vec<String>,
+}
+
+impl std::fmt::Debug for CdApiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CdApiConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("token_file", &self.token_file)
+            .field(
+                "readonly_api_token",
+                &self.readonly_api_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("proxy_secret_file", &self.proxy_secret_file)
+            .field("operator_users", &self.operator_users)
+            .finish()
+    }
 }
 
 impl CdApiConfig {
@@ -92,6 +113,14 @@ impl CdApiConfig {
                 .collect()
         })
         .unwrap_or_default();
+        let readonly_api_token = crate::first_non_empty_var(
+            lookup,
+            &[
+                "MU_CD_CONTROLLER_READONLY_TOKEN_FILE",
+                "MU_CD_READONLY_TOKEN_FILE",
+            ],
+        )
+        .and_then(|path| load_token_file(Path::new(&path)));
         Self {
             bind_addr: crate::first_non_empty_var(
                 lookup,
@@ -110,6 +139,7 @@ impl CdApiConfig {
                 ],
             )
             .map(PathBuf::from),
+            readonly_api_token,
             proxy_secret_file: crate::first_non_empty_var(
                 lookup,
                 &[
@@ -133,14 +163,21 @@ pub fn load_token_file(path: &Path) -> Option<String> {
         Ok(s) => {
             let t = s.trim();
             if t.is_empty() {
-                tracing::error!(path = %path.display(), "CD API token file is empty; /api/cd/* will reject all requests");
+                tracing::error!(
+                    path = %path.display(),
+                    "CD API token file is empty; failing closed (token slot disabled)"
+                );
                 None
             } else {
                 Some(t.to_string())
             }
         }
         Err(e) => {
-            tracing::error!(path = %path.display(), error = %e, "CD API token file unreadable; /api/cd/* will reject all requests");
+            tracing::error!(
+                path = %path.display(),
+                error = %e,
+                "CD API token file unreadable; failing closed (token slot disabled)"
+            );
             None
         }
     }
@@ -190,6 +227,14 @@ impl CdApiState {
     #[must_use]
     pub fn with_authorizer(mut self, authorizer: CdAuthorizer) -> Self {
         self.authorizer = authorizer;
+        self
+    }
+
+    /// Configures an optional dedicated strictly read-only service bearer token on the underlying
+    /// [`CdAuthorizer`].
+    #[must_use]
+    pub fn with_readonly_service_token(mut self, token: Option<String>) -> Self {
+        self.authorizer = self.authorizer.with_readonly_service_token(token);
         self
     }
 
@@ -1138,14 +1183,20 @@ async fn post_deploy_with_policy_repo(
     }
 }
 
-async fn post_deploy(
-    State(state): State<CdApiState>,
-    headers: HeaderMap,
-    Json(req): Json<DeployTriggerRequest>,
-) -> Response {
+async fn post_deploy(State(state): State<CdApiState>, headers: HeaderMap, body: Bytes) -> Response {
     if let Err(rej) = authorize(&state, &headers, POLICY_CD_SERVICE_DEPLOY) {
         return rej.into_response();
     }
+    let req: DeployTriggerRequest = match serde_json::from_slice(&body) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid_deploy_payload: {e}") })),
+            )
+                .into_response();
+        }
+    };
     let Some(orchestrator) = state.orchestrator.clone() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1426,9 +1477,15 @@ pub async fn spawn_cd_api_with_orchestrator(
     let token = match config.token_file.as_deref() {
         Some(p) => load_token_file(p),
         None => {
-            tracing::error!(
-                "MU_CD_CONTROLLER_API_TOKEN_FILE / MUCONDE_CD_API_TOKEN_FILE not set; /api/cd/* will reject all requests"
-            );
+            if config.readonly_api_token.is_none() {
+                tracing::error!(
+                    "MU_CD_CONTROLLER_API_TOKEN_FILE / MUCONDE_CD_API_TOKEN_FILE not set; /api/cd/* will reject all bearer requests"
+                );
+            } else {
+                tracing::warn!(
+                    "MU_CD_CONTROLLER_API_TOKEN_FILE / MUCONDE_CD_API_TOKEN_FILE not set; only read-only service bearer token slot is enabled"
+                );
+            }
             None
         }
     };
@@ -1439,6 +1496,7 @@ pub async fn spawn_cd_api_with_orchestrator(
         .as_deref()
         .and_then(load_secret_file);
     let mut state = CdApiState::new(store, token)
+        .with_readonly_service_token(config.readonly_api_token.clone())
         .with_proxy_secret(proxy_secret)
         .with_operator_users(&config.operator_users);
     if let Some(orch) = orchestrator {
@@ -1481,8 +1539,79 @@ mod tests {
         let c = CdApiConfig::default();
         assert!(c.bind_addr.is_none());
         assert!(c.token_file.is_none());
+        assert!(c.readonly_api_token.is_none());
         assert!(c.proxy_secret_file.is_none());
         assert!(c.operator_users.is_empty());
+    }
+
+    #[test]
+    fn test_cd_api_config_readonly_token_env_precedence_and_fail_closed() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary_path = dir.path().join("cd-readonly-primary.token");
+        let fallback_path = dir.path().join("cd-readonly-fallback.token");
+        let empty_path = dir.path().join("cd-readonly-empty.token");
+        let missing_path = dir.path().join("cd-readonly-missing.token");
+        std::fs::write(&primary_path, "  ro-primary-secret-777 \n").unwrap();
+        std::fs::write(&fallback_path, "\tro-fallback-secret-888\n").unwrap();
+        std::fs::write(&empty_path, "   \n\t ").unwrap();
+
+        // MU_CD_CONTROLLER_READONLY_TOKEN_FILE takes precedence over MU_CD_READONLY_TOKEN_FILE.
+        let both = HashMap::from([
+            (
+                "MU_CD_CONTROLLER_READONLY_TOKEN_FILE",
+                primary_path.to_str().unwrap().to_string(),
+            ),
+            (
+                "MU_CD_READONLY_TOKEN_FILE",
+                fallback_path.to_str().unwrap().to_string(),
+            ),
+        ]);
+        let cfg_both = CdApiConfig::from_env_lookup(&|k| both.get(k).cloned());
+        assert_eq!(
+            cfg_both.readonly_api_token.as_deref(),
+            Some("ro-primary-secret-777")
+        );
+        let dbg = format!("{cfg_both:?}");
+        assert!(
+            !dbg.contains("ro-primary-secret-777"),
+            "Debug must redact readonly_api_token: {dbg}"
+        );
+        assert!(dbg.contains("[REDACTED]"));
+
+        // MU_CD_READONLY_TOKEN_FILE resolves when canonical var is unset.
+        let fallback_only = HashMap::from([(
+            "MU_CD_READONLY_TOKEN_FILE",
+            fallback_path.to_str().unwrap().to_string(),
+        )]);
+        let cfg_fallback = CdApiConfig::from_env_lookup(&|k| fallback_only.get(k).cloned());
+        assert_eq!(
+            cfg_fallback.readonly_api_token.as_deref(),
+            Some("ro-fallback-secret-888")
+        );
+
+        // Missing file path fails closed (None); never falls back to literal path or secondary var.
+        let missing_primary = HashMap::from([
+            (
+                "MU_CD_CONTROLLER_READONLY_TOKEN_FILE",
+                missing_path.to_str().unwrap().to_string(),
+            ),
+            (
+                "MU_CD_READONLY_TOKEN_FILE",
+                fallback_path.to_str().unwrap().to_string(),
+            ),
+        ]);
+        let cfg_missing = CdApiConfig::from_env_lookup(&|k| missing_primary.get(k).cloned());
+        assert_eq!(cfg_missing.readonly_api_token, None);
+
+        // Empty/whitespace-only file fails closed (None).
+        let empty_only = HashMap::from([(
+            "MU_CD_CONTROLLER_READONLY_TOKEN_FILE",
+            empty_path.to_str().unwrap().to_string(),
+        )]);
+        let cfg_empty = CdApiConfig::from_env_lookup(&|k| empty_only.get(k).cloned());
+        assert_eq!(cfg_empty.readonly_api_token, None);
     }
 
     #[test]

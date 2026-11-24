@@ -648,9 +648,14 @@ async fn smoke_cd_controller_health_deployments_and_sse() {
 
     let before = store.snapshot();
 
+    let ro_token_path = temp.path().join("cd-readonly.token");
+    std::fs::write(&ro_token_path, "  ephemeral-cd-readonly-token\n").unwrap();
+    let loaded_ro_token = load_token_file(&ro_token_path).expect("load ephemeral readonly token");
+
     let api_cfg = CdApiConfig {
         bind_addr: Some("127.0.0.1:0".to_string()),
         token_file: Some(token_path.clone()),
+        readonly_api_token: Some(loaded_ro_token.clone()),
         proxy_secret_file: None,
         operator_users: Vec::new(),
     };
@@ -662,6 +667,13 @@ async fn smoke_cd_controller_health_deployments_and_sse() {
     let http_client = cfg.build_client(false).unwrap();
     let http_base = format!("http://{addr}");
     run_http_cd_smoke(&http_base, &http_client, Some(&loaded_token), cfg.timeout).await;
+    run_http_cd_smoke(
+        &http_base,
+        &http_client,
+        Some(&loaded_ro_token),
+        cfg.timeout,
+    )
+    .await;
 
     // Also exercise SSE heartbeat chunk on an ephemeral listener with short keep-alive
     let sse_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

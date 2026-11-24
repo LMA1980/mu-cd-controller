@@ -105,22 +105,24 @@ ______________________________________________________________________
 
 ### Listener & Dual Authorization (`mu-auth` + Service Tokens)
 
-| Env var                                       | Default                          | Meaning                                                                                                                              |
-| --------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `MUCONDE_CD_API_ADDR`                         | unset (API **disabled**)         | Bind address of the separate axum listener, e.g. `127.0.0.1:8447`                                                                    |
-| `MUCONDE_CD_API_TOKEN_FILE`                   | unset                            | File holding the service-to-service bearer token (`cd:service.deploy` and service-scoped reads)                                      |
-| `MUCONDE_PROXY_SECRET_FILE`                   | unset                            | File holding the shared edge proxy secret (`X-Proxy-Secret`) for interactive [`mu-auth`](https://github.com/LMA1980/mu-auth) callers |
-| `MUCONDE_OPERATOR_USERS`                      | unset                            | Comma-separated GitHub logins bootstrapped with baseline CD/A\|B operator folios                                                     |
-| `MUCONDE_REPO`                                | unset                            | `owner/repo` recorded for CLI `deploy` runs (used by `?repo=`)                                                                       |
-| `MUOBSERVE_ADDR` / `MUOBSERVE_COLLECTOR_ADDR` | `observe.ci.internal:9445` (SLO) | `mu-observable-hub` SLO RPC endpoint (`MuObserveSloClient`) and `mu-observable-collector` sink (`MuObserveCdSink`)                   |
+| Env var                                       | Default                          | Meaning                                                                                                                                      |
+| --------------------------------------------- | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MUCONDE_CD_API_ADDR`                         | unset (API **disabled**)         | Bind address of the separate axum listener, e.g. `127.0.0.1:8447`                                                                            |
+| `MUCONDE_CD_API_TOKEN_FILE`                   | unset                            | File holding the service-to-service bearer token (`cd:service.deploy` and service-scoped reads)                                              |
+| `MU_CD_CONTROLLER_READONLY_TOKEN_FILE`        | unset                            | Optional file holding a strictly read-only service bearer token (also accepts `MU_CD_READONLY_TOKEN_FILE`); fails closed if unreadable/empty |
+| `MUCONDE_PROXY_SECRET_FILE`                   | unset                            | File holding the shared edge proxy secret (`X-Proxy-Secret`) for interactive [`mu-auth`](https://github.com/LMA1980/mu-auth) callers         |
+| `MUCONDE_OPERATOR_USERS`                      | unset                            | Comma-separated GitHub logins bootstrapped with baseline CD/A\|B operator folios                                                             |
+| `MUCONDE_REPO`                                | unset                            | `owner/repo` recorded for CLI `deploy` runs (used by `?repo=`)                                                                               |
+| `MUOBSERVE_ADDR` / `MUOBSERVE_COLLECTOR_ADDR` | `observe.ci.internal:9445` (SLO) | `mu-observable-hub` SLO RPC endpoint (`MuObserveSloClient`) and `mu-observable-collector` sink (`MuObserveCdSink`)                           |
 
 `mu-cd-controller` enforces **dual authorization** (`CdAuthorizer` backed by [`mu-auth`](https://github.com/LMA1980/mu-auth)):
 
 1. **Interactive Edge-Proxied Operators (`mu-console` via [`mu-auth`](https://github.com/LMA1980/mu-auth))**:
    - The edge reverse proxy presents `X-Proxy-Secret` (validated in constant time against `MUCONDE_PROXY_SECRET_FILE`) and `X-Forwarded-User` (GitHub login).
    - `CdAuthorizer` evaluates `PolicyFolio`s and `RoleLeases` (`member`, `gate-inspector`, `ab-emergency`, `platform-admin`, and passkey-gated `super-operator`) against canonical capabilities: `cd:runs.read`, `cd:steps.read`, `ab:slots.read`, `ab:gate.logs.read` (redacting `log_excerpt` when absent), and `ab:rollback` (there is zero `ab:promote` endpoint).
-1. **Service-to-Service Bearer Tokens (`mu-ci-controller`)**:
-   - Callers present `Authorization: Bearer <token>` matched in constant time against `MUCONDE_CD_API_TOKEN_FILE` for service-scoped reads and automated `POST /api/cd/deploy` triggers (`cd:service.deploy`).
+1. **Service-to-Service Bearer Tokens (`mu-ci-controller` and Canary Probes)**:
+   - Full service callers present `Authorization: Bearer <token>` matched in constant time against `MU_CD_CONTROLLER_API_TOKEN_FILE` (or `MUCONDE_CD_API_TOKEN_FILE`) for service-scoped reads and automated `POST /api/cd/deploy` / `POST /api/cd/policy/refresh` triggers (`cd:service.deploy`).
+   - Least-privilege read-only probes present `Authorization: Bearer <token>` matched in constant time against `MU_CD_CONTROLLER_READONLY_TOKEN_FILE` (or `MU_CD_READONLY_TOKEN_FILE`), permitting only strictly read-only inspection policies (`cd:runs.read`, `cd:steps.read`, `ab:slots.read` with `log_excerpt` redacted) and rejecting all mutating or privileged requests with `403 Forbidden`.
    - Fails closed (`401`/`403`) if credentials are missing, unreadable, empty, or lack the required `PolicyFolio`.
 
 Service-to-service IPC and observability traffic (`mu-cd-agent`, `mu-registry`, `mu-observable-hub`, `mu-observable-collector`) uses `step-ca` mTLS or `MUOB` framing independently of the loopback HTTP API.
