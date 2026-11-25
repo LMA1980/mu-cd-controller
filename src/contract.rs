@@ -768,7 +768,29 @@ ab_rules:
             Some(&["smoke_health".to_string(), "rollback_check".to_string()][..])
         );
 
-        let repo_cfg = MuConDeConfig::from_repo_root(std::path::Path::new(".")).unwrap();
+        let controller_yaml = r#"
+version: "1"
+service: "mu-cd-controller"
+target_nodes:
+  - "node-a"
+lease_ttl_seconds: 300
+warmup_timeout_seconds: 30
+bake_window_seconds: 60
+max_error_logs: 0
+max_p99_latency_ms: 250.0
+integration_tests: "all"
+ab_rules:
+  btrfs_snapshots: true
+  keep_snapshots: 5
+  auto_rollback_on_critical: true
+deployment:
+  target_nodes:
+    - "node-a"
+  binary: "mu-cd-controller"
+  install_path: "/usr/local/bin/mu-cd-controller"
+  systemd_unit: "mu-cd-controller.service"
+"#;
+        let repo_cfg = MuConDeConfig::from_yaml_str(controller_yaml).unwrap();
         assert_eq!(repo_cfg.service, "mu-cd-controller");
         assert_eq!(repo_cfg.ab_rules, AbRulesConfig::default());
         assert_eq!(
