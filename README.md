@@ -25,8 +25,8 @@ ______________________________________________________________________
 
 - **Idle Runner Discovery**: Inspects target host worker utilization and pending queue depths (`active_slots == 0 && !exclusive_locked`) with exponential backoff (`MUCONDE_IDLE_*`) to schedule deployments during verified idle windows without interrupting active CI pipelines.
 - **TTL-Bounded Deployment Leases**: Negotiates time-to-live leases (default `300s`) on target nodes. If lease renewal fails or verification stalls, the target node autonomously rolls back.
-- **Declarative Deployment Contracts (`.mucd/mu-cd.yml` with `.muconde/MuConDe.yml` fallback)**:
-  - Parses target nodes, service binary / static `web_root` / `systemd_unit` placement (`deployment`), Btrfs snapshot retention (`ab_rules`), bake SLO bounds (`bake_window_seconds`, `max_error_logs`, `max_p99_latency_ms`), and required Integration Test suites (`integration_tests: [...]` or `"all"`, plus optional `it_archive_digest`).
+- **Signature-Verified Deployment Policy Contracts (`.mucd/mu-cd.yml` schema in policy repo)**:
+  - Parses target nodes, service binary / static `web_root` / `systemd_unit` placement (`deployment`), Btrfs snapshot retention (`ab_rules`), bake SLO bounds (`bake_window_seconds`, `max_error_logs`, `max_p99_latency_ms`), and required Integration Test suites (`integration_tests: [...]` or `"all"`, plus optional `it_archive_digest`) exclusively from the signature-verified deployment policy repository (`MU_CD_DEPLOY_REPO_DIR`).
 - **Symmetric A/B Promotion / Rollback State Machine (`@a` \<-> `@b`)**:
   - Snapshots the currently active slot (`snapshots/@snap-<digest>`) and stages the candidate release into the opposite inactive slot (`@b` when `@a` is active, `@a` when `@b` is active).
   - Atomically swaps `<service>/current` to the candidate slot and triggers warmup and live integration tests on the agent.
@@ -61,9 +61,9 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-## Declarative Contract (`.mucd/mu-cd.yml`)
+## Declarative Policy Contract
 
-Phase 1 supports `.mucd/mu-cd.yml` (`.yaml`) with automatic fallback to `.muconde/MuConDe.yml`:
+`mu-cd-controller` requires `MU_CD_DEPLOY_REPO_DIR` (or `MU_CD_CONTROLLER_DEPLOY_REPO_DIR`) on startup and resolves service contracts and node inventories exclusively from the signature-verified deployment policy repository. `POST /api/cd/deploy` accepts digest-only payloads and rejects caller-supplied `config`, `manifest_yaml`, or `repo_path` overrides with HTTP `400 Bad Request` (`legacy_policy_fields_forbidden`).
 
 ```yaml
 version: "1"

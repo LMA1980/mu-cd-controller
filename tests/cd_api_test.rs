@@ -30,6 +30,7 @@ use mu_cd_controller::lease::LeaseCoordinator;
 use mu_cd_controller::orchestrator::{
     dispatch_agent_frame, AgentFrame, DeploymentOrchestrator, IpcAgentClient, MuRegistClient,
 };
+use mu_cd_controller::policy_repo::{PolicyRepoConfig, PolicyRepository};
 use mu_cd_ipc::{
     create_fory_runtime, read_frame, write_frame, ArtifactTaintNotification,
     IntegrationTestProgress, IntegrationTestReport, IpcHeader, StageDeploymentRequest,
@@ -1391,38 +1392,157 @@ async fn test_emergency_rollback_enforces_ab_rollback_folio_restores_slot_and_ta
     assert_eq!(d3.active_slot, Slot::A);
 }
 
+fn build_cd_api_policy_repo(
+    target_nodes: &[&str],
+    systemd_unit: &str,
+) -> (tempfile::TempDir, Arc<PolicyRepository>) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let signing_key = tmp.path().join("signer_ed25519");
+    let keygen = std::process::Command::new("ssh-keygen")
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-f",
+            signing_key.to_str().unwrap(),
+        ])
+        .output()
+        .expect("ssh-keygen");
+    assert!(keygen.status.success(), "ssh-keygen failed");
+
+    let pub_key = std::fs::read_to_string(tmp.path().join("signer_ed25519.pub")).unwrap();
+    let signers_file = tmp.path().join("allowed_signers");
+    std::fs::write(&signers_file, format!("cd-test@example.invalid {pub_key}")).unwrap();
+    std::fs::set_permissions(&signers_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let repo_dir = tmp.path().join("policy-repo");
+    std::fs::create_dir_all(repo_dir.join("policy")).unwrap();
+    std::fs::create_dir_all(repo_dir.join("contracts/services")).unwrap();
+    std::fs::write(
+        repo_dir.join("policy/commit-verification.yml"),
+        format!(
+            "branch: \"main\"\nrequire_signed_commits: true\nallowed_signers_path: \"{}\"\nfail_closed_on_unverified: true\n",
+            signers_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("contracts/nodes.yml"),
+        r#"nodes:
+  - node_id: "node-a"
+    arch: "x86_64"
+    host: "node-a"
+    max_memlock_kb: 2097152
+    max_slots: 1
+  - node_id: "node-b"
+    arch: "x86_64"
+    host: "node-b"
+    max_memlock_kb: 2097152
+    max_slots: 1
+  - node_id: "worker-riscv64"
+    arch: "riscv64gc"
+    host: "worker-riscv64"
+    max_memlock_kb: 29360128
+    max_slots: 1
+"#,
+    )
+    .unwrap();
+    let nodes_yaml_list: String = target_nodes
+        .iter()
+        .map(|n| format!("  - \"{n}\"\n"))
+        .collect();
+    std::fs::write(
+        repo_dir.join("contracts/services/mu-cd-controller.yml"),
+        format!(
+            r#"version: "1"
+service: "mu-cd-controller"
+target_nodes:
+{nodes_yaml_list}deployment:
+  binary: "mu-cd-controller"
+  install_path: "/usr/local/bin/mu-cd-controller"
+  systemd_unit: "{systemd_unit}"
+integration_tests: "all"
+"#
+        ),
+    )
+    .unwrap();
+
+    let run_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(["-C", repo_dir.to_str().unwrap()])
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run_git(&["init", "-b", "main"]);
+    run_git(&["config", "user.name", "CD Test"]);
+    run_git(&["config", "user.email", "cd-test@example.invalid"]);
+    run_git(&["add", "."]);
+    let signing_arg = format!("user.signingkey={}", signing_key.display());
+    run_git(&[
+        "-c",
+        "gpg.format=ssh",
+        "-c",
+        &signing_arg,
+        "commit",
+        "-S",
+        "-m",
+        "signed test policy",
+    ]);
+
+    let repo = Arc::new(PolicyRepository::new(PolicyRepoConfig {
+        repo_dir: Some(repo_dir),
+        refresh_on_deploy: true,
+        ..Default::default()
+    }));
+    (tmp, repo)
+}
+
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
 async fn test_post_deploy_deduplicates_targets_and_promotes_all_nodes() {
+    assert_eq!(
+        mu_cd_controller::dedup_target_nodes(&[
+            " node-a ".into(),
+            "node-b".into(),
+            "node-a".into()
+        ]),
+        vec!["node-a", "node-b"]
+    );
+    let (_tmp, policy_repo) = build_cd_api_policy_repo(&["node-a", "node-b"], "custom-cd-ctrl");
     let store = Arc::new(CdStateStore::default());
     let coordinator = Arc::new(LeaseCoordinator::new());
     let agent = Arc::new(MockApiAgent::default());
     let regist = Arc::new(RecordingRegist::default());
     let orchestrator = Arc::new(
         DeploymentOrchestrator::new(coordinator, None, agent.clone(), regist)
-            .with_cd_state(store.clone()),
+            .with_cd_state(store.clone())
+            .with_policy_repo(policy_repo.clone()),
     );
-    let app = router(CdApiState::new(store, Some(TOKEN.into())).with_orchestrator(orchestrator));
+    let app = router(
+        CdApiState::new(store, Some(TOKEN.into()))
+            .with_orchestrator(orchestrator)
+            .with_policy_repo(policy_repo),
+    );
 
+    let bin_sha = "1".repeat(64);
+    let it_sha = "2".repeat(64);
     let payload = serde_json::json!({
         "repo": "LMA1980/mu-cd-controller",
-        "artifact_sha256": "deadbeef1234",
-        "git_commit": "0123456789abcdef",
-        "binary_digest": "deadbeef1234",
-        "it_archive_digest": "cafebabe5678",
-        "manifest_yaml": r#"
-version: "1"
-service: "mu-cd-controller"
-integration_tests: "all"
-deployment:
-  target_nodes:
-    - " node-a "
-    - "node-b"
-    - "node-a"
-  binary: "mu-cd-controller"
-  install_path: "/usr/local/bin/mu-cd-controller"
-  systemd_unit: "custom-cd-ctrl"
-"#,
+        "git_commit": "0123456789abcdef0123456789abcdef01234567",
+        "binary_digest": bin_sha,
+        "it_archive_digest": it_sha,
         "wait": true
     });
 
@@ -1454,6 +1574,10 @@ deployment:
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
 async fn test_post_deploy_multi_node_partial_rollback_returns_422_and_compensates() {
+    let (_tmp, policy_repo) = build_cd_api_policy_repo(
+        &["node-a", "node-b", "worker-riscv64"],
+        "mu-cd-controller.service",
+    );
     let store = Arc::new(CdStateStore::default());
     let coordinator = Arc::new(LeaseCoordinator::new());
     let agent = Arc::new(MockApiAgent {
@@ -1463,22 +1587,20 @@ async fn test_post_deploy_multi_node_partial_rollback_returns_422_and_compensate
     let regist = Arc::new(RecordingRegist::default());
     let orchestrator = Arc::new(
         DeploymentOrchestrator::new(coordinator.clone(), None, agent.clone(), regist.clone())
-            .with_cd_state(store.clone()),
+            .with_cd_state(store.clone())
+            .with_policy_repo(policy_repo.clone()),
     );
-    let app = router(CdApiState::new(store, Some(TOKEN.into())).with_orchestrator(orchestrator));
+    let app = router(
+        CdApiState::new(store, Some(TOKEN.into()))
+            .with_orchestrator(orchestrator)
+            .with_policy_repo(policy_repo),
+    );
 
     let payload = serde_json::json!({
         "repo": "LMA1980/mu-cd-controller",
-        "artifact_sha256": "deadbeef5678",
-        "manifest_yaml": r#"
-version: "1"
-service: "mu-cd-controller"
-target_nodes:
-  - "node-a"
-  - "node-b"
-  - "worker-riscv64"
-integration_tests: "all"
-"#,
+        "git_commit": "0123456789abcdef0123456789abcdef01234567",
+        "binary_digest": "3".repeat(64),
+        "it_archive_digest": "4".repeat(64),
         "wait": true
     });
 
@@ -1584,17 +1706,21 @@ async fn test_readonly_service_token_allows_read_routes_and_forbids_mutations() 
         artifact_digest: Some("sha256:dep-new".into()),
     });
 
+    let (_tmp_ro, policy_repo_ro) =
+        build_cd_api_policy_repo(&["node-a"], "mu-cd-controller.service");
     let coordinator = Arc::new(LeaseCoordinator::new());
     let agent = Arc::new(MockApiAgent::default());
     let regist = Arc::new(RecordingRegist::default());
     let orchestrator = Arc::new(
         DeploymentOrchestrator::new(coordinator, None, agent.clone(), regist)
-            .with_cd_state(store.clone()),
+            .with_cd_state(store.clone())
+            .with_policy_repo(policy_repo_ro.clone()),
     );
 
     let state = CdApiState::new(store, Some(TOKEN.into()))
         .with_readonly_service_token(Some(loaded_ro))
         .with_orchestrator(orchestrator)
+        .with_policy_repo(policy_repo_ro)
         .with_proxy_secret(Some("edge-secret".into()));
     let now = mu_cd_controller::cd_state::now_epoch_ms();
     state
@@ -1674,8 +1800,9 @@ async fn test_readonly_service_token_allows_read_routes_and_forbids_mutations() 
     // 2. ALL mutating endpoints reject RO token with 403 Forbidden (NOT 401), with zero token leakage.
     let deploy_payload = serde_json::json!({
         "repo": "LMA1980/mu-cd-controller",
-        "artifact_sha256": "deadbeef1234",
-        "manifest_yaml": "version: \"1\"\nservice: \"mu-cd-controller\"\ntarget_nodes: [\"node-a\"]\nintegration_tests: \"all\"\n",
+        "git_commit": "0123456789abcdef0123456789abcdef01234567",
+        "binary_digest": "5".repeat(64),
+        "it_archive_digest": "6".repeat(64),
         "wait": true
     })
     .to_string();

@@ -1,4 +1,4 @@
-//! Declarative continuous delivery deployment contract (`.mucd/mu-cd.yml` with `.muconde/MuConDe.yml` fallback).
+//! Declarative continuous delivery deployment contract (`.mucd/mu-cd.yml`).
 
 use std::path::{Path, PathBuf};
 
@@ -14,16 +14,10 @@ const MUCD_CANDIDATES: &[&str] = &[
     ".mucd/MuConDe.yaml",
 ];
 
-/// Legacy candidate manifest filenames under `.muconde/` checked in fallback order.
-const LEGACY_MUCONDE_CANDIDATES: &[&str] = &[".muconde/MuConDe.yml", ".muconde/MuConDe.yaml"];
-
 /// Resolve the path to the continuous delivery manifest in `repo_root`.
 ///
-/// In Phase 1 dual-stack resolution:
-/// 1. Checks `.mucd/mu-cd.yml`, `.mucd/mu-cd.yaml`, `.mucd/MuConDe.yml`, and `.mucd/MuConDe.yaml`.
-/// 2. If none exist under `.mucd/`, falls back to `.muconde/MuConDe.yml` and `.muconde/MuConDe.yaml`,
-///    emitting a structured `tracing::warn!` advising migration.
-/// 3. Returns `ContractError::NotFound` if neither manifest is present.
+/// Checks `.mucd/mu-cd.yml`, `.mucd/mu-cd.yaml`, `.mucd/MuConDe.yml`, and `.mucd/MuConDe.yaml`
+/// and returns `ContractError::NotFound` if none exist.
 pub fn resolve_manifest_path(repo_root: impl AsRef<Path>) -> Result<PathBuf, ContractError> {
     MuConDeConfig::resolve_manifest_path(repo_root)
 }
@@ -231,21 +225,10 @@ impl MuConDeConfig {
                 return Ok(path);
             }
         }
-        for candidate in LEGACY_MUCONDE_CANDIDATES {
-            let path = root.join(candidate);
-            if path.is_file() {
-                tracing::warn!(
-                    path = %path.display(),
-                    "Loaded deployment contract from legacy .muconde directory; consider migrating to .mucd/mu-cd.yml"
-                );
-                return Ok(path);
-            }
-        }
         Err(ContractError::NotFound(root.to_path_buf()))
     }
 
-    /// Load and validate configuration from a repository root directory by resolving
-    /// either `.mucd/mu-cd.yml` or the legacy `.muconde/MuConDe.yml` fallback.
+    /// Load and validate configuration from a repository root directory by resolving `.mucd/mu-cd.yml`.
     pub fn from_repo_root(repo_root: impl AsRef<Path>) -> Result<Self, ContractError> {
         let manifest_path = Self::resolve_manifest_path(repo_root)?;
         let content = std::fs::read_to_string(&manifest_path)
@@ -256,27 +239,21 @@ impl MuConDeConfig {
     /// Load and validate configuration from a file or repository root on disk.
     ///
     /// If `path` is a directory, it resolves the manifest via [`Self::from_repo_root`].
-    /// If `path` is a file, it loads it directly (emitting a migration warning if under `.muconde/`).
-    /// If `path` does not exist as specified (e.g. default `.mucd/mu-cd.yml`), it attempts fallback
-    /// to legacy manifests or returns [`ContractError::NotFound`].
+    /// If `path` is a file, it loads it directly.
+    /// If `path` does not exist directly under `.mucd/`, it attempts resolution via `.mucd/`
+    /// or returns [`ContractError::NotFound`].
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ContractError> {
         let p = path.as_ref();
         if p.is_dir() {
             return Self::from_repo_root(p);
         }
         if p.is_file() {
-            if p.starts_with(".muconde") || p.to_string_lossy().contains("/.muconde/") {
-                tracing::warn!(
-                    path = %p.display(),
-                    "Loaded deployment contract from legacy .muconde directory; consider migrating to .mucd/mu-cd.yml"
-                );
-            }
             let content =
                 std::fs::read_to_string(p).map_err(|e| ContractError::Yaml(e.to_string()))?;
             return Self::from_yaml_str(&content);
         }
 
-        // If path does not exist directly, check whether it is a candidate relative path
+        // If path does not exist directly, check whether it is a candidate relative path under .mucd/
         if let Some(parent) = p.parent() {
             let parent_dir = if parent.as_os_str().is_empty() {
                 Path::new(".")
@@ -285,7 +262,7 @@ impl MuConDeConfig {
             };
             if parent_dir
                 .file_name()
-                .map(|n| n == ".mucd" || n == ".muconde")
+                .map(|n| n == ".mucd")
                 .unwrap_or(false)
             {
                 let repo_root = parent_dir.parent().unwrap_or_else(|| Path::new("."));
@@ -659,7 +636,7 @@ integration_tests: "all"
     }
 
     #[test]
-    fn test_phase1_legacy_muconde_fallback_when_mucd_absent() {
+    fn test_phase3_legacy_muconde_fallback_removed() {
         let dir = tempfile::tempdir().unwrap();
         let muconde_dir = dir.path().join(".muconde");
         std::fs::create_dir_all(&muconde_dir).unwrap();
@@ -676,15 +653,15 @@ integration_tests: "all"
         )
         .unwrap();
 
-        let resolved = resolve_manifest_path(dir.path()).unwrap();
-        assert_eq!(resolved, legacy_manifest);
+        let err = resolve_manifest_path(dir.path()).unwrap_err();
+        assert_eq!(err, ContractError::NotFound(dir.path().to_path_buf()));
 
-        let config = MuConDeConfig::from_repo_root(dir.path()).unwrap();
-        assert_eq!(config.service, "mu-service-legacy-fallback");
+        let err_repo = MuConDeConfig::from_repo_root(dir.path()).unwrap_err();
+        assert_eq!(err_repo, ContractError::NotFound(dir.path().to_path_buf()));
 
-        // Verify from_file with a path under .mucd falls back to .muconde
-        let config_fallback = MuConDeConfig::from_file(dir.path().join(".mucd/mu-cd.yml")).unwrap();
-        assert_eq!(config_fallback.service, "mu-service-legacy-fallback");
+        let mucd_path = dir.path().join(".mucd/mu-cd.yml");
+        let err_mucd = MuConDeConfig::from_file(&mucd_path).unwrap_err();
+        assert_eq!(err_mucd, ContractError::NotFound(mucd_path));
     }
 
     #[test]

@@ -573,62 +573,18 @@ pub fn dispatch_agent_frame(
     }
 }
 
-/// Reads the node mapping string (`MU_CD_CONTROLLER_NODE_MAP` -> `MU_CD_NODE_MAP` ->
-/// `MUCONDE_NODE_MAP`) using a caller-supplied environment lookup.
-pub fn resolve_node_map(lookup: &dyn Fn(&str) -> Option<String>) -> String {
-    crate::first_non_empty_var(
-        lookup,
-        &[
-            "MU_CD_CONTROLLER_NODE_MAP",
-            "MU_CD_NODE_MAP",
-            "MUCONDE_NODE_MAP",
-        ],
-    )
-    .unwrap_or_default()
-}
-
-/// Resolves a logical target node identifier (e.g. `node-a`, `node-b`, `worker-riscv64`)
-/// using `MU_CD_CONTROLLER_NODE_MAP` / `MU_CD_NODE_MAP` / `MUCONDE_NODE_MAP`
-/// (`"node-a=host1,node-b=host2"`).
-pub fn resolve_target_node(logical: &str) -> String {
-    let map_str = resolve_node_map(&|key| std::env::var(key).ok());
-    if !map_str.is_empty() {
-        resolve_target_node_from_map(logical, &map_str)
-    } else {
-        logical.trim().to_string()
-    }
-}
-
-/// Pure helper resolving `logical` against a comma-separated `key=value` map string.
-pub fn resolve_target_node_from_map(logical: &str, map_str: &str) -> String {
-    let trimmed = logical.trim();
-    for pair in map_str.split(',') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k.trim().eq_ignore_ascii_case(trimmed) && !v.trim().is_empty() {
-                return v.trim().to_string();
-            }
-        }
-    }
-    trimmed.to_string()
-}
-
-/// Pure helper resolving and deduplicating `nodes` against a comma-separated `key=value`
-/// map string while preserving first-seen order (capped at 64 targets).
-pub fn resolve_target_nodes_from_map(nodes: &[String], map_str: &str) -> Vec<String> {
+/// Trims and deduplicates a list of target node identifiers while preserving first-seen order
+/// (capped at 64 targets).
+#[must_use]
+pub fn dedup_target_nodes(nodes: &[String]) -> Vec<String> {
     let mut out = Vec::new();
-    for n in nodes.iter().take(64) {
-        let resolved = resolve_target_node_from_map(n, map_str);
-        if !resolved.is_empty() && !out.contains(&resolved) {
-            out.push(resolved);
+    for raw in nodes.iter().take(64) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() && !out.iter().any(|existing: &String| existing == trimmed) {
+            out.push(trimmed.to_string());
         }
     }
     out
-}
-
-/// Resolves and deduplicates a list of logical target node names while preserving order.
-pub fn resolve_target_nodes(nodes: &[String]) -> Vec<String> {
-    let map_str = resolve_node_map(&|key| std::env::var(key).ok());
-    resolve_target_nodes_from_map(nodes, &map_str)
 }
 
 /// Transport stream to `mu-cd-agent`, supporting plain TCP for unconfigured tests
@@ -759,8 +715,7 @@ impl IpcAgentClient {
         self
     }
 
-    /// Attach a verified [`PolicyRepository`] for authoritative node-ID-to-host resolution
-    /// when `MU_CD_CONTROLLER_NODE_MAP` / `MUCONDE_NODE_MAP` does not override the target node.
+    /// Attach a verified [`PolicyRepository`] for authoritative node-ID-to-host resolution.
     #[must_use]
     pub fn with_policy_repo(mut self, policy_repo: Arc<PolicyRepository>) -> Self {
         self.policy_repo = Some(policy_repo);
@@ -768,13 +723,6 @@ impl IpcAgentClient {
     }
 
     fn resolve_agent_host(&self, node_id: &str) -> String {
-        let map_str = resolve_node_map(&|key| std::env::var(key).ok());
-        if !map_str.is_empty() {
-            let mapped = resolve_target_node_from_map(node_id, &map_str);
-            if mapped != node_id.trim() {
-                return mapped;
-            }
-        }
         if let Some(ref repo) = self.policy_repo {
             if let Some(host) = repo.resolve_node_host(node_id) {
                 return host;
@@ -1323,20 +1271,10 @@ impl DeploymentOrchestrator {
     }
 
     fn resolve_node_candidates(target_nodes: &[String]) -> Vec<(String, String)> {
-        let map_str = resolve_node_map(&|key| std::env::var(key).ok());
-        let mut candidates = Vec::new();
-        let mut seen = HashSet::new();
-        for raw in target_nodes.iter().take(64) {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let resolved = resolve_target_node_from_map(trimmed, &map_str);
-            if !resolved.is_empty() && seen.insert(resolved.clone()) {
-                candidates.push((trimmed.to_string(), resolved));
-            }
-        }
-        candidates
+        dedup_target_nodes(target_nodes)
+            .into_iter()
+            .map(|node| (node.clone(), node))
+            .collect()
     }
 
     fn find_first_eligible_idle_node(
@@ -1534,18 +1472,7 @@ impl DeploymentOrchestrator {
         arch_digests: Option<&ArchDigestMaps>,
     ) -> Result<Vec<DeploymentOutcome>, OrchestratorError> {
         config.validate()?;
-        let targets = if snapshot.is_some() {
-            let mut dedup = Vec::new();
-            for node in config.effective_target_nodes() {
-                let trimmed = node.trim().to_string();
-                if !trimmed.is_empty() && !dedup.contains(&trimmed) {
-                    dedup.push(trimmed);
-                }
-            }
-            dedup
-        } else {
-            resolve_target_nodes(config.effective_target_nodes())
-        };
+        let targets = dedup_target_nodes(config.effective_target_nodes());
         if targets.is_empty() {
             return Err(OrchestratorError::Contract(ContractError::EmptyTargetNodes));
         }
@@ -3763,20 +3690,16 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_target_node_from_map() {
-        let map = "node-a=host-primary,node-b=host-secondary,worker-riscv64=host-riscv";
-        assert_eq!(resolve_target_node_from_map("node-a", map), "host-primary");
+    fn test_dedup_target_nodes_preserves_order_and_deduplicates_simple() {
+        let input = vec![
+            " node-a ".into(),
+            "node-b".into(),
+            "worker-riscv64".into(),
+            "node-a".into(),
+        ];
         assert_eq!(
-            resolve_target_node_from_map("node-b", map),
-            "host-secondary"
-        );
-        assert_eq!(
-            resolve_target_node_from_map("worker-riscv64", map),
-            "host-riscv"
-        );
-        assert_eq!(
-            resolve_target_node_from_map("custom-node", map),
-            "custom-node"
+            dedup_target_nodes(&input),
+            vec!["node-a", "node-b", "worker-riscv64"]
         );
     }
 
@@ -3990,8 +3913,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_target_nodes_from_map_preserves_order_and_deduplicates() {
-        let map = "node-a=host-primary,node-b=host-secondary,standby=host-primary,worker-riscv64=host-riscv,worker-aarch64=host-arm";
+    fn test_dedup_target_nodes_trims_and_ignores_blank_entries() {
         let input = vec![
             " node-a ".into(),
             "node-b".into(),
@@ -4001,10 +3923,16 @@ mod tests {
             "node-b".into(),
             "worker-aarch64".into(),
         ];
-        let resolved = resolve_target_nodes_from_map(&input, map);
+        let resolved = dedup_target_nodes(&input);
         assert_eq!(
             resolved,
-            vec!["host-primary", "host-secondary", "host-riscv", "host-arm",]
+            vec![
+                "node-a",
+                "node-b",
+                "standby",
+                "worker-riscv64",
+                "worker-aarch64",
+            ]
         );
     }
 
@@ -4769,38 +4697,12 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_node_map_env_precedence_and_legacy_fallback() {
-        use std::collections::HashMap;
-
-        let canonical = HashMap::from([
-            (
-                "MU_CD_CONTROLLER_NODE_MAP",
-                "node-a=node-a.cluster.internal",
-            ),
-            ("MU_CD_NODE_MAP", "node-a=mid.cluster.internal"),
-            ("MUCONDE_NODE_MAP", "node-a=legacy.cluster.internal"),
-        ]);
-        let map = resolve_node_map(&|k| canonical.get(k).map(|v| (*v).into()));
+    fn test_ipc_agent_client_resolves_raw_host_without_env_node_map() {
+        let client = IpcAgentClient::new(8446);
+        assert_eq!(client.resolve_agent_host(" node-a "), "node-a");
         assert_eq!(
-            resolve_target_node_from_map("node-a", &map),
-            "node-a.cluster.internal"
-        );
-
-        let mid = HashMap::from([
-            ("MU_CD_NODE_MAP", "node-a=mid.cluster.internal"),
-            ("MUCONDE_NODE_MAP", "node-a=legacy.cluster.internal"),
-        ]);
-        let map_mid = resolve_node_map(&|k| mid.get(k).map(|v| (*v).into()));
-        assert_eq!(
-            resolve_target_node_from_map("node-a", &map_mid),
-            "mid.cluster.internal"
-        );
-
-        let legacy = HashMap::from([("MUCONDE_NODE_MAP", "node-a=legacy.cluster.internal")]);
-        let map_legacy = resolve_node_map(&|k| legacy.get(k).map(|v| (*v).into()));
-        assert_eq!(
-            resolve_target_node_from_map("node-a", &map_legacy),
-            "legacy.cluster.internal"
+            client.resolve_agent_host("worker-riscv64.cluster.internal"),
+            "worker-riscv64.cluster.internal"
         );
     }
 

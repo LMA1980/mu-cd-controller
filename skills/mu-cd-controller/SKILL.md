@@ -7,5 +7,5 @@ description: "Orchestrate zero-downtime A/B continuous delivery, deployment leas
 
 ## 1. Canary Bake-Window SLO & Automatic Tainting
 
-- Every production deployment specification (`.mucd/` or legacy `.muconde/`) undergoes canary verification and SLO evaluation (`max_error_logs`, `max_p99_latency_ms`).
+- Every production deployment specification resolved from the signature-verified deployment policy repository (`MU_CD_DEPLOY_REPO_DIR`) undergoes canary verification and SLO evaluation (`max_error_logs`, `max_p99_latency_ms`).
 - When an SLO breach or health-probe failure occurs during the bake window, `mu-cd-controller` triggers an immediate atomic rollback and marks the artifact digest as tainted (`should_rollback_and_taint`).

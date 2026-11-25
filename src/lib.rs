@@ -44,10 +44,8 @@ pub use lease::{
     DEFAULT_IDLE_POLL_MAX_MS, DEFAULT_IDLE_WAIT_TIMEOUT_SECS,
 };
 pub use orchestrator::{
-    dispatch_agent_frame, resolve_node_map, resolve_target_node, resolve_target_node_from_map,
-    resolve_target_nodes, resolve_target_nodes_from_map, AgentFrame, AgentIpcClient,
-    DeploymentOrchestrator, DeploymentOutcome, HttpMuRegistClient, IpcAgentClient, MuRegistClient,
-    DEFAULT_REGISTRY_URL,
+    dedup_target_nodes, dispatch_agent_frame, AgentFrame, AgentIpcClient, DeploymentOrchestrator,
+    DeploymentOutcome, HttpMuRegistClient, IpcAgentClient, MuRegistClient, DEFAULT_REGISTRY_URL,
 };
 pub use policy_repo::{
     build_scenario_execution_plan, parse_cidr, resolve_scenarios_for_node,
