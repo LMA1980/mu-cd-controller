@@ -170,20 +170,43 @@ fn resolve_registry_token(lookup: &dyn Fn(&str) -> Option<String>) -> Option<Str
     None
 }
 
+fn require_policy_repo_config(
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<PolicyRepoConfig, String> {
+    let cfg = PolicyRepoConfig::from_env_lookup(lookup);
+    let Some(ref repo_dir) = cfg.repo_dir else {
+        return Err(
+            "MU_CD_DEPLOY_REPO_DIR (or MU_CD_CONTROLLER_DEPLOY_REPO_DIR) is required on startup"
+                .to_string(),
+        );
+    };
+    if !repo_dir.is_dir() {
+        return Err(format!(
+            "Deployment policy repository directory '{}' does not exist or is not a directory",
+            repo_dir.display()
+        ));
+    }
+    if let Err(err) = std::fs::read_dir(repo_dir) {
+        return Err(format!(
+            "Deployment policy repository directory '{}' is unreadable: {err}",
+            repo_dir.display()
+        ));
+    }
+    Ok(cfg)
+}
+
 fn spawn_policy_refresh_and_self_upgrade_resume(
-    policy_repo: Option<Arc<PolicyRepository>>,
+    policy_repo: Arc<PolicyRepository>,
     orchestrator: Arc<DeploymentOrchestrator>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Some(repo) = policy_repo {
-            if let Err(err) = repo.refresh_and_verify().await {
-                error!(
-                    error = %err,
-                    "Initial deployment policy repository verification failed closed; incoming deployments will return 503 until verified"
-                );
-            }
-            let _bg_refresh = repo.spawn_background_refresh();
+        if let Err(err) = policy_repo.refresh_and_verify().await {
+            error!(
+                error = %err,
+                "Background deployment policy repository refresh failed closed"
+            );
         }
+        let _bg_refresh = policy_repo.spawn_background_refresh();
         match orchestrator.resume_pending_self_upgrade_if_present().await {
             Ok(Some(outcome)) => {
                 info!(?outcome, "Completed resumed controller self-upgrade gate");
@@ -242,31 +265,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let controller_node_id = cd_sink_concrete.node_id().to_string();
     let cd_sink: Arc<dyn CdTelemetrySink> = Arc::new(cd_sink_concrete);
 
-    let policy_repo_cfg = PolicyRepoConfig::from_env();
-    let policy_repo = policy_repo_cfg.is_enabled().then(|| {
-        Arc::new(
-            PolicyRepository::new(policy_repo_cfg)
-                .with_telemetry_sink(cd_sink.clone(), controller_node_id),
-        )
-    });
-
-    let mut agent_client_builder = IpcAgentClient::new(env_cfg.agent_port)
-        .with_progress_sink(cd_state.clone())
-        .with_tls_config(tls_config.clone());
-    if let Some(ref repo) = policy_repo {
-        agent_client_builder = agent_client_builder.with_policy_repo(repo.clone());
+    let policy_repo_cfg = require_policy_repo_config(&|key| std::env::var(key).ok())?;
+    let policy_repo = Arc::new(
+        PolicyRepository::new(policy_repo_cfg)
+            .with_telemetry_sink(cd_sink.clone(), controller_node_id),
+    );
+    if let Err(err) = policy_repo.verify_startup_local().await {
+        return Err(
+            format!("Deployment policy repository failed startup verification: {err}").into(),
+        );
     }
-    let agent_client = Arc::new(agent_client_builder);
+
+    let agent_client = Arc::new(
+        IpcAgentClient::new(env_cfg.agent_port)
+            .with_progress_sink(cd_state.clone())
+            .with_tls_config(tls_config.clone())
+            .with_policy_repo(policy_repo.clone()),
+    );
 
     let mut orchestrator =
         DeploymentOrchestrator::new(coordinator.clone(), poller, agent_client, regist_client)
             .with_idle_backoff(IdleBackoffConfig::from_env())
             .with_cd_state(cd_state.clone())
             .with_telemetry_sink(cd_sink)
-            .with_state_dir(env_cfg.state_dir.clone());
-    if let Some(ref repo) = policy_repo {
-        orchestrator = orchestrator.with_policy_repo(repo.clone());
-    }
+            .with_state_dir(env_cfg.state_dir.clone())
+            .with_policy_repo(policy_repo.clone());
 
     if let Some(muobserve_addr) = env_cfg.muobserve_addr {
         let slo_client = Arc::new(MuObserveSloClient::new(muobserve_addr, tls_config.clone()));
@@ -513,5 +536,39 @@ mod tests {
             resolve_registry_token(&|k| missing_path_raw.get(k).cloned()),
             None
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_require_policy_repo_config_fails_closed_when_unset_or_unreadable() {
+        let empty: HashMap<&str, String> = HashMap::new();
+        let err_unset = require_policy_repo_config(&|k| empty.get(k).cloned()).unwrap_err();
+        assert!(err_unset.contains("MU_CD_DEPLOY_REPO_DIR"));
+
+        let blank = HashMap::from([("MU_CD_DEPLOY_REPO_DIR", "   ".to_string())]);
+        assert!(require_policy_repo_config(&|k| blank.get(k).cloned()).is_err());
+
+        let temp = tempfile::tempdir().unwrap();
+        let missing_dir = temp.path().join("missing-policy-repo");
+        let missing = HashMap::from([(
+            "MU_CD_DEPLOY_REPO_DIR",
+            missing_dir.to_string_lossy().into_owned(),
+        )]);
+        assert!(require_policy_repo_config(&|k| missing.get(k).cloned()).is_err());
+
+        let not_a_dir = temp.path().join("regular-file");
+        std::fs::write(&not_a_dir, "not a directory").unwrap();
+        let file_map = HashMap::from([(
+            "MU_CD_DEPLOY_REPO_DIR",
+            not_a_dir.to_string_lossy().into_owned(),
+        )]);
+        assert!(require_policy_repo_config(&|k| file_map.get(k).cloned()).is_err());
+
+        let valid = HashMap::from([(
+            "MU_CD_DEPLOY_REPO_DIR",
+            temp.path().to_string_lossy().into_owned(),
+        )]);
+        let cfg = require_policy_repo_config(&|k| valid.get(k).cloned()).unwrap();
+        assert_eq!(cfg.repo_dir.as_deref(), Some(temp.path()));
     }
 }

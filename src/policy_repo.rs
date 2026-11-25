@@ -1580,6 +1580,45 @@ impl PolicyRepository {
         })
     }
 
+    /// Verifies the local deployment policy repository tip on startup without blocking on a remote
+    /// `git fetch`, failing closed if the local tip is missing, unreadable, or fails signature or
+    /// schema verification.
+    pub async fn verify_startup_local(&self) -> Result<VerifiedPolicySummary, PolicyRepoError> {
+        let _guard = self.fetch_lock.lock().await;
+        let Some(ref repo_dir) = self.config.repo_dir else {
+            return Err(self
+                .record_verify_failure("deployment policy repo directory not configured", true)
+                .await);
+        };
+        if !repo_dir.is_dir() {
+            return Err(self
+                .record_verify_failure(
+                    format!(
+                        "deployment policy repo directory '{}' does not exist",
+                        repo_dir.display()
+                    ),
+                    true,
+                )
+                .await);
+        }
+        match self.verify_candidate_tip(repo_dir).await {
+            Ok(bundle) => {
+                let summary = VerifiedPolicySummary {
+                    refreshed: false,
+                    policy_commit_sha: bundle.policy_commit_sha.clone(),
+                    verified_at_epoch_ms: bundle.verified_at_epoch_ms,
+                    services: bundle.service_contracts.keys().cloned().collect(),
+                };
+                if let Ok(mut st) = self.state.write() {
+                    st.verified = Some(bundle);
+                    st.unverified_error = None;
+                }
+                Ok(summary)
+            }
+            Err(err) => Err(self.record_verify_failure(err.to_string(), true).await),
+        }
+    }
+
     /// Performs a single-flight Git fetch (when a remote is configured) and full fail-closed
     /// signature + schema verification of the candidate commit tip.
     pub async fn refresh_and_verify(&self) -> Result<VerifiedPolicySummary, PolicyRepoError> {

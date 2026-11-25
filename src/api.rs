@@ -45,7 +45,6 @@ use crate::policy_repo::{
     normalize_arch_digest_map, validate_git_commit_sha, validate_service_identifier,
     validate_sha256_hex, ArchDigestMaps, PolicyRepository,
 };
-use crate::telemetry::{build_cd_log, now_unix_nano};
 use mu_observable_ipc::TraceContext;
 
 /// Default `limit` for `GET /api/cd/deployments` and `GET /api/cd/runs`.
@@ -328,7 +327,7 @@ pub struct DeploymentGate {
     pub tainted: bool,
     pub started_epoch_ms: u64,
     pub finished_epoch_ms: Option<u64>,
-    /// Contract order (`.mucd/mu-cd.yml` / legacy `.muconde/MuConDe.yml` -> `integration_tests`, `"all"` expanded by the agent).
+    /// Contract order (verified policy service contract -> `integration_tests`, `"all"` expanded by the agent).
     pub tests: Vec<GateTestView>,
 }
 
@@ -716,57 +715,6 @@ fn resolve_effective_digest(req: &DeployTriggerRequest) -> Result<Option<String>
     Ok(bin.or(legacy).map(ToOwned::to_owned))
 }
 
-async fn emit_legacy_manifest_deprecation(
-    orchestrator: &DeploymentOrchestrator,
-    incoming_trace: Option<TraceContext>,
-    service: &str,
-    repo: &str,
-    legacy_fields: &[&'static str],
-    ignored_in_favor_of_policy_repo: bool,
-) {
-    let detail = if ignored_in_favor_of_policy_repo {
-        "legacy_manifest_fallback: ignoring caller-supplied legacy contract fields in favor of verified deployment policy repository"
-    } else {
-        "legacy_manifest_fallback: serving caller-supplied legacy contract because deployment policy repository is unconfigured"
-    };
-    tracing::warn!(
-        deprecation = "legacy_manifest_fallback",
-        service = %service,
-        repo = %repo,
-        legacy_fields = ?legacy_fields,
-        ignored_by_policy_repo = ignored_in_favor_of_policy_repo,
-        "{detail}"
-    );
-    if let Some(sink) = orchestrator.telemetry_sink() {
-        let now_ns = now_unix_nano();
-        let trace = incoming_trace.unwrap_or_else(|| {
-            TraceContext::from_seed(
-                now_ns as u64,
-                (now_ns as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
-                1,
-                true,
-            )
-        });
-        let entry = build_cd_log(
-            trace.trace_id,
-            trace.span_id,
-            now_ns,
-            13,
-            "WARN",
-            "controller",
-            detail,
-            serde_json::json!({
-                "deprecation": "legacy_manifest_fallback",
-                "service": service,
-                "repo": repo,
-                "legacy_fields": legacy_fields,
-                "ignored_by_policy_repo": ignored_in_favor_of_policy_repo,
-            }),
-        );
-        sink.emit_logs(vec![entry]).await;
-    }
-}
-
 fn rollout_outcomes_response(
     outcomes_res: Result<Vec<crate::orchestrator::DeploymentOutcome>, OrchestratorError>,
     service: String,
@@ -832,7 +780,6 @@ async fn post_deploy_with_policy_repo(
     policy_repo: Arc<PolicyRepository>,
     req: DeployTriggerRequest,
     incoming_trace: Option<TraceContext>,
-    legacy_fields: Vec<&'static str>,
     raw_digest: Option<String>,
 ) -> Response {
     let Some(raw_service) = resolve_requested_service(&req) else {
@@ -913,38 +860,15 @@ async fn post_deploy_with_policy_repo(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    if legacy_fields.is_empty() {
-        match git_commit_trimmed.map(validate_git_commit_sha) {
-            Some(Ok(_)) => {}
-            _ => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": "invalid_git_commit" })),
-                )
-                    .into_response();
-            }
-        }
-    } else if let Some(commit) = git_commit_trimmed {
-        if validate_git_commit_sha(commit).is_err() {
+    match git_commit_trimmed.map(validate_git_commit_sha) {
+        Some(Ok(_)) => {}
+        _ => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": "invalid_git_commit" })),
             )
                 .into_response();
         }
-    }
-
-    let repo_label = req.repo.as_deref().unwrap_or(&service);
-    if !legacy_fields.is_empty() {
-        emit_legacy_manifest_deprecation(
-            &orchestrator,
-            incoming_trace,
-            &service,
-            repo_label,
-            &legacy_fields,
-            true,
-        )
-        .await;
     }
 
     let verified = match policy_repo.ensure_verified().await {
@@ -1210,7 +1134,18 @@ async fn post_deploy(State(state): State<CdApiState>, headers: HeaderMap, body: 
         .and_then(|v| v.to_str().ok())
         .and_then(|s| mu_observable_ipc::TraceContext::parse_traceparent(s).ok());
 
-    let legacy_fields = collect_legacy_fields(&req);
+    let rejected_fields = collect_legacy_fields(&req);
+    if !rejected_fields.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "legacy_policy_fields_forbidden",
+                "rejected_fields": rejected_fields,
+            })),
+        )
+            .into_response();
+    }
+
     let raw_digest = match resolve_effective_digest(&req) {
         Ok(d) => d,
         Err(code) => {
@@ -1232,169 +1167,49 @@ async fn post_deploy(State(state): State<CdApiState>, headers: HeaderMap, body: 
             policy_repo,
             req,
             incoming_trace,
-            legacy_fields,
             raw_digest,
         )
         .await;
     }
 
-    if legacy_fields.is_empty() {
-        if let Some(raw_service) = resolve_requested_service(&req) {
-            if validate_service_identifier(&raw_service).is_err() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": "invalid_service" })),
-                )
-                    .into_response();
-            }
-        }
-        if raw_digest
-            .as_deref()
-            .is_none_or(|d| validate_sha256_hex(d).is_err())
-        {
+    if let Some(raw_service) = resolve_requested_service(&req) {
+        if validate_service_identifier(&raw_service).is_err() {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid_digest" })),
+                Json(serde_json::json!({ "error": "invalid_service" })),
             )
                 .into_response();
         }
-        if req
-            .git_commit
-            .as_deref()
-            .is_none_or(|c| validate_git_commit_sha(c).is_err())
-        {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid_git_commit" })),
-            )
-                .into_response();
-        }
+    }
+    if raw_digest
+        .as_deref()
+        .is_none_or(|d| validate_sha256_hex(d).is_err())
+    {
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "deploy_repo_unverified",
-                "detail": "deployment policy repository is not configured",
-            })),
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid_digest" })),
         )
             .into_response();
     }
-
-    let mut config = if let Some(cfg) = req.config {
-        if let Err(e) = cfg.validate() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("invalid_contract: {e}") })),
-            )
-                .into_response();
-        }
-        cfg
-    } else if let Some(ref yaml) = req.manifest_yaml {
-        match MuConDeConfig::from_yaml_str(yaml) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": format!("invalid_manifest_yaml: {e}") })),
-                )
-                    .into_response();
-            }
-        }
-    } else if let Some(ref path) = req.repo_path {
-        match MuConDeConfig::from_file(path) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": format!("invalid_repo_path: {e}") })),
-                )
-                    .into_response();
-            }
-        }
-    } else {
+    if req
+        .git_commit
+        .as_deref()
+        .is_none_or(|c| validate_git_commit_sha(c).is_err())
+    {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "missing_contract" })),
+            Json(serde_json::json!({ "error": "invalid_git_commit" })),
         )
             .into_response();
-    };
-
-    if config.it_archive_digest.is_none() {
-        if let Some(ref it_digest) = req.it_archive_digest {
-            let trimmed = it_digest.trim();
-            if !trimmed.is_empty() {
-                config.it_archive_digest = Some(trimmed.to_string());
-            }
-        }
     }
-
-    let resolved_nodes = crate::orchestrator::resolve_target_nodes(config.effective_target_nodes());
-    let service = config.service.clone();
-    let Some(digest) = raw_digest else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "empty_artifact_sha256" })),
-        )
-            .into_response();
-    };
-
-    let repo_label = req.repo.as_deref().unwrap_or(&service);
-    emit_legacy_manifest_deprecation(
-        &orchestrator,
-        incoming_trace,
-        &service,
-        repo_label,
-        &legacy_fields,
-        false,
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "deploy_repo_unverified",
+            "detail": "deployment policy repository is not configured",
+        })),
     )
-    .await;
-
-    if req.wait {
-        let res = orchestrator
-            .orchestrate_rollout_for_repo_with_trace(
-                &config,
-                &digest,
-                req.repo.as_deref(),
-                incoming_trace,
-            )
-            .await;
-        rollout_outcomes_response(res, service, resolved_nodes, digest)
-    } else {
-        let digest_bg = digest.clone();
-        let repo_bg = req.repo.clone();
-        let cfg_bg = config.clone();
-        let trace_bg = incoming_trace;
-        tokio::spawn(async move {
-            if let Err(e) = orchestrator
-                .orchestrate_rollout_for_repo_with_trace(
-                    &cfg_bg,
-                    &digest_bg,
-                    repo_bg.as_deref(),
-                    trace_bg,
-                )
-                .await
-            {
-                tracing::error!(
-                    service = %cfg_bg.service,
-                    digest = %digest_bg,
-                    error = %e,
-                    "Asynchronous CD rollout failed"
-                );
-            }
-        });
-        (
-            StatusCode::ACCEPTED,
-            Json(DeployTriggerResponse {
-                accepted: true,
-                service,
-                target_nodes: resolved_nodes,
-                artifact_sha256: digest,
-                promoted_nodes: Vec::new(),
-                rolled_back_nodes: Vec::new(),
-                deployment_id: None,
-            }),
-        )
-            .into_response()
-    }
+        .into_response()
 }
 
 async fn post_policy_refresh(State(state): State<CdApiState>, headers: HeaderMap) -> Response {

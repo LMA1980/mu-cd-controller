@@ -399,7 +399,7 @@ async fn post_api(app: axum::Router, uri: &str, body: &str) -> (StatusCode, serd
 }
 
 #[tokio::test]
-async fn test_zero_trust_deploy_ignores_caller_overrides_and_emits_deprecation_warning() {
+async fn test_zero_trust_deploy_rejects_legacy_policy_fields_with_400() {
     let fixture =
         TestPolicyFixture::create("node-a.cluster.internal", "worker-riscv64.cluster.internal");
     let sink = Arc::new(RecordingCdTelemetrySink::new());
@@ -410,14 +410,14 @@ async fn test_zero_trust_deploy_ignores_caller_overrides_and_emits_deprecation_w
     let regist = Arc::new(RecordingRegist::default());
 
     let orchestrator = Arc::new(
-        DeploymentOrchestrator::new(coordinator, None, agent.clone(), regist.clone())
+        DeploymentOrchestrator::new(coordinator.clone(), None, agent.clone(), regist.clone())
             .with_cd_state(store.clone())
             .with_telemetry_sink(sink.clone())
             .with_policy_repo(policy_repo.clone()),
     );
     let app = router(
-        CdApiState::new(store, Some(API_TOKEN.into()))
-            .with_orchestrator(orchestrator)
+        CdApiState::new(store.clone(), Some(API_TOKEN.into()))
+            .with_orchestrator(orchestrator.clone())
             .with_policy_repo(policy_repo),
     );
 
@@ -467,42 +467,168 @@ async fn test_zero_trust_deploy_ignores_caller_overrides_and_emits_deprecation_w
         "digest-only request must not emit legacy_manifest_fallback"
     );
 
-    // 2. Caller attempts to override target_nodes and integration_tests via manifest_yaml.
+    // 2. Caller attempts using manifest_yaml, config, or repo_path are strictly rejected with 400.
     agent.plans.lock().await.clear();
     let bin_sha_2 = "3".repeat(64);
-    let override_attempt = serde_json::json!({
+    let legacy_manifest = "version: \"1\"\nservice: \"example-service\"\ntarget_nodes: [\"untrusted-override-node\"]\nintegration_tests: [\"fake_noop\"]\n";
+
+    let reject_manifest = serde_json::json!({
         "repo": "LMA1980/example-service",
         "service": "example-service",
         "git_commit": commit_sha,
         "binary_digest": bin_sha_2,
         "it_archive_digest": it_sha,
-        "manifest_yaml": "version: \"1\"\nservice: \"example-service\"\ntarget_nodes: [\"untrusted-override-node\"]\nintegration_tests: [\"fake_noop\"]\n",
+        "manifest_yaml": legacy_manifest,
         "wait": true
     });
-    let (status, body) = post_api(app, "/api/cd/deploy", &override_attempt.to_string()).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    let resp2: DeployTriggerResponse = serde_json::from_value(body).unwrap();
+    let (status, err_json) =
+        post_api(app.clone(), "/api/cd/deploy", &reject_manifest.to_string()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {err_json}");
+    assert_eq!(err_json["error"], "legacy_policy_fields_forbidden");
     assert_eq!(
-        resp2.target_nodes,
-        vec!["node-a", "worker-riscv64"],
-        "caller-supplied target_nodes must never override verified policy repo"
-    );
-    let plans2 = agent.plans.lock().await.clone();
-    assert_eq!(
-        plans2[0].1.as_ref().unwrap().selected_tests,
-        vec!["systemd_unit_active", "smoke_example_service"],
-        "caller-supplied integration_tests must never override verified policy repo"
+        err_json["rejected_fields"],
+        serde_json::json!(["manifest_yaml"])
     );
 
-    let logs = sink.recorded_logs().await;
+    let reject_config = serde_json::json!({
+        "repo": "LMA1980/example-service",
+        "service": "example-service",
+        "git_commit": commit_sha,
+        "binary_digest": bin_sha_2,
+        "it_archive_digest": it_sha,
+        "config": {
+            "version": "1",
+            "service": "example-service",
+            "target_nodes": ["untrusted-override-node"],
+            "integration_tests": "all"
+        }
+    });
+    let (status, err_json) =
+        post_api(app.clone(), "/api/cd/deploy", &reject_config.to_string()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {err_json}");
+    assert_eq!(err_json["error"], "legacy_policy_fields_forbidden");
+    assert_eq!(err_json["rejected_fields"], serde_json::json!(["config"]));
+
+    let reject_repo_path = serde_json::json!({
+        "repo": "LMA1980/example-service",
+        "service": "example-service",
+        "git_commit": commit_sha,
+        "binary_digest": bin_sha_2,
+        "it_archive_digest": it_sha,
+        "repo_path": "/tmp/untrusted-repo"
+    });
+    let (status, err_json) =
+        post_api(app.clone(), "/api/cd/deploy", &reject_repo_path.to_string()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {err_json}");
+    assert_eq!(err_json["error"], "legacy_policy_fields_forbidden");
+    assert_eq!(
+        err_json["rejected_fields"],
+        serde_json::json!(["repo_path"])
+    );
+
+    let reject_all = serde_json::json!({
+        "repo": "LMA1980/example-service",
+        "service": "example-service",
+        "git_commit": commit_sha,
+        "binary_digest": bin_sha_2,
+        "it_archive_digest": it_sha,
+        "config": {
+            "version": "1",
+            "service": "example-service",
+            "target_nodes": ["untrusted-override-node"],
+            "integration_tests": "all"
+        },
+        "manifest_yaml": legacy_manifest,
+        "repo_path": "/tmp/untrusted-repo"
+    });
+    let (status, err_json) = post_api(app, "/api/cd/deploy", &reject_all.to_string()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {err_json}");
+    assert_eq!(err_json["error"], "legacy_policy_fields_forbidden");
+    assert_eq!(
+        err_json["rejected_fields"],
+        serde_json::json!(["config", "manifest_yaml", "repo_path"])
+    );
     assert!(
-        logs.iter().any(|l| {
-            l.severity_text == "WARN"
-                && l.body.contains("legacy_manifest_fallback")
-                && l.attributes_json.contains("\"legacy_manifest_fallback\"")
-                && l.attributes_json.contains("\"manifest_yaml\"")
-        }),
-        "expected legacy_manifest_fallback warning log, got {logs:?}"
+        agent.plans.lock().await.is_empty(),
+        "rejected legacy payload must never dispatch to agents"
+    );
+    assert!(
+        coordinator.list_leases().await.is_empty(),
+        "rejected legacy payload must never acquire leases"
+    );
+
+    // 3. Even without a PolicyRepository attached, legacy fields fail closed with 400 (no fallback).
+    let unconfigured_orch = Arc::new(
+        DeploymentOrchestrator::new(
+            Arc::new(LeaseCoordinator::new()),
+            None,
+            Arc::new(RecordingAgent::default()),
+            Arc::new(RecordingRegist::default()),
+        )
+        .with_cd_state(store.clone()),
+    );
+    let app_no_repo =
+        router(CdApiState::new(store, Some(API_TOKEN.into())).with_orchestrator(unconfigured_orch));
+    let (status, err_json) =
+        post_api(app_no_repo, "/api/cd/deploy", &reject_manifest.to_string()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {err_json}");
+    assert_eq!(err_json["error"], "legacy_policy_fields_forbidden");
+}
+
+#[test]
+fn test_startup_fails_closed_when_deploy_repo_dir_missing_or_unverified() {
+    let bin = env!("CARGO_BIN_EXE_mu-cd-controller");
+
+    // 1. Unset MU_CD_DEPLOY_REPO_DIR must exit non-zero on startup.
+    let out_unset = std::process::Command::new(bin)
+        .env_remove("MU_CD_DEPLOY_REPO_DIR")
+        .env_remove("MU_CD_CONTROLLER_DEPLOY_REPO_DIR")
+        .env_remove("MU_CD_CONTROLLER_API_ADDR")
+        .env_remove("MUCONDE_CD_API_ADDR")
+        .output()
+        .expect("spawn mu-cd-controller without MU_CD_DEPLOY_REPO_DIR");
+    assert!(
+        !out_unset.status.success(),
+        "daemon must fail closed when MU_CD_DEPLOY_REPO_DIR is unset"
+    );
+    let stderr_unset = String::from_utf8_lossy(&out_unset.stderr);
+    assert!(
+        stderr_unset.contains("MU_CD_DEPLOY_REPO_DIR"),
+        "expected MU_CD_DEPLOY_REPO_DIR diagnostic, got: {stderr_unset}"
+    );
+
+    // 2. Non-existent directory must exit non-zero on startup.
+    let tmp = tempfile::tempdir().unwrap();
+    let missing_dir = tmp.path().join("does-not-exist");
+    let out_missing = std::process::Command::new(bin)
+        .env("MU_CD_DEPLOY_REPO_DIR", &missing_dir)
+        .env_remove("MU_CD_CONTROLLER_DEPLOY_REPO_DIR")
+        .output()
+        .expect("spawn mu-cd-controller with missing MU_CD_DEPLOY_REPO_DIR");
+    assert!(
+        !out_missing.status.success(),
+        "daemon must fail closed when MU_CD_DEPLOY_REPO_DIR does not exist"
+    );
+
+    // 3. Unverified / unsigned policy repository must exit non-zero on startup.
+    let unsigned_fixture =
+        TestPolicyFixture::create("node-a.cluster.internal", "worker-riscv64.cluster.internal");
+    let modified =
+        sample_service_yaml().replace("bake_window_seconds: 60", "bake_window_seconds: 90");
+    unsigned_fixture.commit_files(
+        &sample_nodes_yaml("node-a.cluster.internal", "worker-riscv64.cluster.internal"),
+        &modified,
+        false,
+        "unsigned tampered tip",
+    );
+    let out_unverified = std::process::Command::new(bin)
+        .env("MU_CD_DEPLOY_REPO_DIR", &unsigned_fixture.repo_dir)
+        .env_remove("MU_CD_CONTROLLER_DEPLOY_REPO_DIR")
+        .output()
+        .expect("spawn mu-cd-controller with unsigned MU_CD_DEPLOY_REPO_DIR");
+    assert!(
+        !out_unverified.status.success(),
+        "daemon must fail closed when MU_CD_DEPLOY_REPO_DIR fails signature verification"
     );
 }
 
